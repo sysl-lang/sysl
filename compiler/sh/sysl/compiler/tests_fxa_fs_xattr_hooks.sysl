@@ -1,0 +1,248 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.read_text
+
+// **`sysl.fs`'s extended attributes over their four hooks, on every kind of target.**
+//
+// `get_xattr` and its family are written over `sysl_fs_getxattr`, `sysl_fs_setxattr`,
+// `sysl_fs_removexattr` and `sysl_fs_listxattr` (`sysl.fs.sys`'s `xattr.sysl`). On a freestanding target
+// the program answers them, and one it reaches and leaves unanswered is refused by name; on a hosted
+// one `sysl.fs.hosted` answers them over whichever C calls the platform has -- Darwin's four with
+// `position` and `options`, Linux's and Bionic's eight with an `l` form each, and none at all on
+// wasi-libc, where they answer "not supported". The library's own tests run them on this machine;
+// these read the program each other target gets.
+
+private val fxa_bare: string = "thumb-freestanding-softfp"
+
+// A program reaching every one of the eight calls.
+private val fxa_every_call: string = raw"""
+    import sysl.fs.{get_xattr, link_get_xattr, set_xattr, link_set_xattr, remove_xattr}
+    import sysl.fs.{link_remove_xattr, list_xattrs, link_list_xattrs, NoAttribute}
+
+    @export("main")
+    entry() -> int
+        val v = "v".bytes
+        var n = 0
+
+        if set_xattr("/a", "user.a", v).is_ok() then n += 1
+        if link_set_xattr("/a", "user.a", v).is_ok() then n += 1
+        if get_xattr("/a", "user.a").unwrap_err() == NoAttribute then n += 2
+        if link_get_xattr("/a", "user.a").is_err() then n += 4
+        if remove_xattr("/a", "user.a").is_err() then n += 8
+        if link_remove_xattr("/a", "user.a").is_err() then n += 16
+        if list_xattrs("/a").is_err() then n += 32
+        if link_list_xattrs("/a").is_err() then n += 64
+
+        n
+    end entry
+    """
+
+// The four hooks, answered by the program.
+private val fxa_hooks: string = raw"""
+
+    @export("sysl_fs_getxattr")
+    my_get(path: *u8, len: usize, name: *u8, name_len: usize, follow: int, into: *u8, room: usize,
+           got: *usize) -> int = -61
+
+    @export("sysl_fs_setxattr")
+    my_set(path: *u8, len: usize, name: *u8, name_len: usize, value: *u8, value_len: usize,
+           follow: int) -> int = 0
+
+    @export("sysl_fs_removexattr")
+    my_remove(path: *u8, len: usize, name: *u8, name_len: usize, follow: int) -> int = -61
+
+    @export("sysl_fs_listxattr")
+    my_list(path: *u8, len: usize, follow: int, into: *u8, room: usize, got: *usize) -> int = -38
+    """
+
+private fxa_root(program: string) -> string = lbr_tree(lbr_one("main.sysl", program))
+
+// What `build-c` for the bare target answers, and the LLVM text it wrote where it built.
+private fxa_bare_build(root: string) -> ((int, string), string)
+    val out = lbr_temp("sysl-fxa-out")
+    val said = lbr_cli(["sysl", "build-c", "--target", fxa_bare, "-o", s"$out/p.a", "--emit-llvm", s"$out/p.ll",
+                        root])
+    val ir = read_text(s"$out/p.ll").unwrap_or("")
+
+    lbr_drop([out])
+    (said, ir)
+end fxa_bare_build
+
+// The LLVM text a hosted target's program gets, with the standard module compiled from source so
+// that no C library for the target is needed here.
+private fxa_hosted_ir(target: string) -> (int, string)
+    val root = fxa_root(fxa_every_call)
+    val said = lbr_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", target, root])
+
+    lbr_drop([root])
+    said
+end fxa_hosted_ir
+
+// The one line of `ir` defining `symbol`, or "".
+private fxa_define(ir: string, symbol: string) -> string
+    for line in lines_of(ir)
+        if line.starts_with("define ") && line.contains(s" @$symbol(") then return line
+
+    ""
+end fxa_define
+
+// The lines of the function `symbol`'s definition in `ir`, from its `define` to its closing brace.
+private fxa_body(ir: string, symbol: string) -> string
+    var out = ""
+    var inside = false
+
+    for line in lines_of(ir)
+        if !inside && line.starts_with("define ") && line.contains(s" @$symbol(") then inside = true
+
+        if inside
+            out = out + line + "\n"
+
+            if line == "}" then return out
+        end if
+
+    out
+end fxa_body
+
+// -- a bare target ---------------------------------------------------------------------------------
+
+@test("a bare program reaching every xattr call is refused naming exactly the four xattr hooks")
+fxa_bare_refused_naming_the_four()
+    if !lbr_ready() then return
+
+    val root = fxa_root(fxa_every_call)
+    val (said, _) = fxa_bare_build(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built with no hook answered")
+    assert(said.1.contains(s"this program reaches 'sysl.fs', and '$fxa_bare' has no operating system under " +
+        "it for the standard library to answer a filesystem with, so the program answers it: define " +
+        "'sysl_fs_getxattr', 'sysl_fs_listxattr', 'sysl_fs_removexattr', 'sysl_fs_setxattr' with '@export'"),
+        said.1)
+end fxa_bare_refused_naming_the_four
+
+@test("a bare program reaching only get_xattr is asked for its one hook")
+fxa_bare_only_get_is_asked()
+    if !lbr_ready() then return
+
+    val root = fxa_root(raw"""
+        import sysl.fs.get_xattr
+
+        @export("main")
+        entry() -> int = if get_xattr("/a", "user.a").is_ok() then 1 else 0
+        """)
+    val (said, _) = fxa_bare_build(root)
+
+    lbr_drop([root])
+    assert(said.0 != 0, "built with its hook unanswered")
+    assert(said.1.contains("define 'sysl_fs_getxattr' with '@export'"), said.1)
+
+    for other in ["sysl_fs_setxattr", "sysl_fs_removexattr", "sysl_fs_listxattr"]
+        assert(!said.1.contains(other), s"$other was asked for: ${said.1}")
+end fxa_bare_only_get_is_asked
+
+@test("a bare program answering the four builds, its answers strong and no C xattr call in it")
+fxa_bare_answered_builds()
+    if !lbr_ready() then return
+
+    val root = fxa_root(fxa_every_call + fxa_hooks)
+    val (said, ir) = fxa_bare_build(root)
+
+    lbr_drop([root])
+    assert(said.0 == 0, said.1)
+
+    for hook in ["sysl_fs_getxattr", "sysl_fs_setxattr", "sysl_fs_removexattr", "sysl_fs_listxattr"]
+        val line = fxa_define(ir, hook)
+
+        assert(line != "", s"$hook is not defined")
+        assert(!line.contains(" weak "), line)
+
+    for c in ["getxattr", "lgetxattr", "setxattr", "removexattr", "listxattr"]
+        assert(!ir.contains(s" @$c("), s"'$c' is in a bare image")
+end fxa_bare_answered_builds
+
+// -- the hosted targets ------------------------------------------------------------------------------
+
+@test("on Linux the hooks call glibc's eight, the l forms for a link, and setxattr's flags are zero")
+fxa_linux_calls()
+    if !lbr_ready() then return
+
+    val said = fxa_hosted_ir("x86_64-linux")
+
+    assert(said.0 == 0, said.1)
+
+    val ir = said.1
+
+    assert(ir.contains("declare i64 @getxattr(ptr, ptr, ptr, i64)"), "getxattr takes four on Linux")
+    assert(ir.contains("declare i64 @lgetxattr(ptr, ptr, ptr, i64)"), "lgetxattr")
+    assert(ir.contains("declare i32 @setxattr(ptr, ptr, ptr, i64, i32)"), "setxattr takes flags")
+    assert(ir.contains("declare i32 @lsetxattr(ptr, ptr, ptr, i64, i32)"), "lsetxattr")
+    assert(ir.contains("declare i32 @removexattr(ptr, ptr)"), "removexattr")
+    assert(ir.contains("declare i32 @lremovexattr(ptr, ptr)"), "lremovexattr")
+    assert(ir.contains("declare i64 @listxattr(ptr, ptr, i64)"), "listxattr")
+    assert(ir.contains("declare i64 @llistxattr(ptr, ptr, i64)"), "llistxattr")
+    var sets = 0
+
+    for line in lines_of(ir)
+        if line.contains("call i32 @setxattr(") || line.contains("call i32 @lsetxattr(")
+            assert(line.ends_with(", i32 0)"), s"flags are not zero: $line")
+            sets += 1
+        end if
+
+    assert_eq(sets, 2)
+
+    for hook in ["sysl_fs_getxattr", "sysl_fs_setxattr", "sysl_fs_removexattr", "sysl_fs_listxattr"]
+        assert(fxa_define(ir, hook).starts_with("define weak "), s"$hook: ${fxa_define(ir, hook)}")
+end fxa_linux_calls
+
+@test("on Android Bionic's calls are Linux's eight")
+fxa_android_calls()
+    if !lbr_ready() then return
+
+    val said = fxa_hosted_ir("aarch64-android")
+
+    assert(said.0 == 0, said.1)
+    assert(said.1.contains("declare i64 @getxattr(ptr, ptr, ptr, i64)"), "getxattr")
+    assert(said.1.contains("declare i64 @llistxattr(ptr, ptr, i64)"), "llistxattr")
+    assert(said.1.contains("declare i32 @lremovexattr(ptr, ptr)"), "lremovexattr")
+end fxa_android_calls
+
+@test("on macOS the hooks call Darwin's four, with a position and options and no l forms")
+fxa_macos_calls()
+    if !lbr_ready() then return
+
+    val said = fxa_hosted_ir("x86_64-macos")
+
+    assert(said.0 == 0, said.1)
+
+    val ir = said.1
+
+    assert(ir.contains("declare i64 @getxattr(ptr, ptr, ptr, i64, i32, i32)"), "getxattr takes six on Darwin")
+    assert(ir.contains("declare i32 @setxattr(ptr, ptr, ptr, i64, i32, i32)"), "setxattr takes six")
+    assert(ir.contains("declare i32 @removexattr(ptr, ptr, i32)"), "removexattr takes options")
+    assert(ir.contains("declare i64 @listxattr(ptr, ptr, i64, i32)"), "listxattr takes options")
+
+    for l in ["lgetxattr", "lsetxattr", "lremovexattr", "llistxattr"]
+        assert(!ir.contains(s" @$l("), s"'$l' is not Darwin's")
+end fxa_macos_calls
+
+@test("on wasi there is no C call to make, and every hook answers UNSUPPORTED")
+fxa_wasi_unsupported()
+    if !lbr_ready() then return
+
+    val said = fxa_hosted_ir("wasm32-wasi")
+
+    assert(said.0 == 0, said.1)
+
+    for c in ["getxattr", "setxattr", "removexattr", "listxattr"]
+        assert(!said.1.contains(s"declare i32 @$c(") && !said.1.contains(s"declare i64 @$c("), s"'$c' on wasi")
+
+    for hook in ["sysl_fs_getxattr", "sysl_fs_setxattr", "sysl_fs_removexattr", "sysl_fs_listxattr"]
+        assert(fxa_define(said.1, hook).starts_with("define weak "), s"$hook is not answered")
+
+    for supplier in ["supply_getxattr", "supply_setxattr", "supply_removexattr", "supply_listxattr"]
+        val body = fxa_body(said.1, "sysl.fs.hosted$" + supplier)
+
+        assert(body.contains("ret i32 -38"), s"$supplier: $body")
+        assert(!body.contains("call "), s"$supplier calls something: $body")
+end fxa_wasi_unsupported

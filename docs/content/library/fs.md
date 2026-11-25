@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `get_xattr`, `set_xattr`, `remove_xattr`, `list_xattrs` and their `link_` forms, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -197,6 +197,7 @@ enum IoError
     NotOpen
     NotPermitted
     InvalidUtf8(offset: usize)
+    NoAttribute
     Other(code: int)
 
     code(self) -> int
@@ -223,6 +224,10 @@ first is an operation this process may not perform at all, the second a file who
 `canonicalize`, `current_dir` and `make_temp_dir` answer when bytes that had to be text are not UTF-8,
 and its `offset` is the byte at which the decode stopped. Its `code()` is `EILSEQ` (92 on macOS, 84 on
 Linux); two of them are equal when they stopped at the same byte, and one is never equal to an `Other`.
+
+**`NoAttribute` is an [extended attribute](#extended-attributes) that is not there**: `ENOATTR`, 93,
+on macOS and `ENODATA`, 61, on Linux, whose C libraries spell the one as the other. It is a case of
+its own so that a missing attribute is not mistaken for a missing file.
 
 `code()` answers for every case, not only `Other`: the named ones hand back the code they were
 recognised from, which keeps the question answerable without a second table. `message()` is a sentence
@@ -1113,6 +1118,82 @@ when the last of them does, which is what `Meta.links` counts.
 link, the two answer different files, and confusing them is the shape of every path-traversal bug
 there is. Reach for this one whenever the answer decides access to something.
 
+### Extended attributes
+
+```sysl
+get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+remove_xattr(path: string, name: string) -> Result[unit, IoError]
+list_xattrs(path: string) -> Result[Buf[string], IoError]
+
+link_get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+link_set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+link_remove_xattr(path: string, name: string) -> Result[unit, IoError]
+link_list_xattrs(path: string) -> Result[Buf[string], IoError]
+```
+
+An extended attribute is a named value a filesystem keeps beside a file's contents: a download's
+quarantine mark, a backup tool's checksum, a security label. **A name is text and a value is bytes**:
+a value may hold any byte, a zero among them, and may be empty, and it is passed with its length,
+never terminated. **An attribute that is not there is `NoAttribute`**, so "no such attribute" is not
+mistaken for "no such file", which stays `NotFound`:
+
+```sysl
+import sysl.fs.{write_text, get_xattr, set_xattr, remove_xattr, list_xattrs, make_dir_all,
+                remove_dir_all, NoAttribute}
+import sysl.process.pid
+
+val dir = s"/tmp/sysl-fs-doc-xattr-${pid()}"
+val f = dir + "/notes"
+
+remove_dir_all(dir).unwrap()
+make_dir_all(dir).unwrap()
+write_text(f, "hello").unwrap()
+
+val value: []u8 = [104, 0, 105]
+
+set_xattr(f, "user.sysl.tag", value).unwrap()
+
+val back = get_xattr(f, "user.sysl.tag").unwrap()
+
+print(back.len, back[0], back[1], back[2])
+print(list_xattrs(f).unwrap().any((n) -> n == "user.sysl.tag"))
+
+remove_xattr(f, "user.sysl.tag").unwrap()
+
+print(get_xattr(f, "user.sysl.tag").unwrap_err() == NoAttribute)
+print(get_xattr(dir + "/gone", "user.sysl.tag").unwrap_err())
+
+remove_dir_all(dir).unwrap()
+```
+
+```output
+3 104 0 105
+true
+true
+no such file or directory
+```
+
+**Every call comes in two, like `metadata` and `link_metadata`.** The plain one follows a symbolic
+link and asks about what it points at; the `link_` one asks about the link itself, which is the
+platform's `XATTR_NOFOLLOW` on macOS and its `l`-prefixed calls on Linux. macOS keeps attributes on
+a link apart from its target's; Linux refuses a `user.` attribute on a link with `NotPermitted`.
+
+**A name is what the platform says it is.** Linux wants a namespace before a dot (`user.`,
+`trusted.`, `security.`) and refuses a bare name with `Other(95)`, `EOPNOTSUPP`; macOS takes any name,
+by convention reverse-DNS. A name holding a zero byte is refused with `Other(22)`, `EINVAL`, before
+anything is asked, since C would read it as the shorter name before the zero. A filesystem that
+keeps no attributes answers its own refusal — `ENOTSUP`, or `EPERM` on a device node.
+
+**`list_xattrs` answers what this process may see, in the filesystem's order.** That is neither sorted
+nor everything: Linux leaves out a `trusted.` attribute for an unprivileged process, and macOS puts
+names of its own on files it has seen (`com.apple.provenance`), so a program asks for the names it
+set rather than counting. A name that is not UTF-8 makes the call answer `InvalidUtf8`, as
+[`entries`](#listing-a-directory) does.
+
+**A value is asked for twice** — its size, then its bytes — and one that grew in between is asked
+for again rather than handed back cut short.
+
 ### Where the program is, and somewhere to put things
 
 `current_dir` and `set_current_dir` are the working directory. Both are **process-wide**, which is
@@ -1520,7 +1601,10 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
-which refuse a link with `ELOOP` and an escape with `EXDEV`. Each answers an `int` by the contract every `*.sys` module has
+which refuse a link with `ELOOP` and an escape with `EXDEV`, and for the extended attributes `_getxattr`, `_setxattr`,
+`_removexattr` and `_listxattr`, each taking a `follow` flag (non-zero follows a link) and the two that answer bytes asked
+first with no room for the size they would take, then with room for the bytes, answering `-34`, `ERANGE`, where it grew in
+between. Each answers an `int` by the contract every `*.sys` module has
 (`sysl.io.sys`, `sysl.process.sys`, `sysl.net.sys` and `sysl.env.sys` too): zero or more is success, a negative answer is the `code()`
 of the `IoError` it failed with, **negated** as a system call answers it (so `-1` is `EPERM` and comes back as
 `NotPermitted`, where `-13`, `EACCES`, is `PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at

@@ -1,0 +1,405 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.sys.UNSUPPORTED
+
+// Extended attributes, set and read back on files these tests made.
+//
+// **Every test makes its own directory with `make_temp_dir`**, so two running at once never share a
+// file. Names are `user.sysl.*`, which Linux takes for a regular file and macOS takes for anything,
+// and a listing is narrowed to those names: macOS may put attributes of its own on a new file
+// (`com.apple.provenance`), which no test here can promise the absence of.
+//
+// The axes: following or not (the plain call, the `link_` one) crossed with what is at the path (a
+// file, a directory, a link to a file, a dangling link); the value (text, bytes with zeroes inside and
+// at both ends, empty, larger than a page, replaced by a shorter one); the listing (none, after two
+// sets, after a remove); the failures (no attribute, no file, a name holding a zero, a filesystem that
+// refuses); and the size protocol itself, driven through `fetched` by suppliers that race. Not run
+// here: Linux, which only the build checks reach on this machine, and a name that is not UTF-8, which
+// a `string` argument cannot spell.
+
+private drop(r: Result[unit, IoError]) = ()
+
+private fresh_dir(what: string) -> string = make_temp_dir("sysl-xattr-" + what).unwrap()
+
+private file_in(dir: string, contents: string) -> string
+    val path = dir + "/f"
+
+    write_text(path, contents).unwrap()
+    path
+end file_in
+
+/** The names a test set, out of whatever the platform listed. */
+private ours(names: Buf[string]) -> Buf[string]
+    var kept: Buf[string] = buf()
+
+    for n in names.view() do if n.starts_with("user.sysl.") then kept.push(n)
+
+    kept
+end ours
+
+private holds(names: Buf[string], name: string) -> bool
+    for n in names.view() do if n == name then return true
+
+    false
+end holds
+
+private bytes_eq(a: []const u8, b: []const u8) -> bool
+    if a.len != b.len then return false
+
+    for i in 0..<a.len do if a[i] != b[i] then return false
+
+    true
+end bytes_eq
+
+// -- a value, round trip -----------------------------------------------------------------------------
+
+@test("a text value set on a file reads back byte for byte")
+xattr_text_round_trip()
+    val dir = fresh_dir("text")
+    val f = file_in(dir, "body")
+
+    set_xattr(f, "user.sysl.colour", "teal".bytes).unwrap()
+
+    assert(bytes_eq(get_xattr(f, "user.sysl.colour").unwrap(), "teal".bytes))
+    assert_eq(read_text(f).unwrap(), "body")
+
+    drop(remove_dir_all(dir))
+end xattr_text_round_trip
+
+@test("a value holding zero bytes, at both ends and inside, comes back whole")
+xattr_binary_round_trip()
+    val dir = fresh_dir("binary")
+    val f = file_in(dir, "")
+    val value: []u8 = [0, 1, 0, 0, 255, 128, 0, 7, 0]
+
+    set_xattr(f, "user.sysl.bin", value).unwrap()
+
+    val back = get_xattr(f, "user.sysl.bin").unwrap()
+
+    assert_eq(back.len, 9)
+    assert(bytes_eq(back, value))
+
+    drop(remove_dir_all(dir))
+end xattr_binary_round_trip
+
+@test("an empty value is a value: the attribute is there and holds nothing")
+xattr_empty_value()
+    val dir = fresh_dir("empty")
+    val f = file_in(dir, "x")
+    val none: []u8 = []
+
+    set_xattr(f, "user.sysl.empty", none).unwrap()
+
+    assert_eq(get_xattr(f, "user.sysl.empty").unwrap().len, 0)
+    assert(holds(list_xattrs(f).unwrap(), "user.sysl.empty"))
+
+    drop(remove_dir_all(dir))
+end xattr_empty_value
+
+@test("a value larger than a page is asked for by size and read whole")
+xattr_large_value()
+    val dir = fresh_dir("large")
+    val f = file_in(dir, "x")
+    var value: []u8 = [0; 3000]
+
+    for i in 0..<value.len do value[i] = u8(i % 251)
+
+    set_xattr(f, "user.sysl.large", value).unwrap()
+
+    val back = get_xattr(f, "user.sysl.large").unwrap()
+
+    assert_eq(back.len, 3000)
+    assert(bytes_eq(back, value))
+
+    drop(remove_dir_all(dir))
+end xattr_large_value
+
+@test("setting again replaces the value, a shorter one leaving nothing of the longer behind")
+xattr_replace_shorter()
+    val dir = fresh_dir("replace")
+    val f = file_in(dir, "x")
+
+    set_xattr(f, "user.sysl.r", "a longer value".bytes).unwrap()
+    set_xattr(f, "user.sysl.r", "ab".bytes).unwrap()
+
+    assert(bytes_eq(get_xattr(f, "user.sysl.r").unwrap(), "ab".bytes))
+    assert_eq(ours(list_xattrs(f).unwrap()).len(), 1)
+
+    drop(remove_dir_all(dir))
+end xattr_replace_shorter
+
+@test("a directory keeps attributes as a file does")
+xattr_on_directory()
+    val dir = fresh_dir("dir")
+    val sub = dir + "/sub"
+
+    make_dir(sub).unwrap()
+    set_xattr(sub, "user.sysl.d", "dir".bytes).unwrap()
+
+    assert(bytes_eq(get_xattr(sub, "user.sysl.d").unwrap(), "dir".bytes))
+    assert(bytes_eq(link_get_xattr(sub, "user.sysl.d").unwrap(), "dir".bytes))
+
+    drop(remove_dir_all(dir))
+end xattr_on_directory
+
+// -- the listing -------------------------------------------------------------------------------------
+
+@test("a fresh file lists none of ours; two set list both; one removed lists the other")
+xattr_list_after_set_and_remove()
+    val dir = fresh_dir("list")
+    val f = file_in(dir, "x")
+
+    assert_eq(ours(list_xattrs(f).unwrap()).len(), 0)
+
+    set_xattr(f, "user.sysl.one", "1".bytes).unwrap()
+    set_xattr(f, "user.sysl.two", "22".bytes).unwrap()
+
+    val both = ours(list_xattrs(f).unwrap())
+
+    assert_eq(both.len(), 2)
+    assert(holds(both, "user.sysl.one"))
+    assert(holds(both, "user.sysl.two"))
+
+    remove_xattr(f, "user.sysl.one").unwrap()
+
+    val left = ours(list_xattrs(f).unwrap())
+
+    assert_eq(left.len(), 1)
+    assert(holds(left, "user.sysl.two"))
+    assert(get_xattr(f, "user.sysl.one").unwrap_err() == NoAttribute)
+
+    drop(remove_dir_all(dir))
+end xattr_list_after_set_and_remove
+
+// -- the failures ------------------------------------------------------------------------------------
+
+@test("an attribute that is not there is NoAttribute, to get and to remove, and not NotFound")
+xattr_missing_is_no_attribute()
+    val dir = fresh_dir("missing")
+    val f = file_in(dir, "x")
+
+    val got = get_xattr(f, "user.sysl.absent").unwrap_err()
+
+    assert(got == NoAttribute)
+    assert(got != NotFound)
+    assert(remove_xattr(f, "user.sysl.absent").unwrap_err() == NoAttribute)
+    assert(link_get_xattr(f, "user.sysl.absent").unwrap_err() == NoAttribute)
+    assert(link_remove_xattr(f, "user.sysl.absent").unwrap_err() == NoAttribute)
+
+    drop(remove_dir_all(dir))
+end xattr_missing_is_no_attribute
+
+@test("a path that is not there is NotFound for every call, not NoAttribute")
+xattr_missing_file_is_not_found()
+    val dir = fresh_dir("nofile")
+    val gone = dir + "/gone"
+
+    assert(get_xattr(gone, "user.sysl.a").unwrap_err() == NotFound)
+    assert(set_xattr(gone, "user.sysl.a", "v".bytes).unwrap_err() == NotFound)
+    assert(remove_xattr(gone, "user.sysl.a").unwrap_err() == NotFound)
+    assert(list_xattrs(gone).unwrap_err() == NotFound)
+    assert(link_list_xattrs(gone).unwrap_err() == NotFound)
+
+    drop(remove_dir_all(dir))
+end xattr_missing_file_is_not_found
+
+@test("a name holding a zero byte is refused with EINVAL before the platform could shorten it")
+xattr_name_with_zero_refused()
+    val dir = fresh_dir("zeroname")
+    val f = file_in(dir, "x")
+
+    set_xattr(f, "user.sysl.a", "short".bytes).unwrap()
+
+    // Handed to C as it stands, this name would be read as `user.sysl.a` and act on that one.
+    val name = "user.sysl.a\0tail"
+
+    assert(get_xattr(f, name).unwrap_err() == Other(22))
+    assert(set_xattr(f, name, "clobber".bytes).unwrap_err() == Other(22))
+    assert(remove_xattr(f, name).unwrap_err() == Other(22))
+    assert(link_get_xattr(f, name).unwrap_err() == Other(22))
+    assert(bytes_eq(get_xattr(f, "user.sysl.a").unwrap(), "short".bytes))
+
+    drop(remove_dir_all(dir))
+end xattr_name_with_zero_refused
+
+@test("a name sliced out of a longer string is its own bytes, not the rest of the literal")
+xattr_sliced_name()
+    val dir = fresh_dir("sliced")
+    val f = file_in(dir, "x")
+    val name = "user.sysl.cut-and-more"[0..<13]
+
+    set_xattr(f, name, "v".bytes).unwrap()
+
+    assert(holds(list_xattrs(f).unwrap(), "user.sysl.cut"))
+    assert(get_xattr(f, "user.sysl.cut-and-more").unwrap_err() == NoAttribute)
+
+    drop(remove_dir_all(dir))
+end xattr_sliced_name
+
+@test("an empty name is refused by the platform rather than read as some attribute")
+xattr_empty_name_refused()
+    val dir = fresh_dir("emptyname")
+    val f = file_in(dir, "x")
+
+    assert(set_xattr(f, "", "v".bytes).is_err())
+    assert(get_xattr(f, "").is_err())
+
+    drop(remove_dir_all(dir))
+end xattr_empty_name_refused
+
+@test("a device node's filesystem that keeps no attributes refuses, and the refusal is no NoAttribute")
+xattr_refused_by_filesystem()
+    val e = set_xattr("/dev/null", "user.sysl.dev", "v".bytes).unwrap_err()
+
+    // devfs on macOS and a character device under Linux's `user.` rules both answer `EPERM`.
+    assert(e == NotPermitted)
+    assert(e != NoAttribute)
+end xattr_refused_by_filesystem
+
+// -- following a link, and not -----------------------------------------------------------------------
+
+@test("the plain calls act on what a link points at; the link_ calls on the link itself")
+xattr_link_variants()
+    val dir = fresh_dir("link")
+    val f = file_in(dir, "x")
+    val l = dir + "/l"
+
+    symlink(f, l).unwrap()
+    set_xattr(l, "user.sysl.through", "target".bytes).unwrap()
+
+    // Set through the link, it is the target's.
+    assert(bytes_eq(get_xattr(f, "user.sysl.through").unwrap(), "target".bytes))
+    assert(bytes_eq(get_xattr(l, "user.sysl.through").unwrap(), "target".bytes))
+    assert(holds(list_xattrs(l).unwrap(), "user.sysl.through"))
+    assert(link_get_xattr(l, "user.sysl.through").unwrap_err() == NoAttribute)
+    assert(!holds(link_list_xattrs(l).unwrap(), "user.sysl.through"))
+
+#if macos
+    // macOS keeps attributes on a link, apart from its target's.
+    link_set_xattr(l, "user.sysl.own", "link".bytes).unwrap()
+
+    assert(bytes_eq(link_get_xattr(l, "user.sysl.own").unwrap(), "link".bytes))
+    assert(holds(link_list_xattrs(l).unwrap(), "user.sysl.own"))
+    assert(get_xattr(l, "user.sysl.own").unwrap_err() == NoAttribute)
+    assert(get_xattr(f, "user.sysl.own").unwrap_err() == NoAttribute)
+
+    link_remove_xattr(l, "user.sysl.own").unwrap()
+
+    assert(link_get_xattr(l, "user.sysl.own").unwrap_err() == NoAttribute)
+#else
+    // Linux refuses a `user.` attribute on a link.
+    assert(link_set_xattr(l, "user.sysl.own", "link".bytes).unwrap_err() == NotPermitted)
+#endif
+
+    // Removing through the link removes the target's.
+    remove_xattr(l, "user.sysl.through").unwrap()
+
+    assert(get_xattr(f, "user.sysl.through").unwrap_err() == NoAttribute)
+
+    drop(remove_dir_all(dir))
+end xattr_link_variants
+
+@test("a dangling link is NotFound to follow and answers about itself to the link_ calls")
+xattr_dangling_link()
+    val dir = fresh_dir("dangling")
+    val l = dir + "/l"
+
+    symlink(dir + "/nothing", l).unwrap()
+
+    assert(get_xattr(l, "user.sysl.a").unwrap_err() == NotFound)
+    assert(set_xattr(l, "user.sysl.a", "v".bytes).unwrap_err() == NotFound)
+    assert(list_xattrs(l).unwrap_err() == NotFound)
+    assert(link_get_xattr(l, "user.sysl.a").unwrap_err() == NoAttribute)
+    assert_eq(ours(link_list_xattrs(l).unwrap()).len(), 0)
+
+    drop(remove_dir_all(dir))
+end xattr_dangling_link
+
+// -- the error case ----------------------------------------------------------------------------------
+
+@test("NoAttribute carries the platform's code, its own words, and is what that code reads as")
+xattr_no_attribute_case()
+#if macos
+    assert_eq(NoAttribute.code(), 93)
+#else
+    assert_eq(NoAttribute.code(), 61)
+#endif
+    assert_eq(NoAttribute.message(), "no such attribute")
+    assert_eq(s"$NoAttribute", "no such attribute")
+    assert(from_errno(NoAttribute.code()) == NoAttribute)
+    assert(from_status(-NoAttribute.code()) == NoAttribute)
+    assert(Other(NoAttribute.code()) == NoAttribute)
+    assert(NoAttribute != NotFound)
+    assert(NoAttribute != InvalidUtf8(0))
+end xattr_no_attribute_case
+
+// -- the size protocol, with suppliers that race -----------------------------------------------------
+
+@test("a value that grew between the size and the copy is asked for again, never cut short")
+xattr_fetch_retries_on_growth()
+    var calls = 0
+    val counted: *int = &calls
+
+    val r = fetched((into, room, got) ->
+        counted[0] += 1
+
+        // The first size is two; by the copy the value is three bytes, and ERANGE says so; the second
+        // round reports three and copies three.
+        val size: usize = if counted[0] <= 1 then 2 else 3
+
+        if room == 0
+            *got = size
+            return 0
+        end if
+
+        if room < size then return -34
+
+        for i in 0..<size do into[i] = u8(65 + i)
+
+        *got = size
+        0
+    )
+
+    val back = r.unwrap()
+
+    assert_eq(calls, 4)
+    assert(bytes_eq(back, "ABC".bytes))
+end xattr_fetch_retries_on_growth
+
+@test("a value that shrank between the asks comes back at its new length")
+xattr_fetch_shrunk()
+    val r = fetched((into, room, got) ->
+        if room == 0
+            *got = 5
+            return 0
+        end if
+
+        into[0] = 9
+        *got = 1
+        0
+    )
+
+    val back = r.unwrap()
+
+    assert_eq(back.len, 1)
+    assert_eq(back[0], 9)
+end xattr_fetch_shrunk
+
+@test("a supplier claiming more than the room it had is held to the room")
+xattr_fetch_overclaim()
+    val r = fetched((into, room, got) ->
+        *got = if room == 0 then 2 else 99
+        0
+    )
+
+    assert_eq(r.unwrap().len, 2)
+end xattr_fetch_overclaim
+
+@test("a failure asking the size is the error, and UNSUPPORTED is the target's refusal")
+xattr_fetch_failure()
+    assert(fetched((into, room, got) -> -2).unwrap_err() == NotFound)
+    assert(fetched((into, room, got) -> UNSUPPORTED).unwrap_err() == unsupported())
+end xattr_fetch_failure

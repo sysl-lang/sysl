@@ -43,6 +43,15 @@ private[sysl] ilseq() -> int = 92
 private[sysl] ilseq() -> int = 84
 #endif
 
+// A missing extended attribute: `ENOATTR`, 93, on a BSD, and `ENODATA`, 61, on Linux, whose C
+// libraries spell `ENOATTR` as `ENODATA`. A BSD spends 61 on `ECONNREFUSED`, so the number is the
+// platform's.
+#if bsd
+private[sysl] no_attribute() -> int = 93
+#else
+private[sysl] no_attribute() -> int = 61
+#endif
+
 /** Why a filesystem operation did not happen. */
 enum IoError
     NotFound
@@ -74,6 +83,13 @@ enum IoError
      */
     InvalidUtf8(offset: usize)
 
+    /** The extended attribute asked for is not there (`get_xattr`, `remove_xattr`): `ENOATTR`, code
+     * 93, on a BSD and `ENODATA`, code 61, on Linux, which are one condition under two names. It is
+     * a case of its own so that "the file has no such attribute" is not mistaken for "there is no
+     * such file".
+     */
+    NoAttribute
+
     Other(code: int)
 
     /** The number this came from, so a program can report or compare one the set does not name.
@@ -93,6 +109,7 @@ enum IoError
         NotOpen          -> 9
         NotPermitted     -> 1
         InvalidUtf8(_)   -> ilseq()
+        NoAttribute      -> no_attribute()
         Other(c)         -> c
 
     /** A sentence, in the terms the operation was asked in rather than in C's.
@@ -119,6 +136,7 @@ enum IoError
         NotOpen           -> "the file is not open"
         NotPermitted      -> "operation not permitted"
         InvalidUtf8(at)  -> s"not UTF-8 at byte $at"
+        NoAttribute       -> "no such attribute"
         Other(c)          -> system_text(c)
 
     /** Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one
@@ -311,6 +329,8 @@ from_errno(code: int) -> IoError
         Interrupted
     elif code == 9 then          // EBADF, which is also what a use of a closed `File` reports
         NotOpen
+    elif code == no_attribute() then
+        NoAttribute
     else
         Other(code)
 end from_errno

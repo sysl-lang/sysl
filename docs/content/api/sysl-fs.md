@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`get_xattr`](#get_xattr) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_get_xattr`](#link_get_xattr) [`link_list_xattrs`](#link_list_xattrs) [`link_metadata`](#link_metadata) [`link_remove_xattr`](#link_remove_xattr) [`link_set_xattr`](#link_set_xattr) [`list_xattrs`](#list_xattrs) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`remove_xattr`](#remove_xattr) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`set_xattr`](#set_xattr) [`size_of`](#size_of) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -144,13 +144,13 @@ intended is the kind of surprise a library should not spring.
 ### `create`
 
 ```sysl
-create(path: string) -> Result[File, IoError]
+create(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `create_update`
 
 ```sysl
-create_update(path: string) -> Result[File, IoError]
+create_update(path: string, mode: u32 = file_mode) -> Result[File, IoError]
 ```
 
 ### `current_dir`
@@ -248,6 +248,23 @@ The chain is over `errno` values rather than over a name per platform because th
 that have been stable since V7 -- `ENOENT` has been 2 on every Unix anyone has shipped -- and the
 one that is not is `not_empty` above, which is why it is a call rather than a literal here.
 
+### `get_xattr`
+
+```sysl
+get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+```
+
+The value of the extended attribute `name` of what `path` names, following a symbolic link.
+
+**An attribute that is not there is `NoAttribute`**, whatever the platform calls it, so a caller
+can tell "the file has no such attribute" from "there is no such file" (`NotFound`). A filesystem
+that keeps no attributes at all answers its own `ENOTSUP` as an `Other`: 45 on macOS, 95 on Linux.
+A name holding a zero byte is refused with `Other(22)`, `EINVAL`, before anything is asked, since
+the platform would read it as the shorter name before the zero.
+
+The value is the platform's copy, and it is asked for twice: once for its size and once for the
+bytes. A value that grew between the two asks is asked for again rather than handed back cut short.
+
 ### `hard_link`
 
 ```sysl
@@ -280,9 +297,10 @@ is_dir(path: string) -> bool
 ```
 
 Whether the path names a directory, asked of `stat` -- which follows a symbolic link, as every
-other question here does. A directory the program may not read or search is still a directory.
-Where the target does not support `stat` at all, it asks whether the path opens as a directory
-instead.
+other question here does. A directory the program may not read or search is still a directory;
+only a path `stat` cannot reach (missing, dangling, under an unsearchable directory) answers
+`false`. Where the target does not support `stat` at all, it asks whether the path opens as a
+directory instead.
 
 ### `is_file`
 
@@ -305,6 +323,23 @@ Whether the path itself is a symbolic link. It follows nothing, so a link to a d
 `true` here and `is_dir` answers `true` about the same path -- the two are asking different
 questions and both answers are right.
 
+### `link_get_xattr`
+
+```sysl
+link_get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+```
+
+`get_xattr` about a symbolic link itself rather than what it points at. On a path that is not a
+link, the two are the same question.
+
+### `link_list_xattrs`
+
+```sysl
+link_list_xattrs(path: string) -> Result[Buf[string], IoError]
+```
+
+`list_xattrs` about a symbolic link itself.
+
 ### `link_metadata`
 
 ```sysl
@@ -316,6 +351,38 @@ The same, about the path **itself** -- so a symbolic link is described rather th
 This is the only call in the module that can report a link at all. `is_dir`, `exists` and
 `metadata` all follow one silently, which is the right default and was until now the only
 behaviour available.
+
+### `link_remove_xattr`
+
+```sysl
+link_remove_xattr(path: string, name: string) -> Result[unit, IoError]
+```
+
+`remove_xattr` on a symbolic link itself.
+
+### `link_set_xattr`
+
+```sysl
+link_set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+```
+
+`set_xattr` on a symbolic link itself, leaving what it points at untouched. macOS keeps attributes
+on a link; Linux refuses a `user.` attribute there with `NotPermitted`.
+
+### `list_xattrs`
+
+```sysl
+list_xattrs(path: string) -> Result[Buf[string], IoError]
+```
+
+The names of every extended attribute of what `path` names, following a symbolic link, in the
+order the filesystem keeps them -- which is not sorted and is not promised to be stable. A file with
+none answers an empty list.
+
+**The list holds what this process may see**, not everything there is: Linux leaves out a
+`trusted.` attribute for a process without the privilege to read it, and macOS may hold names the
+system itself set (`com.apple.provenance`). A name that is not UTF-8 makes the whole call answer
+`InvalidUtf8` at the offset within that name, as `entries` does for a directory.
 
 ### `make_dir`
 
@@ -400,6 +467,13 @@ The three ways a program opens a file, named for what it means rather than for t
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
+**`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
+default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
+asks `0o600` here and is owner-only from the moment it exists, with no window between creating
+and `set_permissions`. The mode applies only when the file is created: one that already exists
+keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
+A target with no permission bits ignores the mode.
+
 ### `open_dir`
 
 ```sysl
@@ -411,6 +485,24 @@ The directory at `path`, held open to reach what is beneath it.
 A link as the last component of `path` is refused (`refused_link()`), and what is not a directory
 is `NotADirectory`. The components above it are the caller's own path and are followed as any path
 is -- `/tmp` is a link on macOS.
+
+### `open_uncached`
+
+```sysl
+open_uncached(path: string, create: bool = false) -> Result[File, IoError]
+```
+
+A file opened for reading and writing that **bypasses the operating system's page cache**:
+`O_DIRECT` on Linux, `fcntl(F_NOCACHE)` on macOS. A database that keeps its own buffer pool opens
+its files this way so a page is not held twice. `create` makes the file where it is missing and
+never empties one that exists.
+
+**Use it through `read_at` and `write_at`.** The buffered `read` and `write` move odd amounts
+and so do not suit it. On Linux every transfer must have its buffer address, its offset and its
+length at a multiple of the device's block size (512, in practice 4096), and a transfer that does
+not is `Other(22)` (`EINVAL`); macOS has no such rule. A filesystem that refuses the mode (tmpfs
+on older Linux kernels) answers `Other(22)` at the open. A target whose C library has neither
+mechanism answers "not supported on this target".
 
 ### `open_update`
 
@@ -564,6 +656,16 @@ Removes a file, and refuses a directory rather than removing it: `unlink` is the
 that line, where C's own `remove` quietly does either. Two names for two intentions is what lets
 a program that meant one of them find out it had the other.
 
+### `remove_xattr`
+
+```sysl
+remove_xattr(path: string, name: string) -> Result[unit, IoError]
+```
+
+The extended attribute `name` of what `path` names removed, following a symbolic link. One that is
+not there is `NoAttribute` -- removing is not idempotent here, because the platform does not make
+it so and a caller that wants it to be matches the case away.
+
 ### `rename`
 
 ```sysl
@@ -626,6 +728,20 @@ set_permissions(path: string, mode: u32) -> Result[unit, IoError]
 The permission bits set to exactly what is given. It is not a mask to add: `0o644` means the file
 ends up `0o644` whatever it was, which is `chmod(2)`'s own meaning and the one a program that read
 `permissions()` first is expecting.
+
+### `set_xattr`
+
+```sysl
+set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+```
+
+The extended attribute `name` of what `path` names set to `value`, following a symbolic link. The
+attribute is made where it is missing and its value replaced where it is not; an empty value is a
+value, and the attribute is there afterwards holding nothing.
+
+Linux refuses a name outside a namespace it knows (`Other(95)`, `EOPNOTSUPP`), and refuses a `user.`
+attribute on anything but a regular file or a directory (`NotPermitted`). A name holding a zero byte
+is `Other(22)`, as for `get_xattr`.
 
 ### `size_of`
 
@@ -815,6 +931,9 @@ easy. While any copy lives the descriptor stays open.
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor the file reads and writes through, for a call this module does not make. |
 | `into_raw_fd` | `into_raw_fd(*self) -> Result[int, IoError]` | The descriptor, given rather than lent: the file lets go of it, and closing it is from now on the caller's to do -- Rust's `into_raw_fd`. |
 | `map` | `map(*self) -> Result[&Mapped, IoError]` | The file's bytes, mapped read-only into memory rather than read -- `map_file`, for a file that is already open. |
+| `map_mut` | `map_mut(*self, len: usize = …) -> Result[&MappedMut, IoError]` | The file's bytes mapped readable and writable and shared, so a write through `bytes()` reaches the file. |
+| `sync_data` | `sync_data(*self) -> Result[unit, IoError]` | Hands what is buffered over and asks the device to keep the file's contents, returning once it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which skips an unchanged modification time). |
+| `full_sync` | `full_sync(*self) -> Result[unit, IoError]` | The strongest durability the platform offers: what is buffered is handed over and the device is made to empty its own write cache. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -822,6 +941,7 @@ easy. While any copy lives the descriptor stays open.
 | `size` | `size(*self) -> Result[long, IoError]` | How many bytes the file holds. |
 | `at_end` | `at_end(*self) -> bool` | Whether a read has already run off the end. |
 | `truncate` | `truncate(*self, length: long) -> Result[unit, IoError]` | The file cut to a length, or extended to one with zeroes -- the one thing this surface could not do, having `seek` and `size` and no way to change what is there. |
+| `set_permissions` | `set_permissions(*self, mode: u32) -> Result[unit, IoError]` | The twelve permission bits of this open file set to `mode` -- `fchmod(2)` on the descriptor, so it changes the file this handle holds whatever the path now names. |
 | `read_failure` | `read_failure(*self) -> Option[IoError]` | What the file latched when a read failed, as the same `IoError` -- the system's own wording and `errno` -- that a whole-file read answers, or `None` while `failed` is false. |
 
 ### `FileState`
@@ -872,6 +992,7 @@ enum IoError
     NotOpen
     NotPermitted
     InvalidUtf8(offset: usize)
+    NoAttribute
     Other(code: int)
 ```
 
@@ -937,6 +1058,33 @@ empty view.
 | `is_empty` | `is_empty(self) -> bool` |  |
 | `bytes` | `bytes(&self) -> []const u8` | The whole file, read-only. |
 | `advise` | `advise(self, advice: Advice, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Tells the operating system how `len` bytes from offset `from` are about to be used; `len` left out means to the end of the mapping. |
+
+### `MappedMut`
+
+```sysl
+struct MappedMut
+    private at: *u8
+    private n: usize
+```
+
+A file's bytes mapped shared and writable, from `File.map_mut`: a write through `bytes()` is a
+write to the file.
+
+**Nothing is promised to be on the device until `flush`.** The system writes dirty pages back when
+it chooses, and a program that exits or drops the mapping loses nothing the system has accepted
+(it stays in the page cache and reaches the file), but only `flush` -- and `File.sync_data` or
+`full_sync` after it, for power-loss durability -- says the bytes are out. The mapping is as long
+as the file was when it was made and does not follow it: cutting the file shorter underneath makes
+a read of a page past the new end a signal. Dropping the last reference unmaps it; hold it as a
+`&MappedMut`.
+
+| Member | Signature | Description |
+|---|---|---|
+| `len` | `len(self) -> usize` |  |
+| `is_empty` | `is_empty(self) -> bool` |  |
+| `bytes` | `bytes(&self) -> []u8` | The whole mapping, writable. |
+| `flush` | `flush(self, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Writes `len` bytes from offset `from` (`len` left out: to the end) to the file and returns once they are there -- `msync(MS_SYNC)`. |
+| `flush_async` | `flush_async(self, from: usize = 0, len: usize = …) -> Result[unit, IoError]` | Schedules the same write-back and returns at once (`msync(MS_ASYNC)`). |
 
 ### `Matching`
 
@@ -1068,6 +1216,12 @@ its output arrived calls `close` and reads the answer.
 
 ```sysl
 impl Drop for Mapped
+```
+
+### Drop for MappedMut
+
+```sysl
+impl Drop for MappedMut
 ```
 
 ### Eq for IoError

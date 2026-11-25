@@ -1,0 +1,126 @@
+module sysl.fs.hosted
+@requires(os, libc)
+
+import sysl.sys.UNSUPPORTED
+
+// `sysl.fs.sys`'s extended-attribute hooks over the C library, for the two families that have the
+// calls: Darwin's and Linux's (glibc, musl, Bionic). **They are not one interface.** Darwin's four
+// take an `options` word, whose `XATTR_NOFOLLOW` asks about a link itself, and its `getxattr` and
+// `setxattr` take a `position` too, meaningful only for a resource fork and zero for everything else.
+// Linux's take neither, and spell not following as a second call with an `l` in front; its `setxattr`
+// takes `flags` (`XATTR_CREATE`, `XATTR_REPLACE`), and zero asks for neither. Every other hosted
+// target -- wasi-libc has none of them -- answers `UNSUPPORTED`.
+//
+// **A null buffer is how both ask for a size.** Darwin answers the size only where the buffer is null
+// and otherwise checks it against the room, so the hooks' "no room" is passed through as a null.
+
+#if macos
+private extern "getxattr" c_getxattr(path: *u8, name: *u8, value: *u8, size: usize, position: u32,
+                                     options: int) -> isize
+private extern "setxattr" c_setxattr(path: *u8, name: *u8, value: *u8, size: usize, position: u32,
+                                     options: int) -> int
+private extern "removexattr" c_removexattr(path: *u8, name: *u8, options: int) -> int
+private extern "listxattr" c_listxattr(path: *u8, names: *u8, size: usize, options: int) -> isize
+
+/** `XATTR_NOFOLLOW`, where `follow` is zero. */
+private options(follow: int) -> int = if follow != 0 then 0 else 1
+
+private value_of(p: *u8, n: *u8, into: *u8, room: usize, follow: int) -> isize =
+    c_getxattr(p, n, into, room, 0, options(follow))
+
+private stored(p: *u8, n: *u8, value: *u8, len: usize, follow: int) -> int =
+    c_setxattr(p, n, value, len, 0, options(follow))
+
+private removed(p: *u8, n: *u8, follow: int) -> int = c_removexattr(p, n, options(follow))
+
+private names_of(p: *u8, into: *u8, room: usize, follow: int) -> isize =
+    c_listxattr(p, into, room, options(follow))
+#elif linux || android
+private extern "getxattr" c_getxattr(path: *u8, name: *u8, value: *u8, size: usize) -> isize
+private extern "lgetxattr" c_lgetxattr(path: *u8, name: *u8, value: *u8, size: usize) -> isize
+private extern "setxattr" c_setxattr(path: *u8, name: *u8, value: *u8, size: usize, flags: int) -> int
+private extern "lsetxattr" c_lsetxattr(path: *u8, name: *u8, value: *u8, size: usize, flags: int) -> int
+private extern "removexattr" c_removexattr(path: *u8, name: *u8) -> int
+private extern "lremovexattr" c_lremovexattr(path: *u8, name: *u8) -> int
+private extern "listxattr" c_listxattr(path: *u8, names: *u8, size: usize) -> isize
+private extern "llistxattr" c_llistxattr(path: *u8, names: *u8, size: usize) -> isize
+
+private value_of(p: *u8, n: *u8, into: *u8, room: usize, follow: int) -> isize =
+    if follow != 0 then c_getxattr(p, n, into, room) else c_lgetxattr(p, n, into, room)
+
+private stored(p: *u8, n: *u8, value: *u8, len: usize, follow: int) -> int =
+    if follow != 0 then c_setxattr(p, n, value, len, 0) else c_lsetxattr(p, n, value, len, 0)
+
+private removed(p: *u8, n: *u8, follow: int) -> int =
+    if follow != 0 then c_removexattr(p, n) else c_lremovexattr(p, n)
+
+private names_of(p: *u8, into: *u8, room: usize, follow: int) -> isize =
+    if follow != 0 then c_listxattr(p, into, room) else c_llistxattr(p, into, room)
+#endif
+
+@export("sysl_fs_getxattr")
+supply_getxattr(path: *u8, len: usize, name: *u8, name_len: usize, follow: int, into: *u8, room: usize,
+                got: *usize) -> int
+#if macos || linux || android
+    var p: [path_room]u8
+    var n: [path_room]u8
+
+    if !terminated(path, len, p[..]) || !terminated(name, name_len, n[..]) then return name_too_long
+
+    val size = value_of(&p[0], &n[0], if room == 0 then null else into, room, follow)
+
+    if size < 0 then return failed()
+
+    *got = usize(size)
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_getxattr
+
+@export("sysl_fs_setxattr")
+supply_setxattr(path: *u8, len: usize, name: *u8, name_len: usize, value: *u8, value_len: usize,
+                follow: int) -> int
+#if macos || linux || android
+    var p: [path_room]u8
+    var n: [path_room]u8
+
+    if !terminated(path, len, p[..]) || !terminated(name, name_len, n[..]) then return name_too_long
+
+    status(stored(&p[0], &n[0], value, value_len, follow))
+#else
+    UNSUPPORTED
+#endif
+end supply_setxattr
+
+@export("sysl_fs_removexattr")
+supply_removexattr(path: *u8, len: usize, name: *u8, name_len: usize, follow: int) -> int
+#if macos || linux || android
+    var p: [path_room]u8
+    var n: [path_room]u8
+
+    if !terminated(path, len, p[..]) || !terminated(name, name_len, n[..]) then return name_too_long
+
+    status(removed(&p[0], &n[0], follow))
+#else
+    UNSUPPORTED
+#endif
+end supply_removexattr
+
+@export("sysl_fs_listxattr")
+supply_listxattr(path: *u8, len: usize, follow: int, into: *u8, room: usize, got: *usize) -> int
+#if macos || linux || android
+    var p: [path_room]u8
+
+    if !terminated(path, len, p[..]) then return name_too_long
+
+    val size = names_of(&p[0], if room == 0 then null else into, room, follow)
+
+    if size < 0 then return failed()
+
+    *got = usize(size)
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_listxattr
