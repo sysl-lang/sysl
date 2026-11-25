@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `set_times`, `link_set_times`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -1067,6 +1067,85 @@ remove_file(path).unwrap()
 1500000000
 ```
 
+### Its times, one at a time, and when it was made
+
+**`set_times(path, accessed, modified)` sets the two times apart**, each an `Option[Instant]`: `None`
+leaves that time exactly as it was (`UTIME_OMIT`), which is what a program copying a file's times
+needs when it carries one and not the other. `set_times(p, Some(t), Some(t))` is `set_modified(p, t)`.
+**`link_set_times` is the same on the path itself**, `utimensat`'s `AT_SYMLINK_NOFOLLOW`: a symbolic
+link's own times are set, `link_metadata` reads them back, and the file it names is untouched — so a
+copy of a tree can carry its links' times as well as its files'.
+
+```sysl
+import sysl.fs.{write_text, symlink, metadata, link_metadata, set_times, link_set_times, make_dir,
+                remove_dir_all}
+import sysl.process.pid
+import sysl.time.Instant
+
+val dir = s"/tmp/sysl-fs-doc-times-${pid()}"
+val file = dir + "/file"
+val link = dir + "/link"
+
+make_dir(dir).unwrap()
+write_text(file, "x").unwrap()
+symlink(file, link).unwrap()
+
+set_times(file, Some(Instant(1500000000123456)), Some(Instant(1400000000654321))).unwrap()
+set_times(file, None, Some(Instant(1300000000000001))).unwrap()
+
+val m = metadata(file).unwrap()
+
+print(f"${m.accessed.us} ${m.modified.us}")
+
+link_set_times(link, Some(Instant(1000000000000000)), Some(Instant(1000000000000000))).unwrap()
+print(link_metadata(link).unwrap().modified.us)
+print(metadata(file).unwrap().modified.us)
+
+remove_dir_all(dir).unwrap()
+```
+
+```output
+1500000000123456 1300000000000001
+1000000000000000
+1300000000000001
+```
+
+**A time is an `Instant`, kept to the microsecond**, which APFS, ext4, btrfs and xfs all keep exactly.
+There is no "now by the kernel's clock" (`UTIME_NOW`), because an `Instant` is a time rather than an
+instruction: `Some(sysl.time.now())` sets one by this program's clock. A path that is not there is
+`NotFound` from either call, also where both times are `None` — that changes nothing, but still asks
+that the path be there, so the answer is the same on every platform (Linux's `utimensat` would
+otherwise succeed on nothing). The third time, `changed`, is nobody's to set.
+
+**`Meta.created` is the birth time, an `Option[Instant]`**: `Some` where the platform and the
+filesystem keep one, and `None` where they do not, rather than a date nobody recorded. macOS answers
+it from `st_birthtimespec` on APFS and HFS+; Linux answers it from `statx`'s `STATX_BTIME` where the
+kernel (4.11), the C library (glibc 2.28, musl 1.2.5, Bionic API 30) and the filesystem all know it;
+a program supplying `sysl.fs.sys` itself answers it where its `stat` hook fills it in. Nothing sets it
+— though on macOS, a modification time set earlier than the birth time pulls the birth time back to
+it, a file not having changed before it existed.
+
+```sysl
+import sysl.fs.{write_text, metadata, remove_file}
+import sysl.process.pid
+import sysl.time.now
+
+val path = s"/tmp/sysl-fs-doc-created-${pid()}.txt"
+
+write_text(path, "x").unwrap()
+
+// Known on this machine or not, a birth time is never one in the future.
+print(metadata(path).unwrap().created match
+    Some(t) -> t.us <= now().us + 1000000
+    None -> true)
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+```
+
 ### Links, and the path the filesystem agrees on
 
 ```sysl
@@ -1553,10 +1632,12 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata`, `set_permissions`, `set_owner` and `set_modified` are one `stat`, `chmod`, `chown` or `utimensat` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `set_times` and `link_set_times` are
+one `stat`, `chmod`, `chown`, `set_modified` or `set_times` hook, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
-thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers
+sixteen numbers in POSIX's shape and leaves zero what it has nothing to say about — a birth time it
+does not know is three zeros, which reads as `created == None`; a hook it answers
 `UNSUPPORTED` comes back from these calls as *not supported on this target*. The one exception is
 the permission step of `copy_dir_all`: a target whose `chmod` answers `UNSUPPORTED` has no permission bits, so
 there is nothing to carry and the copy goes on; any other error from it still fails the copy.
@@ -1565,7 +1646,7 @@ there is nothing to carry and the copy goes on; any other error from it still fa
 
 **Anything `stat` would answer used to be**, and it is not any more: `metadata` is that call, and the
 `struct stat` it comes back in stays in the hosted answer's shim, where the header decides the layout,
-with thirteen numbers — `sysl.fs.sys.Stat` — crossing rather than a transcription. That is the shape this section always
+with sixteen numbers — `sysl.fs.sys.Stat` — crossing rather than a transcription. That is the shape this section always
 prescribed, arrived at the day something needed it.
 
 The rule the whole module is written under is one sentence: **a question that can be answered by a

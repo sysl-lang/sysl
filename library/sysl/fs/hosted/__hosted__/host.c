@@ -7,6 +7,12 @@
 // empty there and the hooks are left for whatever answers them on that system.
 #if !defined(_WIN32)
 
+// glibc and musl declare `statx`, the only Linux call that answers a birth time, only to
+// `_GNU_SOURCE`; it has to be said before the first header.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE 1
+#endif
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -122,13 +128,20 @@ int sysl_fs_host_truncate(const char *path, long long length) {
     return truncate(path, (off_t) length);
 }
 
-// What `stat` knows, as the thirteen numbers of `sysl.fs.sys.Stat` in its order.
+// `sysl.fs.sys.stat_created`: the bit of `Stat.has` saying a birth time was filled in.
+enum { SYSL_FS_STAT_CREATED = 1 };
+
+// What `stat` knows, as the sixteen numbers of `sysl.fs.sys.Stat` in its order.
 //
 // `struct stat` is the transcription `sysl.fs` refuses: every field's offset, and several fields'
 // widths, differ between the platforms, and being wrong about one reads the wrong bytes rather than
 // failing. The timestamps are seconds and nanoseconds separately, because the *member* holding them
 // is what the platforms disagree about -- `st_mtimespec` against `st_mtim` -- while `struct
 // timespec` itself is standard.
+//
+// **A birth time is Darwin's alone among what `struct stat` holds** (`st_birthtimespec`), and Darwin
+// answers it zero for a filesystem that keeps none, so zero is read as "unknown" rather than as 1970.
+// Linux has no birth time in `struct stat` at all; it comes from `statx`, below.
 static void sysl_fs_host_fill(const struct stat *st, long long *out) {
     out[0]  = (long long) st->st_size;
     out[1]  = (long long) st->st_mode;
@@ -153,10 +166,82 @@ static void sysl_fs_host_fill(const struct stat *st, long long *out) {
     out[11] = (long long) st->st_ctim.tv_sec;
     out[12] = (long long) st->st_ctim.tv_nsec;
 #endif
+
+    out[13] = 0;
+    out[14] = 0;
+    out[15] = 0;
+
+#ifdef __APPLE__
+    if (st->st_birthtimespec.tv_sec != 0 || st->st_birthtimespec.tv_nsec != 0) {
+        out[13] = (long long) st->st_birthtimespec.tv_sec;
+        out[14] = (long long) st->st_birthtimespec.tv_nsec;
+        out[15] = SYSL_FS_STAT_CREATED;
+    }
+#endif
 }
+
+// **On Linux every reading is one `statx`** (4.11; glibc 2.28, musl 1.2.5, Bionic API 30), so the
+// birth time comes in the same call as everything else and is about the same file. A filesystem that
+// keeps none leaves `STATX_BTIME` out of the answer's mask, and the time is then left unknown. A
+// kernel without the call answers `ENOSYS`, and a container whose seccomp filter predates it `EPERM`;
+// either is answered by `stat`, without a birth time, as a C library without `statx` is.
+//
+// The kernel's `STATX_*` names can be in scope where the C library declares no `statx` -- glibc
+// before 2.28 shows them through the kernel headers, and Bionic below API 30 declares the call only
+// for the level that has it -- so the library's own version is asked as well. musl defines the
+// names beside the call (1.2.5), so for musl the name is the answer.
+#if defined(__linux__) && defined(STATX_BTIME) && defined(AT_STATX_SYNC_AS_STAT)
+#if defined(__GLIBC__) && (__GLIBC__ < 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ < 28))
+#elif defined(__ANDROID__) && __ANDROID_API__ < 30
+#else
+#define SYSL_FS_HOST_STATX 1
+#endif
+#endif
+
+#if defined(SYSL_FS_HOST_STATX)
+#include <sys/sysmacros.h>
+
+// Zero, -1 with `errno` set, or 1 where `statx` is not there to ask and the caller asks `stat`.
+static int sysl_fs_host_statx(int dir, const char *path, int flags, long long *out) {
+    struct statx sx;
+
+    if (statx(dir, path, flags | AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS | STATX_BTIME, &sx) != 0)
+        return (errno == ENOSYS || errno == EPERM) ? 1 : -1;
+
+    out[0]  = (long long) sx.stx_size;
+    out[1]  = (long long) sx.stx_mode;
+    out[2]  = (long long) sx.stx_nlink;
+    out[3]  = (long long) sx.stx_uid;
+    out[4]  = (long long) sx.stx_gid;
+    out[5]  = (long long) sx.stx_ino;
+    /* The encoding `stat` answers `st_dev` in, so a reading from either compares equal. */
+    out[6]  = (long long) makedev(sx.stx_dev_major, sx.stx_dev_minor);
+    out[7]  = (long long) sx.stx_mtime.tv_sec;
+    out[8]  = (long long) sx.stx_mtime.tv_nsec;
+    out[9]  = (long long) sx.stx_atime.tv_sec;
+    out[10] = (long long) sx.stx_atime.tv_nsec;
+    out[11] = (long long) sx.stx_ctime.tv_sec;
+    out[12] = (long long) sx.stx_ctime.tv_nsec;
+    out[13] = 0;
+    out[14] = 0;
+    out[15] = 0;
+
+    if (sx.stx_mask & STATX_BTIME) {
+        out[13] = (long long) sx.stx_btime.tv_sec;
+        out[14] = (long long) sx.stx_btime.tv_nsec;
+        out[15] = SYSL_FS_STAT_CREATED;
+    }
+    return 0;
+}
+#endif
 
 // `follow` picks between `stat` and `lstat`: what a path names, or the path itself.
 int sysl_fs_host_stat(const char *path, int follow, long long *out) {
+#if defined(SYSL_FS_HOST_STATX)
+    int asked = sysl_fs_host_statx(AT_FDCWD, path, follow ? 0 : AT_SYMLINK_NOFOLLOW, out);
+
+    if (asked <= 0) return asked;
+#endif
     struct stat st;
 
     if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return -1;
@@ -166,6 +251,11 @@ int sysl_fs_host_stat(const char *path, int follow, long long *out) {
 }
 
 int sysl_fs_host_fstat(int fd, long long *out) {
+#if defined(SYSL_FS_HOST_STATX)
+    int asked = sysl_fs_host_statx(fd, "", AT_EMPTY_PATH, out);
+
+    if (asked <= 0) return asked;
+#endif
     struct stat st;
 
     if (fstat(fd, &st) != 0) return -1;
@@ -318,6 +408,17 @@ int sysl_fs_host_stat_beneath(int dir, char *rel, long long *out) {
 
     if (at < 0) return -1;
 
+#if defined(SYSL_FS_HOST_STATX)
+    int asked = sysl_fs_host_statx(at, name, AT_SYMLINK_NOFOLLOW, out);
+
+    if (asked <= 0) {
+        int why = errno;
+
+        if (owned) close(at);
+        errno = why;
+        return asked;
+    }
+#endif
     struct stat st;
     int rc = fstatat(at, name, &st, AT_SYMLINK_NOFOLLOW);
     int why = errno;

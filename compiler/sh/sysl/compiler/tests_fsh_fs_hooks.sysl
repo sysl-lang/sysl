@@ -96,6 +96,7 @@ private fsh_hooks(left_out: []string) -> string
     rows.push(("access", "path: *u8, len: usize, how: int"))
     rows.push(("chmod", "path: *u8, len: usize, mode: u32"))
     rows.push(("set_modified", "path: *u8, len: usize, micros: long"))
+    rows.push(("set_times", "path: *u8, len: usize, follow: int, accessed: long, modified: long, given: int"))
     rows.push(("opendir", "path: *u8, len: usize, dir: *usize"))
     rows.push(("readdir", "dir: usize, into: *u8, room: usize, got: *usize"))
     rows.push(("closedir", "dir: usize"))
@@ -1322,3 +1323,163 @@ fsh_sync_data_hook_unanswered_refused()
 
     lbr_drop([p, out])
 end fsh_sync_data_hook_unanswered_refused
+
+// -- a file's times, and its birth time ---------------------------------------------------------------
+
+// A program setting times both ways, which reaches `sysl_fs_set_times` (and `sysl_fs_stat`, for the
+// call that sets neither) and not `sysl_fs_set_modified`.
+private val fsh_sets_times: string = raw"""
+    import sysl.fs.{set_times, link_set_times}
+    import sysl.fs.sys.Stat
+    import sysl.time.Instant
+
+    run() -> int
+        var n = 0
+
+        if set_times("/a", Some(Instant(1)), None).is_ok() then n += 1
+        if link_set_times("/a", None, Some(Instant(2))).is_ok() then n += 1
+        if set_times("/a", None, None).is_ok() then n += 1
+        n
+    end run
+    """
+
+@test("a freestanding program setting times with the set_times hook answered links with no C library in it")
+fsh_set_times_hook_answered_links()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_sets_times + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    // The program's own answer is the one in the image, under its export or its own name.
+    assert(all.contains(" T sysl_fs_set_times") || all.contains(" T k_set_times"), all)
+
+    for name in ["utimensat", "sysl_fs_host_set_times", "statx", "sysl_fs_set_modified"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_set_times_hook_answered_links
+
+@test("a freestanding program setting times with set_times unanswered is refused naming it, not set_modified")
+fsh_set_times_hook_unanswered_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_sets_times + fsh_runtime + fsh_hooks(["set_times"]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with the set_times hook unanswered")
+    assert(said.1.contains("define 'sysl_fs_set_times' with '@export'"), said.1)
+    assert(!said.1.contains("'sysl_fs_set_modified'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_set_times_hook_unanswered_refused
+
+/** The hook's contract, read off a program's own answer to it: `follow` is 1 through `set_times` and 0
+ * through `link_set_times`, `given` has a bit per time given (1 the access time, 2 the modification
+ * time), a time not given is passed as zero, and a call giving neither never reaches the hook.
+ */
+@test("set_times and link_set_times hand their hook follow, the given bits and the microseconds")
+fsh_set_times_hook_arguments()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{set_times, link_set_times, make_temp_dir, remove_dir_all}
+        import sysl.time.Instant
+
+        @export("sysl_fs_set_times")
+        seen(path: *u8, len: usize, follow: int, accessed: long, modified: long, given: int) -> int
+            print(f"len $len follow $follow accessed $accessed modified $modified given $given")
+            0
+
+        val d = make_temp_dir("fsh").unwrap()
+
+        print(f"len ${d.bytes.len} ${(d + "/nothing").bytes.len}")
+        set_times(d, Some(Instant(1500000000123456)), Some(Instant(-1234567))).unwrap()
+        set_times(d, Some(Instant(7)), None).unwrap()
+        link_set_times(d, None, Some(Instant(9))).unwrap()
+        link_set_times(d + "/nothing", Some(Instant(1)), Some(Instant(2))).unwrap()
+        set_times(d, None, None).unwrap()
+        print(link_set_times(d + "/nothing", None, None))
+
+        remove_dir_all(d).unwrap()
+        """)
+
+    val said = lbr_run(p, [])
+    val lines = lines_of(said)
+
+    assert_eq(lines.len(), 6, said)
+
+    // The first line is the two paths' lengths, as the program counts them: the hook is handed the
+    // string's own bytes, with no terminator counted.
+    val (dir_len, nothing_len) = fsh_two_words(lines[0])
+
+    assert_eq(lines[1], s"len $dir_len follow 1 accessed 1500000000123456 modified -1234567 given 3")
+    assert_eq(lines[2], s"len $dir_len follow 1 accessed 7 modified 0 given 1")
+    assert_eq(lines[3], s"len $dir_len follow 0 accessed 0 modified 9 given 2")
+    assert_eq(lines[4], s"len $nothing_len follow 0 accessed 1 modified 2 given 3")
+    assert_eq(lines[5], "Err(no such file or directory)")
+    lbr_drop([p])
+end fsh_set_times_hook_arguments
+
+// The second and third words of `len A B`.
+private fsh_two_words(line: string) -> (string, string)
+    val first = line.index_of(" ").unwrap()
+    val rest = line[first + 1..<line.len]
+    val second = rest.index_of(" ").unwrap()
+
+    (rest[0..<second], rest[second + 1..<rest.len])
+end fsh_two_words
+
+@test("a set_times hook answering UNSUPPORTED is heard as not supported, from both calls")
+fsh_set_times_unsupported()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{set_times, link_set_times}
+        import sysl.time.Instant
+
+        @export("sysl_fs_set_times")
+        no_times(path: *u8, len: usize, follow: int, accessed: long, modified: long, given: int) -> int = -38
+
+        print(set_times("/tmp", Some(Instant(1)), None))
+        print(link_set_times("/tmp", None, Some(Instant(1))))
+        """)
+
+    assert_eq(lbr_run(p, []), "Err(not supported on this target)\nErr(not supported on this target)\n")
+    lbr_drop([p])
+end fsh_set_times_unsupported
+
+/** A program's own `stat` hook decides the birth time: one that leaves the last three numbers zero,
+ * as every supplier written before them does, reads as `None`; one that sets `has` reads as its time.
+ */
+@test("a stat hook that fills no birth time answers created None, and one that does answers it")
+fsh_stat_hook_birth_time()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.metadata
+        import sysl.fs.sys.{Stat, stat_created}
+
+        @export("sysl_fs_stat")
+        my_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int
+            *out = if len == 5 then Stat(3, 0o100644, 1, 0, 0, 7, 1, 1, 0, 1, 0, 1, 0, 1400000000, 654321999, stat_created)
+            else Stat(3, 0o100644, 1, 0, 0, 7, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0)
+
+            0
+
+        val old = metadata("/old").unwrap()
+        val born = metadata("/born").unwrap()
+
+        print(f"${old.size} ${old.created.is_none()}")
+        print(born.created.unwrap().us)
+        """)
+
+    assert_eq(lbr_run(p, []), "3 true\n1400000000654321\n")
+    lbr_drop([p])
+end fsh_stat_hook_birth_time

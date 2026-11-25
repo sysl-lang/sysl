@@ -39,13 +39,18 @@ module sysl.fs.sys
 // **A descriptor is an `int` and a directory stream a `usize`**, which hold whatever the supplier
 // keeps -- a C library's `DIR *`, or a kernel's own index.
 
-/** What `sysl_fs_stat` and `sysl_fs_fstat` fill in about one filesystem entry: thirteen 64-bit
+/** What `sysl_fs_stat` and `sysl_fs_fstat` fill in about one filesystem entry: sixteen 64-bit
  * numbers, in this order.
  *
  * `mode` carries POSIX's encoding -- the file type in the top bits (`0o170000` masks it: `0o100000`
  * a regular file, `0o040000` a directory, `0o120000` a symbolic link) and the twelve permission bits
  * below -- since that is what `Meta` reads. A supplier with nothing to say about a field leaves it
  * zero. Times are seconds and nanoseconds since the Unix epoch, held apart.
+ *
+ * **The last three are a reading not every platform can give**, so they carry their own word for
+ * "unknown" rather than leaving zero to mean it -- zero is a time. `has` holds a bit per optional
+ * reading the supplier filled in (`stat_created`: `created_s` and `created_ns` are the entry's birth
+ * time), and a supplier that knows nothing of them leaves all three zero, which reads as absent.
  */
 struct Stat
     size: long
@@ -61,7 +66,16 @@ struct Stat
     accessed_ns: long
     changed_s: long
     changed_ns: long
+    created_s: long
+    created_ns: long
+    has: long
 end Stat
+
+/** The bit of `Stat.has` saying `created_s` and `created_ns` hold the entry's birth time. */
+const stat_created: long = 1
+
+/** A reading with nothing in it yet, which every caller hands a hook to fill. */
+private[fs] unread() -> Stat = Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 /** The bits of `sysl_fs_open`'s `flags`. They are this interface's own numbers rather than any
  * platform's `O_*`, which differ between C libraries; a supplier translates them once.
@@ -260,6 +274,22 @@ private[fs] extern "sysl_fs_chown" chown(path: *u8, len: usize, owner: u32, grou
  */
 @needs(os)
 private[fs] extern "sysl_fs_set_modified" set_modified(path: *u8, len: usize, micros: long) -> int
+
+/** The bits of `sysl_fs_set_times`'s `given`: which of the two times the call sets. A time whose bit
+ * is clear is left as it is, and the number passed for it means nothing.
+ */
+const times_accessed: int = 1
+const times_modified: int = 2
+
+/** The access time of what `path` names set to `accessed` and its modification time to `modified`,
+ * each microseconds since the Unix epoch, and only those `given` names (`times_*`). A symbolic link
+ * is followed where `follow` is non-zero; where it is zero the link's own times are set and what it
+ * points at is untouched. `given` is never zero. A filesystem that cannot be told a time answers
+ * `UNSUPPORTED`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_set_times" set_times(path: *u8, len: usize, follow: int, accessed: long,
+                                                 modified: long, given: int) -> int
 
 // -- directories -------------------------------------------------------------------------------------
 

@@ -177,6 +177,7 @@ private extern "sysl_fs_host_msync" c_msync(at: *u8, len: usize, wait: int) -> i
 private extern "sysl_fs_host_unmap" c_unmap(at: *u8, len: usize) -> int
 private extern "sysl_fs_host_advise" c_advise(at: *u8, len: usize, advice: int) -> int
 private extern "sysl_fs_host_page_size" c_page_size() -> usize
+private extern "sysl_fs_host_set_times" c_set_times(path: *u8, follow: int, times: *i64, given: int) -> int
 #endif
 
 // -- descriptors -------------------------------------------------------------------------------------
@@ -450,6 +451,43 @@ supply_set_modified(path: *u8, len: usize, micros: long) -> int
     UNSUPPORTED
 #endif
 end supply_set_modified
+
+#if posix
+/** Microseconds since the epoch as the seconds and nanoseconds of a `struct timespec`, written to
+ * `into[0]` and `into[1]`. The seconds are floored, so a time before the epoch keeps its
+ * nanoseconds in `0..<1_000_000_000` as `utimensat` requires.
+ */
+private split_micros(micros: long, into: *i64)
+    var secs = micros / 1000000
+    var rest = micros % 1000000
+
+    if rest < 0
+        secs -= 1
+        rest += 1000000
+
+    into[0] = secs
+    into[1] = rest * 1000
+end split_micros
+#endif
+
+// The two times go to C as seconds and nanoseconds; what "leave this one" and "the link itself" are
+// spelled as -- `UTIME_OMIT`, `AT_SYMLINK_NOFOLLOW` -- is a header's number, so the shim spells them.
+@export("sysl_fs_set_times")
+supply_set_times(path: *u8, len: usize, follow: int, accessed: long, modified: long, given: int) -> int
+#if posix
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    var times: [4]i64 = [0, 0, 0, 0]
+
+    split_micros(accessed, &times[0])
+    split_micros(modified, &times[2])
+    status(c_set_times(&c[0], follow, &times[0], given))
+#else
+    UNSUPPORTED
+#endif
+end supply_set_times
 
 // -- directories -------------------------------------------------------------------------------------
 

@@ -7,7 +7,7 @@ import sysl.time.Instant
 
 // What a program can learn about a path without reading what is at the end of it.
 //
-// **`stat` is one call of `sysl.fs.sys`, and it answers thirteen numbers** -- the shape of
+// **`stat` is one call of `sysl.fs.sys`, and it answers sixteen numbers** -- the shape of
 // `sysl.fs.sys.Stat`, which is whatever lies under the hook filling it in, never a `struct stat`
 // transcribed: that is laid out differently by every platform's headers, and a transcription of one
 // is numbers nothing checks. Nothing here knows an offset.
@@ -128,6 +128,18 @@ struct Meta
     accessed: Instant
     changed: Instant
 
+    /** When the entry was made -- its birth time -- where the platform and the filesystem keep one,
+     * and `None` where they do not, rather than a time nobody recorded. macOS answers it on every
+     * filesystem that keeps one (APFS and HFS+ do); Linux answers it through `statx` where the
+     * kernel, the C library and the filesystem all know it (ext4, btrfs and xfs do); and a program
+     * supplying `sysl.fs.sys` itself answers it where its own `stat` hook fills it in.
+     *
+     * Nothing can set it to an arbitrary time, though on macOS a `set_times` giving a modification
+     * time EARLIER than the birth time moves the birth time back to it: a file cannot have changed
+     * before it existed.
+     */
+    created: Option[Instant]
+
     kind(self) -> Kind
         val t = self.mode & s_ifmt
 
@@ -158,8 +170,9 @@ struct Meta
 end Meta
 
 // **The reading surface is declared wherever `sysl.fs` is**, because it is written over `sysl.fs.sys`
-// alone: `metadata` and `link_metadata` are one `stat` hook into the thirteen numbers of
-// `sysl.fs.sys.Stat`, `set_permissions` one `chmod` hook and `set_owner` one `chown`. Whoever supplies those hooks -- a C
+// alone: `metadata` and `link_metadata` are one `stat` hook into the sixteen numbers of
+// `sysl.fs.sys.Stat`, `set_permissions` one `chmod` hook, `set_owner` one `chown` and `set_times`
+// and `link_set_times` one `set_times`. Whoever supplies those hooks -- a C
 // library on a hosted target, a program's own `@export`s on a bare one -- fills POSIX's shape, and
 // leaves zero what it has nothing to say about. A supplier that cannot answer a hook at all answers
 // `UNSUPPORTED`, and the call reports `unsupported()`, "not supported on this target", rather than the file being
@@ -219,7 +232,57 @@ set_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError] =
 set_modified(path: string, when: Instant) -> Result[unit, IoError] =
     answered(fsys.set_modified(as_ptr(path.bytes), path.bytes.len, when.us))
 
-/** One reading, turned from thirteen numbers into the struct. The inode and device are identities,
+/** The access time and the modification time of what `path` names set, following a symbolic link --
+ * each to the `Instant` given, and left exactly as it was where `None` is given, which is what lets a
+ * program copying a file's times carry one and not the other. `set_times(p, Some(t), Some(t))` is
+ * `set_modified(p, t)`.
+ *
+ * Neither can be set to "now" by the kernel's own clock here, because an `Instant` is a time and not
+ * an instruction: `Some(sysl.time.now())` sets it by this program's. The third time, `changed`, is
+ * not anyone's to set: it moves to now on every call that changes anything.
+ *
+ * A path that is not there reports `NotFound` -- also where both are `None`, which changes nothing
+ * and still asks that the path be there, so the answer is the same on every platform. Times are kept
+ * to the resolution of the filesystem; an `Instant` is microseconds, which APFS, ext4, btrfs and xfs
+ * all keep exactly. A target whose filesystem cannot be told a time reports `unsupported()`.
+ */
+set_times(path: string, accessed: Option[Instant], modified: Option[Instant]) -> Result[unit, IoError] =
+    times_of(path, 1, accessed, modified)
+
+/** The same, on the path **itself**: a symbolic link's own times are set, and what it points at is
+ * left untouched -- `link_metadata` reads them back. A path that is not a link is set as `set_times`
+ * sets it, and a link that points nowhere is still a link whose times can be set.
+ */
+link_set_times(path: string, accessed: Option[Instant],
+               modified: Option[Instant]) -> Result[unit, IoError] =
+    times_of(path, 0, accessed, modified)
+
+/** One `set_times` hook with the bits saying which of the two it sets. Where it sets neither, the
+ * path is read instead: `utimensat` with both left alone answers success on Linux whether or not
+ * anything is there, and the answer should not depend on the platform.
+ */
+private times_of(path: string, follow: int, accessed: Option[Instant],
+                 modified: Option[Instant]) -> Result[unit, IoError]
+    var given = 0
+    var a = 0
+    var m = 0
+
+    if accessed is Some(t)
+        given |= fsys.times_accessed
+        a = t.us
+
+    if modified is Some(t)
+        given |= fsys.times_modified
+        m = t.us
+
+    if given == 0
+        stat_of(path, follow)?
+        return Ok(())
+
+    answered(fsys.set_times(as_ptr(path.bytes), path.bytes.len, follow, a, m, given))
+end times_of
+
+/** One reading, turned from sixteen numbers into the struct. The inode and device are identities,
  * not quantities: a device id whose top bit is set (`/dev/null` on macOS) is kept as the same bits.
  *
  *
@@ -227,7 +290,7 @@ set_modified(path: string, when: Instant) -> Result[unit, IoError] =
  * shape: there is no allocation, and nothing outlives the call.
  */
 private stat_of(path: string, follow: int) -> Result[Meta, IoError]
-    var st = fsys.Stat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    var st = fsys.unread()
     val code = fsys.stat(as_ptr(path.bytes), path.bytes.len, follow, &st)
 
     if code != 0 then return Err(from_status(code))
@@ -235,11 +298,16 @@ private stat_of(path: string, follow: int) -> Result[Meta, IoError]
     Ok(meta_of(st))
 end stat_of
 
-/** The thirteen numbers of a reading as the struct, for every hook that fills one in. */
-private[fs] meta_of(st: fsys.Stat) -> Meta =
+/** The sixteen numbers of a reading as the struct, for every hook that fills one in. A birth time is
+ * there only where the hook set its bit in `has`; a zero `has` is a supplier that knows nothing of it.
+ */
+private[fs] meta_of(st: fsys.Stat) -> Meta
+    val created = if (st.has & fsys.stat_created) != 0 then Some(at(st.created_s, st.created_ns)) else None
+
     Meta(st.size, u32(st.mode), u64(st.links), u32(st.uid), u32(st.gid), u64.wrap(st.inode),
          u64.wrap(st.device), at(st.modified_s, st.modified_ns), at(st.accessed_s, st.accessed_ns),
-         at(st.changed_s, st.changed_ns))
+         at(st.changed_s, st.changed_ns), created)
+end meta_of
 
 /** A POSIX timestamp as an `Instant`. The nanoseconds are divided rather than dropped, so a file
  * written twice within a second is still ordered as long as the filesystem recorded it that way.
