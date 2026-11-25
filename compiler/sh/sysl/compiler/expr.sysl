@@ -140,10 +140,13 @@ end unwrap_results
 //
 // **A struct's `invariant` clause is the one condition here that is a block**, standing in the `if`
 // its clauses lower to (`first_broken`), and it is refused as the clause the reader wrote.
+//
+// An exported alias of `bool` is a `bool` (`reference/ffi.md § Naming a type in the header`), so the
+// test reads through the name to the type it stands for.
 analyze_bool(cx: &Analyzer, e: Expr, at: Span) -> TExpr
     val t = type_expr(cx, e, Some(Bool))
 
-    if texpr_type(t) != Bool && texpr_type(t) != Unknown
+    if repr(texpr_type(t)) != Bool && texpr_type(t) != Unknown
         if *e.kind is Block(_) && cx.func_name.contains("$inv") then
             return cx.err(at, s"an 'invariant' must be a 'bool', but this one is ${type_show(texpr_type(t))}")
 
@@ -442,14 +445,16 @@ private has_nul(s: string) -> bool
 end has_nul
 
 // `null` takes the `*T` its context expects. The null callback is the same word: several C
-// interfaces read one as "there is none, use the default".
+// interfaces read one as "there is none, use the default". A name that is only a name (an exported
+// alias, `reference/ffi.md § Naming a type in the header`) is read through to the pointer it names,
+// and the literal keeps the name, so the header's spelling survives.
 private null_literal(cx: &Analyzer, span: Span, expected: Option[Type]) -> TExpr
     if expected.is_none() then
         return cx.err(span, "'null' takes its type from its context, and there is none here")
 
     val want = expected.unwrap()
 
-    want match
+    nameless(want) match
         Ptr(_, _) -> TExpr(span, TNullLit(want))
         CFn(_, _, _) -> TExpr(span, TNullLit(want))
         _ -> cx.err(span, s"'null' is a raw pointer, and ${type_show(want)} was expected here")
