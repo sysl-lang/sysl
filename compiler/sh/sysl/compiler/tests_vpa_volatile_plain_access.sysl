@@ -20,6 +20,8 @@ import sysl.text.{Search, join, replace_all, split}
 // storage, a `@packed` bitfield's container), the optimisation level (-O0, the default, -O2), the object
 // format (ELF for aarch64-freestanding, Mach-O for aarch64-macos), and LTO (the bitcode archive linked by
 // clang). One cell pins what is outside the guarantee: another processor keeps LLVM's `load volatile`.
+// 32-bit ARM holds the same guarantee for 1, 2 and 4 bytes (`AccVolatileArm`), and makes a wider volatile
+// one such access per word; its cells are below the AArch64 ones (`vpa_thumb_*`).
 // A volatile wider than 64 bits has no one instruction and is refused on AArch64 (`tests_volatile.sysl`).
 //
 // Skipped cells, and why: an under-aligned volatile scalar has no spelling (a `@packed` volatile field
@@ -214,6 +216,63 @@ private val vpa_fixture: string = raw"""
     @export("reg")
     reg(r: *Reg)
         r.mode = 5
+    """ + vpa_aggregate_fixture
+
+// A register block copied, built and stored whole, and a bitfield register changed `with` new fields:
+// each a volatile access to an aggregate, made one part at a time (`emit.sysl`'s
+// `emit_plain_aggregate`). Shared by the AArch64 and the Thumb fixtures.
+private val vpa_aggregate_fixture: string = raw"""
+
+    struct Uart
+        status: volatile u32
+        data: volatile u32
+        baud: u32
+
+    struct Pair
+        lo: volatile u64
+        hi: volatile u64
+        mark: volatile u8
+
+    @packed
+    struct Shcsr
+        memfaultact: volatile u1
+        busfaultact: volatile u1
+        _: volatile u14
+        memfaultena: volatile u1
+        busfaultena: volatile u1
+        usgfaultena: volatile u1
+        _: volatile u13
+
+    struct Scb
+        shcsr: Shcsr
+
+    struct Bank
+        regs: [3]volatile u32
+
+    @export("snapshot")
+    snapshot(r: *Uart) -> u32
+        val u = *r
+        u.status + u.data
+
+    @export("store_block")
+    store_block(r: *Uart)
+        *r = Uart(1, 2, 3)
+
+    @export("copy_block")
+    copy_block(d: *Uart, s: *Uart)
+        *d = *s
+
+    @export("pair_copy")
+    pair_copy(d: *Pair, s: *Pair)
+        *d = *s
+
+    @export("three_fields")
+    three_fields(p: *Scb)
+        p.shcsr = p.shcsr with { memfaultena = 1, busfaultena = 1, usgfaultena = 1 }
+
+    @export("bank_copy")
+    bank_copy(d: *Bank, s: *Bank)
+        *d = *s
     """
 
 // Every function of the fixture, and an instruction its body must hold.
@@ -236,6 +295,7 @@ private vpa_expected() -> Buf[(string, string)]
     out.push(("bank", "str\tw"))
     out.push(("ticks", "str\tx"))
     out.push(("reg", "strb\tw"))
+    vpa_aggregate_expected(&out)
     out
 end vpa_expected
 
@@ -248,7 +308,7 @@ end vpa_objdump
 
 // A fresh directory holding the fixture, or `None` where the standard module's source or llvm-objdump
 // is not on this machine.
-private vpa_project() -> Option[string]
+private vpa_project(fixture: string = vpa_fixture) -> Option[string]
     if std_root().is_err()
         print("skipped: the standard module's source is not on this machine")
         return None
@@ -260,7 +320,7 @@ private vpa_project() -> Option[string]
     val root = replace_all(make_temp_dir("sysl-vpa").unwrap(), "//", "/")
 
     make_dir_all(root).unwrap()
-    write_text(s"$root/main.sysl", vpa_fixture).unwrap()
+    write_text(s"$root/main.sysl", fixture).unwrap()
     Some(root)
 end vpa_project
 
@@ -281,9 +341,19 @@ private vpa_build_c(root: string, args: []const string)
     assert_eq(code, Fine, join(lines.view(), "\n"))
 end vpa_build_c
 
-private vpa_disassemble(file: string) -> string
-    val dis = capture(vpa_objdump().unwrap(), ["-d", "--no-show-raw-insn", "--no-leading-addr", file], "", [],
-                      true)
+// The disassembly of `file`; a non-empty `mattr` names the features an object that records none (one
+// compiled from LTO bitcode) was built for.
+private vpa_disassemble(file: string, mattr: string = "") -> string
+    var argv: Buf[string] = buf()
+
+    for a in ["-d", "--no-show-raw-insn", "--no-leading-addr"]
+        argv.push(a)
+
+    if mattr != "" then argv.push(s"--mattr=$mattr")
+
+    argv.push(file)
+
+    val dis = capture(vpa_objdump().unwrap(), argv.view(), "", [], true)
 
     dis match
         Ok(out) -> out.text
@@ -291,9 +361,9 @@ private vpa_disassemble(file: string) -> string
 end vpa_disassemble
 
 // The disassembly of the fixture's archive for `machine` at `-O<level>`, or `None` where it cannot be
-// built and read here.
-private vpa_code(machine: string, level: string) -> Option[string]
-    val root = vpa_project()
+// built and read here. `mattr` is `vpa_disassemble`'s.
+private vpa_code(machine: string, level: string, fixture: string = vpa_fixture, mattr: string = "") -> Option[string]
+    val root = vpa_project(fixture)
 
     if root.is_none() then return None
 
@@ -301,14 +371,14 @@ private vpa_code(machine: string, level: string) -> Option[string]
 
     vpa_build_c(dir, ["--target", machine, s"-O$level", "-o", s"$dir/libk.a"])
 
-    val text = vpa_disassemble(s"$dir/libk.a")
+    val text = vpa_disassemble(s"$dir/libk.a", mattr)
 
     remove_dir_all(dir).unwrap_or(())
     Some(text)
 end vpa_code
 
 // The fixture's LLVM module for `machine`.
-private vpa_ir(machine: string) -> Option[string]
+private vpa_ir(machine: string, fixture: string = vpa_fixture) -> Option[string]
     if std_root().is_err()
         print("skipped: the standard module's source is not on this machine")
         return None
@@ -316,7 +386,7 @@ private vpa_ir(machine: string) -> Option[string]
     val dir = replace_all(make_temp_dir("sysl-vpa").unwrap(), "//", "/")
 
     make_dir_all(dir).unwrap()
-    write_text(s"$dir/main.sysl", vpa_fixture).unwrap()
+    write_text(s"$dir/main.sysl", fixture).unwrap()
     vpa_build_c(dir, ["--target", machine, "--emit-llvm", s"$dir/k.ll", "-o", s"$dir/libk.a"])
 
     val text = read_text(s"$dir/k.ll").unwrap()
@@ -527,7 +597,7 @@ end vpa_reads_back_as_llvm
 
 @test("another processor keeps LLVM's load volatile and store volatile")
 vpa_ir_other_processor()
-    for machine in ["x86_64-freestanding", "riscv64-freestanding", "thumb-freestanding"]
+    for machine in ["x86_64-freestanding", "riscv64-freestanding", "riscv32-freestanding"]
         val got = vpa_ir(machine)
 
         if got.is_none() then return
@@ -538,3 +608,774 @@ vpa_ir_other_processor()
         assert(vpa_define(ir, "st8").contains("store volatile i8"), s"$machine:\n$ir")
         assert(!ir.contains("asm sideeffect \"ldr"), s"$machine:\n$ir")
 end vpa_ir_other_processor
+
+// **On 32-bit ARM (every Thumb target) a volatile access of 1, 2 or 4 bytes is one plain `ldr`/`str`**
+// (`b`/`h`) of a general register from a bare register address (`AccVolatileArm`). LLVM 21 selects a
+// post-indexed `ldr r3, [r2], #4` or `ldrb r3, [r0], #-1` for a volatile in a loop at -Os and under
+// LTO, an `ldm r2!, {r3}` / `stm r0!, {r2}` on an M0+, and a `vldr s2, [r0]` for a float -- an
+// `ldm`/`stm` an exception may abandon and restart, reading a read-to-clear register twice. The axes
+// are those above, over the eight Thumb machines (ARMv6-M, v7-M, v7E-M with single, double and no FPU,
+// v8-M Mainline hard, softfp and soft), at -O0, -O1, -O2 and -Os, and full LTO. A volatile wider than a
+// word (`u64`, `f64`, `u128`) is one such access per 32-bit word, lowest address first (where LLVM's was
+// an `ldrd`/`strd`, written back in a loop); the order is pinned in the IR and in the machine code. A
+// width that is not whole words (`u48`) is refused there (`tests_volatile.sysl`, `vo_arm_*`).
+private val vpa_thumb_fixture: string = raw"""
+    @packed
+    struct Reg
+        enable: volatile u1
+        mode: volatile u3
+        prescale: volatile u4
+
+    struct Block
+        a: volatile u32
+        b: volatile u32
+        c: volatile u32
+        d: volatile u32
+        flag: volatile bool
+        small: volatile u12
+        link: volatile *u8
+        bank: [4]volatile u32
+        half: volatile f16
+
+    struct Wide
+        a: volatile u64
+        b: volatile u64
+
+    var tick: volatile u32 = 0
+
+    @export("ld8")
+    ld8(p: *volatile u8, n: int) -> u8
+        var q = p
+        var acc: u8 = 0
+
+        for i in 0..<n
+            acc = acc ^ *q
+            q = &q[-1]
+
+        acc
+    end ld8
+
+    @export("st8")
+    st8(p: *volatile u8, n: int, v: u8)
+        var q = p
+
+        for i in 0..<n
+            *q = v
+            q = &q[1]
+    end st8
+
+    @export("ld16")
+    ld16(p: *volatile u16, n: int) -> u16
+        var q = p
+        var acc: u16 = 0
+
+        for i in 0..<n
+            acc = acc ^ *q
+            q = &q[1]
+
+        acc
+    end ld16
+
+    @export("st16")
+    st16(p: *volatile u16, n: int, v: u16)
+        var q = p
+
+        for i in 0..<n
+            *q = v
+            q = &q[-1]
+    end st16
+
+    @export("ld32")
+    ld32(p: *volatile u32, n: int) -> u32
+        var q = p
+        var acc: u32 = 0
+
+        for i in 0..<n
+            acc = acc ^ *q
+            q = &q[1]
+
+        acc
+    end ld32
+
+    @export("ld32d")
+    ld32d(p: *volatile u32, n: int) -> u32
+        var q = p
+        var acc: u32 = 0
+
+        for i in 0..<n
+            acc = acc ^ *q
+            q = &q[-1]
+
+        acc
+    end ld32d
+
+    @export("st32")
+    st32(p: *volatile u32, n: int, v: u32)
+        var q = p
+
+        for i in 0..<n
+            *q = v
+            q = &q[1]
+    end st32
+
+    @export("ldf32")
+    ldf32(p: *volatile f32, n: int) -> f32
+        var q = p
+        var acc: f32 = 0
+
+        for i in 0..<n
+            acc = acc + *q
+            q = &q[1]
+
+        acc
+    end ldf32
+
+    @export("stf32")
+    stf32(p: *volatile f32, n: int, v: f32)
+        var q = p
+
+        for i in 0..<n
+            *q = v
+            q = &q[1]
+    end stf32
+
+    @export("ld64")
+    ld64(p: *volatile u64, n: int) -> u64
+        var q = p
+        var acc: u64 = 0
+
+        for i in 0..<n
+            acc = acc ^ *q
+            q = &q[1]
+
+        acc
+    end ld64
+
+    @export("st64")
+    st64(p: *volatile u64, n: int, v: u64)
+        var q = p
+
+        for i in 0..<n
+            *q = v
+            q = &q[1]
+    end st64
+
+    @export("ldf64")
+    ldf64(p: *volatile f64) -> f64 = *p
+
+    @export("stf64")
+    stf64(p: *volatile f64, v: f64)
+        *p = v
+
+    @export("get64")
+    get64(p: *volatile u64) -> u64 = *p
+
+    @export("set64")
+    set64(p: *volatile u64, v: u64)
+        *p = v
+
+    @export("copy128")
+    copy128(p: *volatile u128, q: *volatile u128)
+        *q = *p
+
+    @export("quad")
+    quad(b: *Block) -> u32 = b.a ^ b.b ^ b.c ^ b.d
+
+    @export("quad_set")
+    quad_set(b: *Block, x: u32)
+        b.a = x
+        b.b = x
+        b.c = x
+        b.d = x
+
+    @export("wide")
+    wide(w: *Wide) -> u64 = w.a ^ w.b
+
+    @export("wide_set")
+    wide_set(w: *Wide, x: u64)
+        w.a = x
+        w.b = x
+
+    @export("narrow")
+    narrow(b: *Block)
+        b.flag = !b.flag
+        b.small = b.small + 1
+        b.link = b.link
+        b.half = b.half + 1.0
+    end narrow
+
+    @export("bank")
+    bank(b: *Block) -> u32
+        b.bank[3] = b.bank[2]
+        b.bank[1] = b.bank[0]
+        b.bank[0]
+    end bank
+
+    @export("ticks")
+    ticks() -> u32
+        tick += 1
+        tick
+
+    @export("reg")
+    reg(r: *Reg)
+        r.mode = 5
+    """ + vpa_aggregate_fixture
+
+// The aggregate cells, and an instruction each body must hold, on either processor.
+private vpa_aggregate_expected(out: *Buf[(string, string)])
+    out.push(("snapshot", "ldr"))
+    out.push(("store_block", "str"))
+    out.push(("copy_block", "str"))
+    out.push(("pair_copy", "str"))
+    out.push(("three_fields", "str"))
+    out.push(("bank_copy", "str"))
+
+// Every function of the Thumb fixture, and an instruction its body must hold.
+private vpa_thumb_expected() -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+
+    vpa_aggregate_expected(&out)
+
+    out.push(("ld64", "ldr"))
+    out.push(("st64", "str"))
+    out.push(("ldf64", "ldr"))
+    out.push(("stf64", "str"))
+    out.push(("get64", "ldr"))
+    out.push(("set64", "str"))
+    out.push(("copy128", "str"))
+    out.push(("wide", "ldr"))
+    out.push(("wide_set", "str"))
+
+    out.push(("ld8", "ldrb"))
+    out.push(("st8", "strb"))
+    out.push(("ld16", "ldrh"))
+    out.push(("st16", "strh"))
+    out.push(("ld32", "ldr"))
+    out.push(("ld32d", "ldr"))
+    out.push(("st32", "str"))
+    out.push(("ldf32", "ldr"))
+    out.push(("stf32", "str"))
+    out.push(("quad", "ldr"))
+    out.push(("quad_set", "str"))
+    out.push(("narrow", "strh"))
+    out.push(("bank", "str"))
+    out.push(("ticks", "str"))
+    out.push(("reg", "strb"))
+    out
+end vpa_thumb_expected
+
+// Every memory access in `body` is one plain `ldr`/`str` (`b`/`h`, a `.w` encoding allowed) of a general
+// register from a bare register address: no writeback, no offset, no `ldm`/`stm`, no `ldrd`/`strd`, no
+// `vldr`/`vstr`, no condition. The frame's own (`sp`) and a literal-pool constant (`pc`) are not the
+// fixture's.
+// The lines of `body` that touch memory off the frame, in order: neither through `sp` nor through a
+// register the body copied out of it (`mov r0, sp`, `add r1, sp, #8`, as -O0 reaches a stack copy), nor
+// a literal-pool constant (`pc`).
+private vpa_thumb_memory_lines(body: string) -> Buf[string]
+    val lines = split(body, "\n")
+    var frame: Buf[string] = buf()
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        val parts = split(lines[i], "\t")
+
+        if parts.len < 3 then continue
+
+        val op = parts[1]
+        val operands = parts[2]
+        val ops = split(replace_all(replace_all(operands, "[", ""), "]", ""), ", ")
+        val memory = op.starts_with("ld") || op.starts_with("st") || op.starts_with("vld") || op.starts_with("vst")
+
+        if memory
+            val off_frame = !operands.starts_with("sp") && !operands.contains("[sp") && !operands.contains("[pc") &&
+                (ops.len < 2 || !vpa_holds(frame, ops[1]))
+
+            if off_frame then out.push(lines[i])
+
+            if op.starts_with("ldr") && ops.len > 0 then frame = vpa_without(frame, ops[0])
+        else if ops.len >= 2 && (op == "mov" || op.starts_with("add")) && ops[1] == "sp"
+            frame.push(ops[0])
+        else if ops.len > 0 && !op.starts_with("b") && !op.starts_with("cmp") && !op.starts_with("it") &&
+                !op.starts_with("push") && !op.starts_with("pop")
+            frame = vpa_without(frame, ops[0])
+
+    out
+end vpa_thumb_memory_lines
+
+private vpa_holds(names: Buf[string], name: string) -> bool
+    for n in names.view()
+        if n == name then return true
+
+    false
+end vpa_holds
+
+private vpa_without(names: Buf[string], name: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for n in names.view()
+        if n != name then out.push(n)
+
+    out
+end vpa_without
+
+private vpa_thumb_plain(body: string, symbol: string, context: string)
+    val lines = vpa_thumb_memory_lines(body)
+    var accesses = 0
+
+    assert(!body.contains("<unknown>"),
+           s"$context: '$symbol' holds an instruction the disassembler cannot read:\n$body")
+
+    for i in 0..<int(lines.len())
+        val parts = split(lines[i], "\t")
+        val op = parts[1]
+        val operands = parts[2]
+
+        accesses += 1
+
+        val bare = if op.ends_with(".w") then op[0..<op.len - 2] else op
+        val plain = (bare == "ldr" || bare == "ldrb" || bare == "ldrh" || bare == "str" || bare == "strb" ||
+            bare == "strh") && operands.contains(", [") && operands.ends_with("]") && !operands.contains("#") &&
+            !operands.contains("!") && split(operands, ",").len == 2
+
+        assert(plain, s"$context: '$symbol' makes the access '${lines[i]}', not one plain ldr/str from a " +
+               s"register address:\n$body")
+
+    assert(accesses > 0, s"$context: '$symbol' makes no access at all:\n$body")
+end vpa_thumb_plain
+
+private vpa_thumb_all_plain(dis: string, context: string)
+    for item in vpa_thumb_expected()
+        val body = vpa_body(dis, item.0, false)
+
+        assert(body.contains("\t" + item.1 + "\t") || body.contains("\t" + item.1 + ".w\t"),
+               s"$context: '${item.0}' has no '${item.1}':\n$dis")
+        vpa_thumb_plain(body, item.0, context)
+end vpa_thumb_all_plain
+
+// The Thumb fixture built for `machine` at -O0, -O1, -O2 and -Os, every access plain at each. The
+// disassembler is told of a double-precision FPv5 outright: the objects record no FPU it reads, and an
+// FP instruction it cannot read could hide a `vldr`.
+private vpa_thumb_levels(machine: string)
+    for level in ["0", "1", "2", "s"]
+        vpa_code(machine, level, vpa_thumb_fixture, "+fp-armv8d16") match
+            Some(dis) -> vpa_thumb_all_plain(dis, s"$machine -O$level")
+            None -> return
+end vpa_thumb_levels
+
+@test("on thumb-freestanding (v8-M, hard float) every volatile access is one plain ldr or str at every level")
+vpa_thumb_v8m_hard()
+    vpa_thumb_levels("thumb-freestanding")
+
+@test("on thumb-freestanding-softfp every volatile access is one plain ldr or str at every level")
+vpa_thumb_v8m_softfp()
+    vpa_thumb_levels("thumb-freestanding-softfp")
+
+@test("on thumb-freestanding-soft every volatile access is one plain ldr or str at every level")
+vpa_thumb_v8m_soft()
+    vpa_thumb_levels("thumb-freestanding-soft")
+
+@test("on thumbv6m-freestanding (M0+) every volatile access is one plain ldr or str, never an ldm or stm")
+vpa_thumb_v6m()
+    vpa_thumb_levels("thumbv6m-freestanding")
+
+@test("on thumbv7m-freestanding every volatile access is one plain ldr or str at every level")
+vpa_thumb_v7m()
+    vpa_thumb_levels("thumbv7m-freestanding")
+
+@test("on thumbv7em-freestanding (single-precision FPU) every volatile access is one plain ldr or str")
+vpa_thumb_v7em()
+    vpa_thumb_levels("thumbv7em-freestanding")
+
+@test("on thumbv7em-freestanding-soft every volatile access is one plain ldr or str at every level")
+vpa_thumb_v7em_soft()
+    vpa_thumb_levels("thumbv7em-freestanding-soft")
+
+@test("on thumbv7em-freestanding-dp (double-precision FPU) every volatile access is one plain ldr or str")
+vpa_thumb_v7em_dp()
+    vpa_thumb_levels("thumbv7em-freestanding-dp")
+
+@test("under full LTO for thumb-freestanding every volatile access is one plain ldr or str")
+vpa_thumb_lto()
+    val clang = "/opt/homebrew/opt/llvm/bin/clang"
+    val llvm_ar = "/opt/homebrew/opt/llvm/bin/llvm-ar"
+
+    if !is_file(clang) || !is_file(llvm_ar)
+        print("skipped: no LLVM clang and llvm-ar here to finish the LTO bitcode")
+        return
+
+    val root = vpa_project(vpa_thumb_fixture)
+
+    if root.is_none() then return
+
+    val dir = root.unwrap()
+
+    vpa_build_c(dir, ["--target", "thumb-freestanding", "-Os", "--lto", "full", "-o", s"$dir/libk.a"])
+
+    // The archive is the program's one bitcode module: optimised and selected again, as the LTO link of
+    // a firmware image does.
+    val extracted = capture(llvm_ar, ["x", "--output", dir, s"$dir/libk.a"], "", [], true)
+
+    extracted match
+        Ok(r) -> assert(r.status.ok(), r.text + r.err.unwrap_or(""))
+        Err(_) -> assert(false, "llvm-ar did not run")
+
+    val compiled = capture(clang, ["--target=thumbv8m.main-none-eabihf", "-Os", "-c", "-x", "ir",
+                                   s"$dir/sysl.code.o", "-o", s"$dir/k.o"], "", [], true)
+
+    compiled match
+        Ok(r) -> assert(r.status.ok(), r.text + r.err.unwrap_or(""))
+        Err(_) -> assert(false, "clang did not run")
+
+    val dis = vpa_disassemble(s"$dir/k.o", "+fp-armv8d16")
+
+    remove_dir_all(dir).unwrap_or(())
+    vpa_thumb_all_plain(dis, "thumb-freestanding full LTO")
+end vpa_thumb_lto
+
+@test("on Thumb each volatile access of 4 bytes or fewer is an asm of one ldr or str, at every width and place")
+vpa_thumb_ir_is_asm()
+    val got = vpa_ir("thumb-freestanding", vpa_thumb_fixture)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+    val load = "asm sideeffect \"ldr"
+    val store = "asm sideeffect \"str"
+
+    assert(!vpa_define(ir, "ld32").contains("load volatile"), vpa_define(ir, "ld32"))
+    assert(vpa_define(ir, "ld8").contains("call i8 " + load + "b $0, [$1]\", \"=r,r,~{memory}\"(ptr "), ir)
+    assert(vpa_define(ir, "st8").contains("call void " + store + "b $0, [$1]\", \"r,r,~{memory}\"(i8 "), ir)
+    assert(vpa_define(ir, "ld16").contains("call i16 " + load + "h $0, [$1]\""), ir)
+    assert(vpa_define(ir, "st16").contains("call void " + store + "h $0, [$1]\""), ir)
+    assert(vpa_define(ir, "ld32").contains("call i32 " + load + " $0, [$1]\""), ir)
+    assert(vpa_define(ir, "st32").contains("call void " + store + " $0, [$1]\""), ir)
+    assert(vpa_define(ir, "ldf32").contains("call float " + load + " $0, [$1]\""), ir)
+    assert(vpa_define(ir, "stf32").contains("(float "), ir)
+
+    // A field, an element, module storage and a bitfield's container are the same one access; a pointer
+    // is a word.
+    val narrow = vpa_define(ir, "narrow")
+
+    assert(narrow.contains("call ptr " + load + " $0, [$1]\""), narrow)
+    assert(narrow.contains("call half " + load + "h $0, [$1]\""), narrow)
+    assert(vpa_define(ir, "bank").contains("call i32 " + load + " $0, [$1]\""), ir)
+    assert(vpa_define(ir, "ticks").contains("(ptr @tick)"), ir)
+    assert(!vpa_define(ir, "reg").contains("load volatile"), vpa_define(ir, "reg"))
+    assert(!vpa_define(ir, "quad_set").contains("store volatile"), vpa_define(ir, "quad_set"))
+    assert(!ir.contains("${0:w}") && !ir.contains("${0:x}"), ir)
+end vpa_thumb_ir_is_asm
+
+@test("on Thumb a bool and a u12 move their storage's width, converted beside the asm")
+vpa_thumb_ir_narrow_integers()
+    val got = vpa_ir("thumbv6m-freestanding", vpa_thumb_fixture)
+
+    if got.is_none() then return
+
+    val narrow = vpa_define(got.unwrap(), "narrow")
+
+    assert(narrow.contains("call i8 asm sideeffect \"ldrb $0, [$1]\""), narrow)
+    assert(narrow.contains(" = trunc i8 "), narrow)
+    assert(narrow.contains("zext i1 "), narrow)
+    assert(narrow.contains("call void asm sideeffect \"strb $0, [$1]\", \"r,r,~{memory}\"(i8 "), narrow)
+    assert(narrow.contains("call i16 asm sideeffect \"ldrh $0, [$1]\""), narrow)
+    assert(narrow.contains(" = trunc i16 "), narrow)
+    assert(narrow.contains("zext i12 "), narrow)
+    assert(narrow.contains("call void asm sideeffect \"strh $0, [$1]\", \"r,r,~{memory}\"(i16 "), narrow)
+    assert(!narrow.contains("(i1 ") && !narrow.contains("(i12 "), narrow)
+end vpa_thumb_ir_narrow_integers
+
+// The lines of `define` that are word accesses, in order.
+private vpa_word_asms(define: string) -> Buf[string]
+    val lines = split(define, "\n")
+    var out: Buf[string] = buf()
+
+    for i in 0..<lines.len
+        if lines[i].contains("asm sideeffect \"ldr $0, [$1]\"") || lines[i].contains("asm sideeffect \"str $0, [$1]\"")
+            out.push(lines[i])
+
+    out
+end vpa_word_asms
+
+@test("on Thumb a volatile wider than a word is one asm ldr or str per word, the lowest address first")
+vpa_thumb_words_in_order()
+    val got = vpa_ir("thumb-freestanding", vpa_thumb_fixture)
+
+    if got.is_none() then return
+
+    val ir = got.unwrap()
+
+    assert(!ir.contains("load volatile") && !ir.contains("store volatile"), ir)
+
+    // A load: the word at the address itself, then the word four bytes up, joined low | high << 32.
+    val get64 = vpa_define(ir, "get64")
+    val loads = vpa_word_asms(get64)
+
+    assert_eq(loads.len(), 2, get64)
+    assert(get64.contains("getelementptr i8, ptr ") && get64.contains(", i32 4"), get64)
+    assert(get64.index_of("getelementptr").unwrap() > get64.index_of(loads[0]).unwrap(), get64)
+    assert(get64.index_of(loads[1]).unwrap() > get64.index_of("getelementptr").unwrap(), get64)
+    assert(get64.contains("shl i64 ") && get64.contains(", 32") && get64.contains("or i64 "), get64)
+
+    // A store: the low word to the address, then the high word (shifted down 32) four bytes up.
+    val set64 = vpa_define(ir, "set64")
+    val stores = vpa_word_asms(set64)
+
+    assert_eq(stores.len(), 2, set64)
+    assert(set64.index_of("lshr i64 ").unwrap() > set64.index_of(stores[0]).unwrap(), set64)
+    assert(set64.index_of(stores[1]).unwrap() > set64.index_of("getelementptr").unwrap(), set64)
+
+    // A float goes through the general registers as the integer of its width.
+    assert(vpa_define(ir, "ldf64").contains("bitcast i64 "), vpa_define(ir, "ldf64"))
+    assert(vpa_define(ir, "ldf64").contains(" to double"), vpa_define(ir, "ldf64"))
+    assert(vpa_define(ir, "stf64").contains("bitcast double "), vpa_define(ir, "stf64"))
+    assert_eq(vpa_word_asms(vpa_define(ir, "stf64")).len(), 2, vpa_define(ir, "stf64"))
+
+    // A u128 is four words each way, at 0, 4, 8 and 12.
+    val copy = vpa_define(ir, "copy128")
+
+    assert_eq(vpa_word_asms(copy).len(), 8, copy)
+    assert(copy.contains(", i32 4") && copy.contains(", i32 8") && copy.contains(", i32 12"), copy)
+    assert(copy.contains("shl i128 ") && copy.contains(", 96"), copy)
+    assert(copy.contains("lshr i128 ") && copy.contains(", 96"), copy)
+end vpa_thumb_words_in_order
+
+// The accesses in a disassembled body, in order: each load or store off the frame, as `op operands`.
+private vpa_thumb_accesses(body: string) -> Buf[string]
+    val lines = vpa_thumb_memory_lines(body)
+    var out: Buf[string] = buf()
+
+    for i in 0..<int(lines.len())
+        val parts = split(lines[i], "\t")
+
+        out.push(parts[1] + " " + parts[2])
+
+    out
+end vpa_thumb_accesses
+
+@test("in the machine code a u64 is two word accesses, the one at the address first, on every Thumb target")
+vpa_thumb_words_disassembled_in_order()
+    for machine in ["thumb-freestanding", "thumb-freestanding-softfp", "thumbv6m-freestanding",
+                    "thumbv7m-freestanding", "thumbv7em-freestanding-dp"]
+        for level in ["1", "2", "s"]
+            val got = vpa_code(machine, level, vpa_thumb_fixture, "+fp-armv8d16")
+
+            if got.is_none() then return
+
+            val dis = got.unwrap()
+            val context = s"$machine -O$level"
+
+            // The pointer arrives in r0 and the value in r2:r3, low word in r2.
+            val get64 = vpa_traced(vpa_body(dis, "get64", false), [("r0", "p")])
+
+            assert_eq(get64.len(), 2, s"$context:\n$dis")
+            assert_eq(get64[0], "ldr ? [p]", s"$context:\n${vpa_body(dis, "get64", false)}")
+            assert_eq(get64[1], "ldr ? [p+4]", s"$context:\n${vpa_body(dis, "get64", false)}")
+
+            val set64 = vpa_traced(vpa_body(dis, "set64", false), [("r0", "p"), ("r2", "lo"), ("r3", "hi")])
+
+            assert_eq(set64.len(), 2, s"$context:\n$dis")
+            assert_eq(set64[0], "str lo [p]", s"$context:\n${vpa_body(dis, "set64", false)}")
+            assert_eq(set64[1], "str hi [p+4]", s"$context:\n${vpa_body(dis, "set64", false)}")
+
+            assert_eq(vpa_thumb_accesses(vpa_body(dis, "copy128", false)).len(), 8, s"$context:\n$dis")
+end vpa_thumb_words_disassembled_in_order
+
+// What a register holds, where the trace knows: one of the `seed` names, or that name plus 4.
+private vpa_tag_of(tags: Buf[(string, string)], reg: string) -> string
+    for t in tags.view()
+        if t.0 == reg then return t.1
+
+    "?"
+end vpa_tag_of
+
+private vpa_set_tag(tags: *Buf[(string, string)], reg: string, tag: string)
+    var kept: Buf[(string, string)] = buf()
+
+    for t in tags.view()
+        if t.0 != reg then kept.push(t)
+
+    if tag != "?" then kept.push((reg, tag))
+
+    *tags = kept
+end vpa_set_tag
+
+// Each access of `body` as `ldr|str <what the register held> [<what the base held>]`, following the
+// arguments named in `seed` through the moves and `add #4`s the selector makes of them. Any other write
+// to a register forgets what it held.
+private vpa_traced(body: string, seed: []const (string, string)) -> Buf[string]
+    var tags: Buf[(string, string)] = buf()
+    var out: Buf[string] = buf()
+
+    for s in seed
+        tags.push(s)
+
+    val lines = split(body, "\n")
+
+    for i in 0..<lines.len
+        val parts = split(lines[i], "\t")
+
+        if parts.len < 3 then continue
+
+        val op = parts[1]
+        val ops = split(replace_all(replace_all(parts[2], "[", ""), "]", ""), ", ")
+
+        if (op.starts_with("ldr") || op.starts_with("str")) && !parts[2].contains("[sp") &&
+                !parts[2].contains("[pc")
+            val base = vpa_tag_of(tags, ops[1])
+            val held = if op.starts_with("str") then vpa_tag_of(tags, ops[0]) else "?"
+
+            out.push(s"${op[0..<3]} $held [$base]")
+
+            if op.starts_with("ldr") then vpa_set_tag(&tags, ops[0], "?")
+        else if op.starts_with("st") || op.starts_with("b") || op.starts_with("cmp") || op.starts_with("it") ||
+                op.starts_with("push") || op.starts_with("pop") || op.starts_with("tst")
+            ()
+        else if (op == "mov" || op == "movs") && ops.len == 2
+            vpa_set_tag(&tags, ops[0], vpa_tag_of(tags, ops[1]))
+        else if (op == "adds" || op == "add" || op == "add.w" || op == "adds.w") && ops[ops.len - 1] == "#0x4"
+            val from = vpa_tag_of(tags, ops[if ops.len == 3 then 1 else 0])
+
+            vpa_set_tag(&tags, ops[0], if from == "?" || from.contains("+") then "?" else from + "+4")
+        else
+            vpa_set_tag(&tags, ops[0], "?")
+
+    out
+end vpa_traced
+
+@test("the suites asking which accesses are volatile read each Thumb asm back as the access it is")
+vpa_thumb_reads_back_as_llvm()
+    val got = vpa_ir("thumb-freestanding", vpa_thumb_fixture)
+
+    if got.is_none() then return
+
+    val ir = volatile_as_llvm(got.unwrap())
+    val ld8 = vpa_define(ir, "ld8")
+    val st32 = vpa_define(ir, "st32")
+
+    assert(ld8.contains(" = load volatile i8, ptr %"), ld8)
+    assert(st32.contains("  store volatile i32 %"), st32)
+    assert(st32.contains(", ptr %"), st32)
+    assert(!ir.contains("asm sideeffect \"ldr") && !ir.contains("asm sideeffect \"str"), ir)
+
+    // A u64 reads back as the two word accesses it is, never as one i64.
+    val get64 = vpa_define(ir, "get64")
+    val set64 = vpa_define(ir, "set64")
+
+    assert_eq(split(get64, " = load volatile i32, ptr %").len, 3, get64)
+    assert_eq(split(set64, "  store volatile i32 %").len, 3, set64)
+    assert(!get64.contains("volatile i64") && !set64.contains("volatile i64"), get64 + set64)
+end vpa_thumb_reads_back_as_llvm
+
+// How many times `part` occurs in `text`.
+private vpa_count(text: string, part: string) -> int = int(split(text, part).len) - 1
+
+// The asm accesses of `define`, loads and stores, of any width.
+private vpa_asm_count(define: string) -> int =
+    vpa_count(define, "asm sideeffect \"ldr") + vpa_count(define, "asm sideeffect \"str")
+
+@test("a volatile copy of a whole block is one plain access per register, lowest address first, both ways")
+vpa_aggregate_ir_in_order()
+    for machine in ["aarch64-freestanding", "thumb-freestanding", "thumbv6m-freestanding"]
+        val got = vpa_ir(machine, if machine.starts_with("aarch64") then vpa_fixture else vpa_thumb_fixture)
+
+        if got.is_none() then return
+
+        val ir = got.unwrap()
+
+        assert(!ir.contains("load volatile %") && !ir.contains("store volatile %"), s"$machine:\n$ir")
+
+        // Uart: the register at the block's address, then the one at element 1, then element 2 -- read,
+        // and then written in the same order.
+        val copy = vpa_define(ir, "copy_block")
+
+        assert_eq(vpa_asm_count(copy), 6, s"$machine:\n$copy")
+        assert(copy.index_of("%struct.Uart, ptr %").is_some(), s"$machine:\n$copy")
+
+        val one = copy.index_of(", i32 0, i32 1").unwrap()
+        val two = copy.index_of(", i32 0, i32 2").unwrap()
+
+        assert(one < two, s"$machine:\n$copy")
+        assert(copy.index_of("asm sideeffect \"ldr").unwrap() < one, s"$machine:\n$copy")
+        assert(copy.index_of("asm sideeffect \"str").unwrap() > two, s"$machine:\n$copy")
+
+        // A block built whole is stored field by field, the first field first.
+        val store = vpa_define(ir, "store_block")
+
+        assert_eq(vpa_count(store, "asm sideeffect \"str"), 3, s"$machine:\n$store")
+        assert(store.index_of("asm sideeffect \"str").unwrap() < store.index_of(", i32 0, i32 1").unwrap(),
+               s"$machine:\n$store")
+        assert(store.index_of(", i32 0, i32 1").unwrap() < store.index_of(", i32 0, i32 2").unwrap(),
+               s"$machine:\n$store")
+
+        // An element array inside a block is its elements, in order.
+        assert_eq(vpa_asm_count(vpa_define(ir, "bank_copy")), 6, s"$machine:\n${vpa_define(ir, "bank_copy")}")
+
+        // A bitfield register changed `with` new fields is one read and one write of its one word.
+        val changed = vpa_define(ir, "three_fields")
+
+        assert_eq(vpa_count(changed, "asm sideeffect \"ldr"), 1, s"$machine:\n$changed")
+        assert_eq(vpa_count(changed, "asm sideeffect \"str"), 1, s"$machine:\n$changed")
+        assert(changed.contains("call i32 asm sideeffect"), s"$machine:\n$changed")
+
+        // Two u64 registers and a byte: one access each on AArch64, two words for each u64 on 32-bit ARM.
+        val pair = vpa_define(ir, "pair_copy")
+        val wide = if machine.starts_with("aarch64") then 3 else 5
+
+        assert_eq(vpa_count(pair, "asm sideeffect \"ldr"), wide, s"$machine:\n$pair")
+        assert_eq(vpa_count(pair, "asm sideeffect \"str"), wide, s"$machine:\n$pair")
+end vpa_aggregate_ir_in_order
+
+@test("on an M0+ a bitfield register changed 'with' new fields is one ldr and one str, never its four bytes")
+vpa_aggregate_with_on_v6m()
+    for level in ["0", "1", "2", "s"]
+        val got = vpa_code("thumbv6m-freestanding", level, vpa_thumb_fixture, "+fp-armv8d16")
+
+        if got.is_none() then return
+
+        val body = vpa_body(got.unwrap(), "three_fields", false)
+        val accesses = vpa_thumb_accesses(body)
+
+        assert_eq(accesses.len(), 2, s"-O$level:\n$body")
+        assert(accesses[0].starts_with("ldr "), s"-O$level:\n$body")
+        assert(accesses[1].starts_with("str "), s"-O$level:\n$body")
+end vpa_aggregate_with_on_v6m
+
+@test("the suites asking which accesses are volatile read a block copy back as one access per register")
+vpa_aggregate_reads_back()
+    val got = vpa_ir("aarch64-freestanding")
+
+    if got.is_none() then return
+
+    val copy = vpa_define(volatile_as_llvm(got.unwrap()), "copy_block")
+
+    assert_eq(vpa_count(copy, " = load volatile i32, ptr %"), 3, copy)
+    assert_eq(vpa_count(copy, "  store volatile i32 %"), 3, copy)
+end vpa_aggregate_reads_back
+
+private val vpa_view_fixture: string = raw"""
+    struct Tagged
+        status: volatile u32
+        name: []const u8
+
+    @export("tagged_copy")
+    tagged_copy(d: *Tagged, s: *Tagged)
+        *d = *s
+    """
+
+@test("a view held in a register block is moved whole, never taken apart into its words")
+vpa_aggregate_keeps_a_view_whole()
+    for machine in ["aarch64-freestanding", "thumb-freestanding"]
+        val got = vpa_ir(machine, vpa_view_fixture)
+
+        if got.is_none() then return
+
+        val copy = vpa_define(got.unwrap(), "tagged_copy")
+
+        // The register is one plain access each time the block is read or written -- the source read, the
+        // destination's old contents read (a view carries a count to give back), the destination written
+        // -- and the view one load or store of all of it each time.
+        assert_eq(vpa_asm_count(copy), 3, s"$machine:\n$copy")
+        assert_eq(vpa_count(copy, " = load volatile { ptr, ptr, "), 2, s"$machine:\n$copy")
+        assert_eq(vpa_count(copy, "store volatile { ptr, ptr, "), 1, s"$machine:\n$copy")
+        assert(!copy.contains("extractvalue { ptr, ptr, "), s"$machine:\n$copy")
+end vpa_aggregate_keeps_a_view_whole
