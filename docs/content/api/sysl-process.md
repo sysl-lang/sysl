@@ -58,7 +58,7 @@ the vector as it is given, so a path is a path whatever is in it.
 
 ## Index
 
-[`capture`](#capture) [`children`](#children) [`exec`](#exec) [`foreground_group`](#foreground_group) [`group`](#group) [`group_members`](#group_members) [`hostname`](#hostname) [`new_session`](#new_session) [`pid`](#pid) [`pipe`](#pipe) [`process_group`](#process_group) [`real_group`](#real_group) [`real_user`](#real_user) [`resident_bytes`](#resident_bytes) [`run`](#run) [`set_foreground_group`](#set_foreground_group) [`set_group`](#set_group) [`set_process_group`](#set_process_group) [`set_user`](#set_user) [`spawn`](#spawn) [`start`](#start) [`total_memory`](#total_memory) [`try_wait_pid`](#try_wait_pid) [`user`](#user) [`wait_pid`](#wait_pid) [`Child`](#child) [`Group`](#group-1) [`Output`](#output) [`Spawned`](#spawned) [`Status`](#status) [`Stdio`](#stdio) [`Usage`](#usage) [`Var`](#var) [Display for Status](#display-for-status) [Drop for Child](#drop-for-child) [Drop for Spawned](#drop-for-spawned) [Eq for Status](#eq-for-status)
+[`capture`](#capture) [`children`](#children) [`exec`](#exec) [`foreground_group`](#foreground_group) [`group`](#group) [`group_id`](#group_id) [`group_members`](#group_members) [`group_name`](#group_name) [`hostname`](#hostname) [`new_session`](#new_session) [`pid`](#pid) [`pipe`](#pipe) [`process_group`](#process_group) [`real_group`](#real_group) [`real_user`](#real_user) [`resident_bytes`](#resident_bytes) [`run`](#run) [`set_foreground_group`](#set_foreground_group) [`set_group`](#set_group) [`set_process_group`](#set_process_group) [`set_user`](#set_user) [`spawn`](#spawn) [`start`](#start) [`total_memory`](#total_memory) [`try_wait_pid`](#try_wait_pid) [`user`](#user) [`user_id`](#user_id) [`user_name`](#user_name) [`wait_pid`](#wait_pid) [`Child`](#child) [`Group`](#group-1) [`Output`](#output) [`Spawned`](#spawned) [`Status`](#status) [`Stdio`](#stdio) [`Usage`](#usage) [`Var`](#var) [Display for Status](#display-for-status) [Drop for Child](#drop-for-child) [Drop for Spawned](#drop-for-spawned) [Eq for Status](#eq-for-status)
 
 ## Functions
 
@@ -162,6 +162,15 @@ group() -> u32
 
 The group the program acts as: the effective group id, compared with `sysl.fs.Meta.group`.
 
+### `group_id`
+
+```sysl
+group_id(name: string) -> Result[u32, IoError]
+```
+
+The id of the group the system's group database calls `name`, as POSIX's `getgrnam_r`, and the
+reverse of `group_name`, with `user_id`'s answers: `NotFound` for a name with no entry.
+
 ### `group_members`
 
 ```sysl
@@ -176,6 +185,20 @@ has not been waited for yet is still listed, as `ps` lists it; once `wait_pid` h
 group the program may not see. **A `pgid` of zero or less fails** with `Other(22)` (`EINVAL`). The
 answer is a snapshot: a process may have exited or started by the time it is read. A target with no
 processes fails with `UNSUPPORTED`'s error.
+
+### `group_name`
+
+```sysl
+group_name(id: u32) -> Result[string, IoError]
+```
+
+The name the system's group database gives group `id`, as POSIX's `getgrgid_r`: `group_name(0)` is
+`"wheel"` on macOS and `"root"` on Linux, and `group_name(group())` is the program's own group's.
+
+It answers as `user_name` does: **an id with no entry is `NotFound`**, a name that is not valid
+UTF-8 is `InvalidUtf8`, a lookup that failed is the system's own error, and a target with no group
+database fails with `unsupported()`. A group with more members than any first guess holds is still
+answered: the lookup grows its room until the entry fits.
 
 ### `hostname`
 
@@ -458,6 +481,34 @@ user() -> u32
 The user the program acts as: the effective user id, the one a filesystem checks a permission
 against and makes a new file's owner. Compare it with `sysl.fs.Meta.owner` to ask whether a file is
 the program's own.
+
+### `user_id`
+
+```sysl
+user_id(name: string) -> Result[u32, IoError]
+```
+
+The id of the user the system's user database calls `name`, as POSIX's `getpwnam_r`, and the
+reverse of `user_name`: `user_id("root")` is 0, and `user_id(user_name(user())?)` is `user()`.
+
+**A name with no entry is `NotFound`**, and so is one holding a zero byte, which no entry's name can
+hold. The name is handed to the database exactly as given -- nothing is trimmed or folded here --
+and whether case matters is the database's own: macOS's matches `"ROOT"` too, Linux's files do
+not. A lookup that failed is the system's own error; a target with no user database fails with
+`unsupported()`.
+
+### `user_name`
+
+```sysl
+user_name(id: u32) -> Result[string, IoError]
+```
+
+The name the system's user database gives user `id`, as POSIX's `getpwuid_r`: `user_name(0)` is
+`"root"`, and `user_name(user())` is the program's own login name.
+
+**An id with no entry is `NotFound`**, which is a different answer from a lookup that failed (the
+system's own error) and from a name that is not valid UTF-8 (`InvalidUtf8`). **A target with no user
+database** (`UNSUPPORTED` from its supplier) fails with that error.
 
 ### `wait_pid`
 
