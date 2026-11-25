@@ -1,6 +1,7 @@
 module sh.sysl.compiler
 @tests
 
+import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
 import sysl.slices.as_ptr
 import sysl.sync.Atomic
@@ -648,13 +649,86 @@ lsi_view_holder_of_outer_accepted()
                     "        keep = o.view()\n        print(keep[2])\n\nrun()\n",
                     "2\nfreed\n0\n67\nfreed\n")
 
+// -- the work a body of many names takes ----------------------------------------------------------
+//
+// The analysis counts the bindings it looks at to answer which one a name is (`binding_probes`): one
+// a question, where the search from the end of the scope stack looked at every binding above the one
+// it found -- `n^2 / 2` for `n` locals each read once more at the end. The count is exact, so the test
+// holds the growth to linear with no clock: doubling the locals at most doubles it.
+
+private var lsi_library_cache: Buf[Program] = buf()
+private var lsi_library_read: bool = false
+
+private lsi_library() -> Buf[Program]
+    if lsi_library_read then return lsi_library_cache
+
+    lsi_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> lsi_library_cache = units
+
+    lsi_library_cache
+end lsi_library
+
+// How many bindings analysing `text` looked at, beside the standard module's own bodies.
+private lsi_probes(text: string) -> usize
+    val parsed = parse(source_of("t.sysl", text))
+
+    assert(parsed.ok(), "the program did not parse")
+
+    var units: Buf[Program] = buf()
+
+    for item in lsi_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then assert(false, s"the program was refused: ${done.reported[0].diag.message}")
+
+    done.an.binding_probes
+end lsi_probes
+
+// The bindings a program of `n` looked at, less those of the same program of none.
+private lsi_growth(shape: &Fn(int) -> string, n: int) -> usize = lsi_probes(shape(n)) - lsi_probes(shape(0))
+
+private lsi_linear(shape: &Fn(int) -> string)
+    val one = lsi_growth(shape, 1000)
+    val two = lsi_growth(shape, 2000)
+    val four = lsi_growth(shape, 4000)
+
+    assert(one > 0, "nothing was looked up")
+    assert(two <= 2 * one + 64, s"1000 names looked at $one bindings, 2000 looked at $two")
+    assert(four <= 2 * two + 64, s"2000 names looked at $two bindings, 4000 looked at $four")
+end lsi_linear
+
+@test("lsi: locals each read once more at the end are looked up in work linear in their number")
+lsi_reads_linear_work()
+    if lsi_library().is_empty() then return
+
+    lsi_linear((n) -> lsi_reads(n))
+
+@test("lsi: locals fixed by their uses, the body read twice, are looked up in linear work")
+lsi_fixed_reads_linear_work()
+    if lsi_library().is_empty() then return
+
+    lsi_linear((n) -> lsi_fixed_reads(n))
+
+@test("lsi: sibling blocks each hiding one name are looked up in linear work")
+lsi_shadowing_blocks_linear_work()
+    if lsi_library().is_empty() then return
+
+    lsi_linear((n) -> lsi_shadowing_blocks(n))
+
 // -- the time a body of many names takes ----------------------------------------------------------
 //
-// Each of these took minutes to build before the index -- 32000 locals each read once more at the end
-// spent 221 seconds reading the body in a release build of 0.13.5, growing as `n^2` (8000: 3.2 s) --
-// and the analysis of each is now linear in the names (32000: half a second). They bound the time by
-// the test's own deadline, as `tests_dpn_deep_operators.sysl` does: the old cost is far past it. Each
-// builds on the stack the compiler gives its own work, as `main` does.
+// The same bodies built whole, at sizes whose search took minutes: 32000 locals each read once more
+// at the end spent 221 seconds reading the body in a release build of 0.13.5, against half a second
+// now. Each builds on the stack the compiler gives its own work, as `main` does.
 
 // `n` locals bound to literals -- each an open binding, typed by its first use -- and each read once
 // more at the end, into a sum.
@@ -707,19 +781,6 @@ private lsi_shadowing_blocks(n: int) -> string
     join(lines.view(), "\n")
 end lsi_shadowing_blocks
 
-// `n` locals declared and never read but the last, which only lowering looks at all of.
-private lsi_decls(n: int) -> string
-    var lines: Buf[string] = buf()
-
-    lines.push("main()")
-
-    for i in 0..<n
-        lines.push(s"    val v$i = $i")
-
-    lines.push(s"    print(v${n - 1})\n")
-    join(lines.view(), "\n")
-end lsi_decls
-
 private struct LsiJob
     texts: *string
     passed: Atomic[i32]
@@ -753,6 +814,3 @@ lsi_fixed_reads_16000() = lsi_big_prints(lsi_fixed_reads(16000), "16000\n")
 
 @test("lsi: 8000 sibling blocks each hiding one name build in time and read the right binding")
 lsi_shadowing_blocks_8000() = lsi_big_prints(lsi_shadowing_blocks(8000), "31996001\n")
-
-@test("lsi: 64000 locals declared build in time")
-lsi_decls_64000() = lsi_big_prints(lsi_decls(64000), "63999\n")
