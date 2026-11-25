@@ -580,6 +580,40 @@ each side of a clause's `&&`**: a value passed every clause, and `a && b` held o
 did, so one side that cannot be repeated — one that calls something, say — leaves the others told. An `||` is not split, since `a || b` holding says nothing of `a`. The receiver may be taken as
 `self`, `*self` or `&self`; the struct behind each passed the same checks.
 
+**A difference of two fields the invariant orders is exact.** Where a clause says `lo <= hi` (or
+`lo < hi`, `hi >= lo`, `hi > lo`) of two unsigned fields, `s.hi - s.lo` read off one value is told to
+the optimizer as a difference that cannot wrap: whatever value the two reads find passed the clause.
+Past a guard `if k >= s.hi - s.lo then <leave>`, then, `s.lo + k` is below `s.hi` and cannot wrap
+either — so a container that keeps a first and a last index reads its element with the guard's one
+compare, its own subscript's test folding into it:
+
+```sysl
+struct Window
+    elems: []int
+    first: usize
+    last: usize
+    invariant first <= last && last <= elems.len
+
+    at(*self, k: usize) -> Option[int]
+        if k >= self.last - self.first then return None
+
+        Some(self.elems[self.first + k])
+
+var w = Window([10, 20, 30, 40], 1, 3)
+
+print(w.at(0), w.at(1), w.at(2))
+```
+
+```output
+Some(20) Some(30) None
+```
+
+**The guard's fact lasts while nothing can change what it read**: `k`, either field, or the value
+holding them. It covers the statements after it in its own list and the value that list ends with,
+and the first statement that is not a plain read — a call, a store, a block, anything that might reach
+the struct through another name — ends it, leaving every later subscript checked as written. A
+guard inside a branch says nothing after the branch.
+
 **What it rests on is the checking**, so the
 one thing outside it is what the checking cannot see: bytes written into the struct through a pointer
 of some other type, or by C, which are the writer's promise to keep exactly as every other guarantee

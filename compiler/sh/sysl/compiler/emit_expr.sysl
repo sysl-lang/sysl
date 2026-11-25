@@ -815,15 +815,18 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
 
             // A sum proved not to wrap is the `nuw` add in either mode: there is nothing to check.
             val proved = op == "+" && nowrap_add(e, l, r, bt)
+            // And so is a difference of two fields the struct's invariant orders (`nowrap_sub`).
+            val proved_sub = op == "-" && nowrap_sub(e, l, r, bt)
 
-            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(e, op, bt, site))
+            if overflow_checked(op, l, r, bits, signed) ||
+               (!proved && !proved_sub && plain_checked(e, op, bt, site))
                 return checked_arith(e, op, bits, signed, lv, rv, arith_text(op, texpr_type(l), texpr_type(r)), site)
 
-            if proved
-                val sum = fresh_reg(e)
+            if proved || proved_sub
+                val got = fresh_reg(e)
 
-                emit(e, InBin(sum, OpAddNuw, lty(e, bt), lv, rv))
-                return sum
+                emit(e, InBin(got, if proved then OpAddNuw else OpSubNuw, lty(e, bt), lv, rv))
+                return got
             end if
         _ -> ()
 

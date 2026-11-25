@@ -111,10 +111,14 @@ private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)]
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
+
+    val mark = nowrap_mark(e)
+
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
     e.moves.last_uses = lasts.1
     e.moves.dying = dying_for(b.result.unwrap(), lasts.3)
     gen_into(e, dest, b.result.unwrap())
+    nowrap_release(e, mark)
     e.moves.dying = set()
     e.moves.last_uses = was
     pop_owned(e)
@@ -870,7 +874,10 @@ gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
+
+    val mark = nowrap_mark(e)
+
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
     e.moves.last_uses = lasts.1
 
     b.result match
@@ -880,6 +887,7 @@ gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
             e.moves.dying = set()
         None -> ()
 
+    nowrap_release(e, mark)
     e.moves.last_uses = was
 
     pop_owned(e)
@@ -896,7 +904,10 @@ gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
+
+    val mark = nowrap_mark(e)
+
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
     e.moves.last_uses = lasts.1
 
     val v = b.result match
@@ -909,6 +920,8 @@ gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
             retain_moving(e, r, texpr_type(r), got)
             got
         None -> VNothing
+
+    nowrap_release(e, mark)
 
     e.moves.last_uses = was
 
@@ -926,8 +939,12 @@ gen_stmts(e: *Emit, xs: Buf[TStmt]) = gen_stmts_with(e, xs, buf())
 //
 // `tail` is the block's value, which follows the last statement: a copy out of storage that the next
 // statement lets go of is drained rather than copied (`slot_drain.sysl`), and that next one may be it.
+//
+// With `hold`, the guards the list proved are kept for its value, which the caller lowers next and
+// then gives them back with `nowrap_release` from a mark it took before the call -- the value is the
+// rest of the list as surely as a statement after the guard would be.
 gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set[string]] = buf(),
-               tail: Option[TExpr] = None)
+               tail: Option[TExpr] = None, hold: bool = false)
     val mark = nowrap_mark(e)
     val was = e.moves.last_uses
     val none: Set[string] = set()
@@ -963,7 +980,9 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
         nowrap_after(e, item)
 
     e.moves.last_uses = was
-    nowrap_release(e, mark)
+
+    if hold && tail.is_some() then nowrap_before_tail(e, tail.unwrap())
+    else nowrap_release(e, mark)
 end gen_stmts_with
 
 // A body whose scope was opened just for it -- a loop's -- with moves inferred over it.
