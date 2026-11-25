@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { posix }"
 
 ## Index
 
-[`proc_exec`](#proc_exec) [`proc_get_id`](#proc_get_id) [`proc_getpgrp`](#proc_getpgrp) [`proc_hostname`](#proc_hostname) [`proc_kill`](#proc_kill) [`proc_list`](#proc_list) [`proc_pipe`](#proc_pipe) [`proc_poll`](#proc_poll) [`proc_poll_usage`](#proc_poll_usage) [`proc_resident`](#proc_resident) [`proc_set_id`](#proc_set_id) [`proc_setpgid`](#proc_setpgid) [`proc_setsid`](#proc_setsid) [`proc_spawn`](#proc_spawn) [`proc_tcgetpgrp`](#proc_tcgetpgrp) [`proc_tcsetpgrp`](#proc_tcsetpgrp) [`proc_temp_path`](#proc_temp_path) [`proc_total_memory`](#proc_total_memory) [`proc_wait`](#proc_wait) [`proc_wait_usage`](#proc_wait_usage)
+[`proc_exec`](#proc_exec) [`proc_get_id`](#proc_get_id) [`proc_getpgrp`](#proc_getpgrp) [`proc_group_id`](#proc_group_id) [`proc_group_name`](#proc_group_name) [`proc_hostname`](#proc_hostname) [`proc_kill`](#proc_kill) [`proc_list`](#proc_list) [`proc_pipe`](#proc_pipe) [`proc_poll`](#proc_poll) [`proc_poll_usage`](#proc_poll_usage) [`proc_resident`](#proc_resident) [`proc_set_id`](#proc_set_id) [`proc_setpgid`](#proc_setpgid) [`proc_setsid`](#proc_setsid) [`proc_spawn`](#proc_spawn) [`proc_tcgetpgrp`](#proc_tcgetpgrp) [`proc_tcsetpgrp`](#proc_tcsetpgrp) [`proc_temp_path`](#proc_temp_path) [`proc_total_memory`](#proc_total_memory) [`proc_user_id`](#proc_user_id) [`proc_user_name`](#proc_user_name) [`proc_wait`](#proc_wait) [`proc_wait_usage`](#proc_wait_usage)
 
 ## Functions
 
@@ -29,6 +29,18 @@ proc_get_id(which: int) -> i64
 
 ```sysl
 proc_getpgrp() -> i64
+```
+
+### `proc_group_id`
+
+```sysl
+proc_group_id(name: *u8, len: usize) -> i64
+```
+
+### `proc_group_name`
+
+```sysl
+proc_group_name(id: u32, into: *u8, room: usize) -> isize
 ```
 
 ### `proc_hostname`
@@ -119,6 +131,18 @@ proc_temp_path(into: *u8, room: usize) -> isize
 
 ```sysl
 proc_total_memory(bytes: *u64) -> int
+```
+
+### `proc_user_id`
+
+```sysl
+proc_user_id(name: *u8, len: usize) -> i64
+```
+
+### `proc_user_name`
+
+```sysl
+proc_user_name(id: u32, into: *u8, room: usize) -> isize
 ```
 
 ### `proc_wait`
