@@ -865,7 +865,7 @@ run(c: bool)
 ```
 
 **A local holding a copy of the parameter is followed along the same ways.** Written over with
-something else on every way to where it is stored or its address handed over, it no longer holds the
+something else on every way to where it is stored, answered or its address handed over, it no longer holds the
 parameter there; written over on only some — an `if` without an `else`, a loop body that may not run,
 one `match` arm, a `break` or `continue` past the store — it still does. Only a store of the whole
 local counts as writing it over: a store through a pointer to it, or in a closure's body, does not;
@@ -911,6 +911,32 @@ run()
 
 ```error
 'note' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
+```
+
+The same holds of an answer ([below](#handing-it-back-is-not-keeping-it)): a copy written over on every
+way to a `return` or to the body's result is not what the function hands back there.
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+pick(p: *int) -> *int
+    var q = p
+    print(*q)
+    q = &spare
+    q
+
+run()
+    var n = 41
+    held = pick(&n)
+
+run()
+print(*held)
+```
+
+```output
+41
+0
 ```
 
 ### Handing it back is not keeping it
@@ -4164,6 +4190,10 @@ wait_for(n: u64)
   convert on arrival) and a data enum are refused; a simple enum and a bitfield (a read-modify-write of
   its container, see [`@packed`](/reference/attributes/)) are admitted. A struct holding a register
   carries no `invariant`.
+- **A qualified field is on its type's boundary**: one a `@packed` struct places at an offset that is
+  not a multiple of its type's alignment on the target (`tag: u8, word: volatile u32`) is refused where
+  it is selected, since its one access would be off the boundary — the rule and its exact definition
+  are in [`@packed`](/reference/attributes/).
 - **What the compiler does**: `load volatile` / `store volatile`, with no runtime cost. A qualified
   field is reached at its own address, never lifted out of the block; copying a whole block is an
   access to every register in it; `&regs.status` is a `*volatile u32`; a type parameter never binds a
