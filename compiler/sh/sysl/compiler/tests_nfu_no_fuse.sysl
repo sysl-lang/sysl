@@ -178,6 +178,7 @@ end nfu_refused
 
 // -- the lowering -----------------------------------------------------------------------------------
 
+// guards: @no_fuse keeps fmul and fadd at f64, f32 and vector widths
 @test("a '@no_fuse' function's a * b + c is fmul and fadd at f64, f32 and a vector; its unmarked twin is llvm.fma")
 nfu_widths()
     if !nfu_ready() then return
@@ -230,28 +231,28 @@ end nfu_widths
 nfu_shapes()
     if !nfu_ready() then return
 
-    val ir = nfu_ir(raw"""
-        id(x: real) -> real = x
-
+    // Each shape over the witness: fused, each leaves `2^-54`, which `big` scales to a whole `±1`.
+    nfu_prints([("main.sysl", raw"""
         @no_fuse
         @noinline
-        shapes(a: real, b: real, c: real) -> real
+        shapes(a: real, b: real, c: real) -> [5]real
             var s = c
-            s += a * b
+            var t = 0.0 - c
+
             s -= a * b
+            t += a * b
 
-            (c - a * b) + (-(a * b) + c) + (a * b - c) + s
+            [c - a * b, -(a * b) + c, a * b - c, s, t]
 
-        print(shapes(1.0, 2.0, 3.0))
-        """)
+        val x = 1.0 + 1.0 / 134217728.0
+        val big = 18014398509481984.0
+        val r = shapes(x, x, 1.0 + 1.0 / 67108864.0)
 
-    val body = nfu_body(ir, "shapes")
-
-    nfu_says(body, "fmul double")
-    nfu_says(body, "fsub double")
-    nfu_unfused(body)
+        print(r[0] * big, r[1] * big, r[2] * big, r[3] * big, r[4] * big)
+        """)], "0 0 0 0 0\n")
 end nfu_shapes
 
+// guards: @no_fuse covers members, instances and nested closures, not a called function
 @test("a member, a generic's instance, and a closure and a nested function written inside are unfused; a function called from inside is not")
 nfu_reach()
     if !nfu_ready() then return
@@ -296,6 +297,7 @@ nfu_reach()
     nfu_says(nfu_body(ir, "elsewhere"), "llvm.fma.f64")
 end nfu_reach
 
+// guards: @no_fuse with @reassociate regroups with each product rounded
 @test("'@no_fuse' beside '@reassociate' regroups with every product rounded apart, and a '@reassociate' block inside one too")
 nfu_with_reassociate()
     if !nfu_ready() then return
@@ -340,6 +342,7 @@ nfu_with_reassociate()
     nfu_says(nfu_body(ir, "regrouped"), "llvm.fmuladd.f64")
 end nfu_with_reassociate
 
+// guards: @strict_fp with @no_fuse is strict fmul and fadd, never fma
 @test("a '@strict_fp' body that is '@no_fuse' is a strict fmul and a strict fadd, never a strict fma")
 nfu_with_strict()
     if !nfu_ready() then return
@@ -367,6 +370,7 @@ nfu_with_strict()
     nfu_says(nfu_body(ir, "strict_fused"), "llvm.experimental.constrained.fma.f64")
 end nfu_with_strict
 
+// guards: a @no_fuse body stays fmul plus fadd even when inlined at -O3
 @test("inlined into a caller that fuses, a '@no_fuse' body stays fmul and fadd at -O3, and the caller's own sum is still fused")
 nfu_inlined()
     if !nfu_ready() || !clang_available() then return
@@ -392,6 +396,7 @@ nfu_inlined()
     nfu_lacks(body, "llvm.fma.f64(double %a.param, double %b.param")
 end nfu_inlined
 
+// guards: a @no_fuse operator stays a call, and a @no_fuse caller fuses no operator body
 @test("a '@no_fuse' arithmetic operator stays a call wherever it is used, and a '@no_fuse' caller reads no operator as its body")
 nfu_operators()
     if !nfu_ready() then return

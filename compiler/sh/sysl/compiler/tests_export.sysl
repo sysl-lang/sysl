@@ -16,6 +16,7 @@ private lowered(text: string, symbol: string) -> string = emit_func_text(text, s
 
 // -- a call to a foreign function -------------------------------------------------------------------
 
+// guards: a small aggregate crosses to C in the convention's register
 @test("a small aggregate crosses to C in the register the convention names, both ways")
 a_small_aggregate_crosses_in_a_register()
     assert_eq(lowered("struct S\n    a: i32\n    b: i32\n\nextern give() -> S\nextern take(v: S)\n" +
@@ -40,6 +41,7 @@ end a_small_aggregate_crosses_in_a_register
 
 // The storage a big result is written into is the caller's, so it exists before the call and is
 // named in front of every argument.
+// guards: a big aggregate crosses to C through storage both ways
 @test("an aggregate too big for registers goes through storage in both directions")
 a_big_aggregate_goes_through_storage()
     assert_eq(lowered("struct Big\n    a: i64\n    b: i64\n    c: i64\n\n" +
@@ -67,6 +69,7 @@ end a_big_aggregate_goes_through_storage
 // The extension is stated at the call as well as on the declaration, because it is the **caller's**
 // obligation and the call is where the caller is: it is that attribute which makes the back end
 // widen the value before it goes into the register.
+// guards: a narrow scalar carries the C extension at call and result
 @test("a narrow scalar carries the convention's extension at the call and on the result")
 a_narrow_scalar_is_widened_at_the_call()
     assert_eq(lowered("extern widen(b: bool, c: u8) -> u8\n\nnarrow() -> u8 = widen(true, 3)\n" +
@@ -81,6 +84,7 @@ end a_narrow_scalar_is_widened_at_the_call
 // A homogeneous floating aggregate comes back under its own type, so there is nothing to reinterpret
 // and the round trip through memory would be a copy for its own sake -- while the *argument* is
 // named as an array of the element and does need one.
+// guards: a floating aggregate is coerced for C going out and read back
 @test("a floating aggregate is coerced going out and read straight back coming in")
 a_floating_aggregate_crosses()
     assert_eq(lowered("struct Pair\n    x: f32\n    y: f32\n\nextern spin(p: Pair) -> Pair\n\n" +
@@ -110,6 +114,7 @@ end a_floating_aggregate_crosses
 
 // A scalar crosses as itself under both lowerings, so the thunk is the call and nothing else -- and
 // the definition is under the compiler's name for it, as every root function's is.
+// guards: an exported scalar function is a thunk calling the definition
 @test("an exported function of scalars is a thunk that calls the definition and returns")
 an_exported_scalar_entry()
     assert_eq(lowered("@export(\"twice\")\ntwice(n: i32) -> i32 = n * 2\n", "twice"),
@@ -123,6 +128,7 @@ end an_exported_scalar_entry
 // The reported case for the boundary this exists to fix: eight bytes of three fields arrive in one
 // integer register under the convention, and sysl's own lowering wants the struct. Reading only the
 // low field would have coincided; reading a second one is what saw it.
+// guards: an exported aggregate entry reassembles it before calling the definition
 @test("an exported function taking an aggregate reassembles it before calling the definition")
 an_exported_aggregate_entry()
     assert_eq(lowered("struct Id\n    index1: i32\n    world0: u16\n    generation: u16\n\n" +
@@ -143,6 +149,7 @@ end an_exported_aggregate_entry
 
 // Where **both** sides return through storage the caller supplies, C's is handed straight to sysl
 // and the value is never a first-class LLVM value at any point.
+// guards: an exported sret entry hands C's slot straight to the definition
 @test("an exported function returning through storage hands C's slot straight to the definition")
 an_exported_entry_through_storage()
     assert_eq(lowered("struct Big\n    a: i64\n    b: i64\n    c: i64\n\n@export(\"probe_big\")\n" +
@@ -156,6 +163,7 @@ an_exported_entry_through_storage()
               "}\n")
 end an_exported_entry_through_storage
 
+// guards: an exported floating aggregate is coerced in parameter and result
 @test("an exported function of a floating aggregate coerces its parameter and its result")
 an_exported_floating_entry()
     assert_eq(lowered("struct Pair\n    x: f32\n    y: f32\n\n@export(\"probe_pair\")\n" +
@@ -177,6 +185,7 @@ an_exported_floating_entry()
               "}\n")
 end an_exported_floating_entry
 
+// guards: a resultless export is just the call and return
 @test("an exported function with no result is the call and the return")
 an_exported_entry_with_no_result()
     assert_eq(lowered("@export(\"probe_void\")\nnothing(n: i32) = ()\n", "probe_void"),
@@ -190,6 +199,7 @@ end an_exported_entry_with_no_result
 // **A symbol C has claimed is not available to a sysl definition**, and it is the *definition* that
 // moves: the exported symbol is the one somebody outside has written down, and a mangled key is this
 // compiler's own business.
+// guards: a definition displaced by an export is emitted under a compiler key
 @test("a definition whose name an export claimed is emitted under a key of the compiler's")
 a_displaced_definition_is_renamed()
     assert_eq(lowered("@export(\"twice\")\ntwice(n: i32) -> i32 = n * 2\n",
@@ -431,6 +441,7 @@ end ex_archive_ir
 
 // -- the symbol -----------------------------------------------------------------------------------
 
+// guards: an exported symbol is the bare C name, no module path
 @test("the exported symbol is the bare name, with no module path")
 ex_the_symbol_is_the_bare_name()
     if ex_no_library() then return
@@ -439,6 +450,7 @@ ex_the_symbol_is_the_bare_name()
 
     assert(out.contains("define i32 @add("), out)
 
+// guards: an export's symbol is the name it states
 @test("and the symbol it names, where it names one")
 ex_the_symbol_it_names()
     if ex_no_library() then return
@@ -451,6 +463,7 @@ ex_the_symbol_it_names()
 // has to be lowered the way the machine's C convention says, which is not what sysl does with its
 // own definitions. The definition therefore keeps its mangled key and the exported symbol is a
 // function of its own that calls it.
+// guards: an exported symbol is a thunk, definition kept under its own key
 @test("and it is a thunk, so the definition is still there under its own key")
 ex_the_symbol_is_a_thunk()
     if ex_no_library() then return
@@ -467,6 +480,7 @@ end ex_the_symbol_is_a_thunk
 // the root module has no qualification, so `@export` under its own name asks for exactly the name the
 // definition would take. The **definition** is what moves: the exported symbol is what somebody
 // outside has written down, and a mangled key is the compiler's own business.
+// guards: a root export's definition moves aside, avoiding a symbol clash
 @test("and in the root module the definition moves aside, so the two do not collide")
 ex_the_definition_moves_aside()
     if ex_no_library() then return
@@ -481,6 +495,7 @@ end ex_the_definition_moves_aside
 // The export is what a real C API needs, since its symbols carry a prefix the sysl side gets from its
 // module path -- so the function stays `add` to everything inside sysl, and a sysl caller reaches the
 // definition rather than paying for a conversion at a call that never leaves sysl.
+// guards: a sysl caller calls the definition, not the C thunk
 @test("a sysl caller reaches the definition, not the thunk")
 ex_a_sysl_caller_reaches_the_definition()
     if ex_no_library() then return
@@ -491,6 +506,7 @@ ex_a_sysl_caller_reaches_the_definition()
     assert(out.contains("call i32 @demo$add("), out)
 end ex_a_sysl_caller_reaches_the_definition
 
+// guards: an unmangled export is external so C linkers resolve it
 @test("an unmangled export is not 'internal', so a linker outside can resolve it")
 ex_an_unmangled_export_is_not_internal()
     if ex_no_library() then return
@@ -501,6 +517,7 @@ ex_an_unmangled_export_is_not_internal()
 
 // -- an export is a root for reachability -----------------------------------------------------------
 
+// guards: what an exported function calls survives pruning
 @test("and so does what an exported function calls")
 ex_what_an_export_calls_survives()
     if ex_no_library() then return
@@ -516,6 +533,7 @@ end ex_what_an_export_calls_survives
 // that being the point of one -- was reachable from nothing and went. It goes **quietly**, unlike a
 // destructor: there is no generated call site to be left dangling, so the suite links and the
 // package's own C is what finds out.
+// guards: a test build keeps an export no test names
 @test("and a test build keeps an export, though no test names it")
 ex_a_test_build_keeps_an_export()
     if ex_no_library() then return
@@ -549,6 +567,7 @@ ex_a_string_parameter()
 // A struct of scalars **is** a C declaration, so it is not refused. What an aggregate needed was
 // never a refusal -- it was for somebody to apply the convention, which is what the exported entry
 // goes through. Here it is only that the rule lets it past.
+// guards: an export may take a struct of scalars, as C declares one
 @test("a struct of scalars is not refused, since C declares one")
 ex_a_struct_of_scalars_is_not_refused()
     if ex_no_library() then return
@@ -606,6 +625,7 @@ end ex_a_data_enum_is_refused
 // A pointer to a struct is fine, and it is the check that the rule is about the *shape* rather than
 // about the type being one the module declared, which a rule keyed on "is it named" would have got
 // wrong.
+// guards: an export may take a pointer to a struct
 @test("and a pointer to a struct is not refused either")
 ex_a_pointer_to_a_struct_is_fine()
     if ex_no_library() then return
@@ -657,6 +677,7 @@ end ex_a_member_export_is_refused
 // promises: the definition stays internal to its file, and the entry C calls is published hidden --
 // every object of the image resolves it, module `asm` and a package's own C among them, and a shared
 // object built from it does not offer it to a loader.
+// guards: a private export keeps its symbol hidden, definition internal
 @test("a private export keeps its symbol, hidden, in front of a definition that stays internal")
 ex_a_private_export_is_hidden()
     if ex_no_library() then return
@@ -668,6 +689,7 @@ ex_a_private_export_is_hidden()
     assert(out.contains("call i32 @demo$add("), out)
 end ex_a_private_export_is_hidden
 
+// guards: a module-private export is hidden, definition keeps module linkage
 @test("a module-private export is hidden too, and its definition keeps the module's linkage")
 ex_a_module_private_export_is_hidden()
     if ex_no_library() then return
@@ -679,6 +701,7 @@ ex_a_module_private_export_is_hidden()
     assert(out.contains("define i32 @demo$add("), out)
 end ex_a_module_private_export_is_hidden
 
+// guards: a public export is visible to the linker
 @test("and a public export is not hidden")
 ex_a_public_export_is_not_hidden()
     if ex_no_library() then return
@@ -689,6 +712,7 @@ ex_a_public_export_is_not_hidden()
     assert(!out.contains("hidden"), out)
 end ex_a_public_export_is_not_hidden
 
+// guards: a private root-module export moves its definition aside
 @test("a private export in the root module moves its definition aside, as a public one does")
 ex_a_private_root_export_moves_aside()
     if ex_no_library() then return
@@ -728,6 +752,7 @@ end ex_the_header_leaves_a_private_export_out
 // **A variadic export is the definition itself, under the exported symbol**, with no thunk: no
 // function can hand on a C tail it was given, so the entry C calls has to be the frame `va_start`
 // reads.
+// guards: a variadic export's definition is the exported symbol
 @test("but a variadic one is allowed, and its definition is the exported symbol")
 ex_a_variadic_export_is_the_definition()
     if ex_no_library() then return
@@ -741,6 +766,7 @@ ex_a_variadic_export_is_the_definition()
     assert(out.contains("@llvm.va_start"), out)
 end ex_a_variadic_export_is_the_definition
 
+// guards: a sysl caller reaches a variadic export by its exported symbol
 @test("a sysl caller of a variadic export reaches it under the exported symbol")
 ex_a_sysl_caller_reaches_a_variadic_export()
     if ex_no_library() then return
@@ -754,6 +780,7 @@ end ex_a_sysl_caller_reaches_a_variadic_export
 
 // In the root module the key and the symbol are one name, and nothing has to move aside: there is
 // no thunk to collide with.
+// guards: a root variadic export keeps its own name, moves nothing aside
 @test("in the root module a variadic export keeps its own name and moves nothing aside")
 ex_a_root_variadic_export()
     if ex_no_library() then return
@@ -764,6 +791,7 @@ ex_a_root_variadic_export()
     assert(!out.contains("six$$sysl"), out)
 end ex_a_root_variadic_export
 
+// guards: a private variadic export is hidden like a private thunk
 @test("a private variadic export is hidden, as a private thunk is")
 ex_a_private_variadic_export_is_hidden()
     if ex_no_library() then return
@@ -809,6 +837,7 @@ end ex_a_variadic_export_takes_no_tuple
 
 // Scalars, pointers, a function pointer, a simple enum, a `bool` and a `char` are passed alike by
 // both conventions, so every one of them is admitted.
+// guards: a variadic export takes any scalar or pointer
 @test("a variadic export takes any scalar or pointer")
 ex_a_variadic_export_takes_scalars()
     if ex_no_library() then return
@@ -872,6 +901,7 @@ end ex_the_header_spells_va_list
 
 // The thunk in front of a `va_list`-taking export hands the one pointer C passed straight on, since
 // the definition receives it as C does.
+// guards: a va_list export passes C's pointer through its thunk unchanged
 @test("an export taking a va_list hands C's pointer through its thunk unchanged")
 ex_a_va_list_export_thunk()
     if ex_no_library() then return
@@ -967,6 +997,7 @@ end ex_two_definitions_of_one_symbol
 //
 // Both halves are asserted together on purpose. A case pinning only the first would go on passing
 // against a check that had been deleted outright.
+// guards: a tests file's export is not a duplicate definition
 @test("but a @tests file's export is not a second definition, while two real ones still are")
 ex_a_tests_files_export_is_not_a_definition()
     if ex_no_library() then return
@@ -1005,6 +1036,7 @@ private ex_computed_storage() -> string =
 // **A hosted archive fills its storage from a constructor.** A C project supplies its own `main`, so
 // nothing else runs to fill storage a computed initializer would have written; the platform's
 // pre-`main` list does, which LLVM lowers to `.init_array`, `__mod_init_func` or `.CRT$XCU`.
+// guards: a hosted archive fills computed vals an export reaches by constructor
 @test("a computed 'val' an export reaches is filled by a constructor on a hosted target")
 ex_a_hosted_archive_gets_a_constructor()
     if ex_no_library() then return
@@ -1055,6 +1087,7 @@ end ex_storage_reached_transitively
 
 // **A build with an entry point lays its `val`s down there**, and gets no constructor beside it --
 // which would take a second count of every reference among them.
+// guards: a program with its own entry emits no global constructor
 @test("while a build with an entry point of its own gets no constructor")
 ex_a_program_gets_no_constructor()
     if ex_no_library() then return
@@ -1067,6 +1100,7 @@ end ex_a_program_gets_no_constructor
 
 // A module with nothing computed at module scope gets no constructor at all -- an empty one would be
 // a symbol on every archive's pre-`main` list doing nothing.
+// guards: an archive with nothing computed has no constructor
 @test("an archive with nothing computed carries no constructor")
 ex_an_archive_with_nothing_computed()
     if ex_no_library() then return
@@ -1080,6 +1114,7 @@ ex_an_archive_with_nothing_computed()
 // caught it -- and it must not, because the thing that links one is a sysl **program**, which has
 // one. A constructor here would fill a copy of the storage nothing reads, and run the initializer a
 // second time to do it.
+// guards: a library artifact emits no global constructor
 @test("and a library artifact gets none, because the program that links it has an entry point")
 ex_a_library_artifact_gets_no_constructor()
     val parsed = parse(source_of("lib.sysl", ex_computed_storage()))
@@ -1104,6 +1139,7 @@ end ex_a_library_artifact_gets_no_constructor
 // The other half of the ruling, and the reason it is not simply "no module storage": a constant
 // initializer is laid straight into the object file and nothing runs to fill it, which is the rule C
 // already has for static storage.
+// guards: an export may reach a val of constant data
 @test("a 'val' whose initializer is constant data is fine")
 ex_a_constant_val_is_fine()
     if ex_no_library() then return
@@ -1112,6 +1148,7 @@ ex_a_constant_val_is_fine()
 
     assert(out.contains("define i32 @begin("), out)
 
+// guards: an export may reach a const, which has no storage
 @test("and a 'const', which has no storage at all")
 ex_a_const_is_fine()
     if ex_no_library() then return
@@ -1723,6 +1760,7 @@ end ex_a_test_build_refuses_an_unspellable_parameter
 // entry point lays the computed `val`s down exactly as an ordinary one does, so a test binary reads
 // filled storage and always did. The refusal that remains is a freestanding archive's, which no test
 // build can be: a test runs on the machine that built it.
+// guards: a test build fills computed storage an export reaches
 @test("while an export reaching computed module storage is fine, because a test build fills it")
 ex_a_test_build_fills_its_storage()
     if ex_no_library() then return
@@ -1734,6 +1772,7 @@ end ex_a_test_build_fills_its_storage
 
 // And the export a test build legitimately has stays legitimate: a `@tests` file's `@export` is a
 // definition *here*, which is the whole reason the tree read keeps them.
+// guards: a tests file's own export is emitted in the test build
 @test("while a @tests file's own export is fine, because this is the build that emits it")
 ex_a_test_builds_own_export_is_fine()
     if ex_no_library() then return
@@ -1797,6 +1836,7 @@ end ex_an_export_above_an_enum
 
 // The mix that has always meant a function still does: `@export` composes with the function
 // attributes exactly as before, and the struct reading is reached only by the layout pair.
+// guards: an export beside a function attribute is still a function
 @test("while an export beside a function attribute is still a function")
 ex_an_export_beside_a_function_attribute()
     if ex_no_library() then return

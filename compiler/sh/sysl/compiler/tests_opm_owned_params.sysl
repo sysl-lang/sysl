@@ -81,6 +81,7 @@ opm_last_use_moves()
     opm_no_traffic(ir)
     assert(ir.contains("@wrap$$sysl.owned("), ir)
 
+// guards: a string temporary is handed to an owned parameter without a retain
 @test("a string made by + or a format hole is a temporary, handed over to an owned parameter with no pair")
 opm_string_temp_moves()
     val src = "struct D\n    m: string\n\nmk(m: string) -> D = D(m)\n\n" +
@@ -122,6 +123,7 @@ opm_last_use_prefers_owned()
 
 // A local named twice in one statement is not at its last use at either argument, so neither hands
 // it over: each argument is retained, and the scope's end gives the local's own count back.
+// guards: a local passed twice to one call is retained, never moved twice
 @test("a local passed twice to one call is never moved twice: both arguments are retained")
 opm_passed_twice()
     val ir = opm_ir("two(a: &Node, b: &Node) -> (W, W) = (W(a), W(b))\n\n" +
@@ -164,6 +166,7 @@ opm_aggregates_move()
 // Not at its last use, so it is not handed over; `keep_bag` answering its parameter itself, the call
 // reads the answer where it lies through the place entry (`place_entry.sysl`), and the answer read in
 // an inert stretch takes no count either.
+// guards: a struct argument whose field is read after the call is lent
 @test("a struct argument whose field is read after the call is not at its last use, so it is lent")
 opm_partial_use_copies()
     val ir = opm_ir("keep_bag(b: Bag) -> Bag = b\n\ngo(v: int) -> int\n    val b = Bag(Node(v), W(Node(1)))\n" +
@@ -180,6 +183,7 @@ opm_projection_borrowed()
 
 // Each of these calls is not one the local can be handed over at, so it is lent to `wrap`'s +0
 // entry rather than retained for the owned body (`zero_entry.sysl`).
+// guards: a local a defer names is lent through the +0 entry, never handed over
 @test("a local a defer names is not handed over, since the deferred statement reads it at the exit")
 opm_defer_retains()
     val ir = opm_ir("go(v: int) -> int\n    val x: &Node = Node(v)\n    defer touch(x.v)\n    wrap(x).n.v\n", "go")
@@ -187,6 +191,7 @@ opm_defer_retains()
     assert(ir.contains("@wrap$$sysl-zero("), ir)
     assert_eq(opm_count(ir, "call void @arc.retain("), 0)
 
+// guards: a last use in one match arm is lent through the +0 entry, not handed over
 @test("a last use in one arm of a match is not handed over there, the scope's end giving the local back")
 opm_match_arm_retains()
     val ir = opm_ir("go(c: int) -> int\n    val x: &Node = Node(c)\n    c match\n        0 -> wrap(x).n.v\n" +
@@ -203,6 +208,7 @@ opm_branch_hand_in()
     assert_eq(opm_takes(ir), 0)
     assert_eq(opm_releases(ir), 1)
 
+// guards: a non-last use of an outer local in a loop is lent, no retain
 @test("a call that is not a last use inside a loop body lends the local every round")
 opm_loop_outer_local_retains()
     val ir = opm_ir("go(v: int) -> int\n    val x: &Node = Node(v)\n    var t = 0\n    for i in 0..<3\n" +
@@ -213,6 +219,7 @@ opm_loop_outer_local_retains()
 
 // -- recursion and generics -------------------------------------------------------------------------------
 
+// guards: mutually recursive keepers of a parameter are both owned
 @test("mutually recursive functions that keep their parameter are both owned, and hand it over to each other")
 opm_mutual_recursion()
     val src = "ping(t: &Node, n: int) -> W = if n == 0 then W(t) else pong(t, n - 1)\n\n" +
@@ -221,6 +228,7 @@ opm_mutual_recursion()
     opm_no_traffic(opm_ir(src, "ping.owned"))
     opm_no_traffic(opm_ir(src, "pong.owned"))
 
+// guards: a self-recursive keeper of a parameter is owned
 @test("a self-recursive function that keeps its parameter through a non-tail call is owned")
 opm_self_recursion()
     val ir = opm_ir("deep(t: &Node, n: int) -> W\n    if n == 0 then return W(t)\n    val w = deep(t, n - 1)\n" +
@@ -232,6 +240,7 @@ opm_self_recursion()
     assert_eq(opm_count(ir, "call void @arc.copy.W("), 1)
     assert(ir.contains("@deep$$sysl.owned("), ir)
 
+// guards: a generic's ownership is decided per instantiation
 @test("a generic keeps per instantiation: owned where the argument is counted, not where it is a scalar")
 opm_generic_per_type()
     val src = "hold[T](x: T) -> Maybe[T] = Yes(x)\n\ngo(v: int) -> int\n    val x: &Node = Node(v)\n" +
@@ -295,6 +304,7 @@ private val opm_bufs: string = raw"""
     print(b.len())
     """
 
+// guards: a local pushed at its last use takes no count
 @test("the library's push is owned, and a local pushed at its last use takes no count and gives none back")
 opm_push_moves()
     val ir = opm_program_ir(opm_bufs, "fill")
@@ -326,6 +336,7 @@ opm_contract_names()
     assert(opm_ir(src, "kept.owned").starts_with("define"), opm_ir(src, "kept.owned"))
     opm_absent(opm_ir(src, "named.owned"))
 
+// guards: a loop-body local pushed at last use moves each round, no count
 @test("a local declared in a for body and pushed at its last use moves every round")
 opm_loop_push_moves()
     for symbol in ["looped", "cstyle"]
@@ -945,6 +956,7 @@ opm_cold_which_own()
     for name in ["both", "strict", "once", "until", "same", "after", "always"]
         opm_cold_owned(fs, name)
 
+// guards: a cold keep counts at the store, nothing on the early return
 @test("a cold keep takes its one count at the store, nothing on the path that returns early, and a lending caller none at all")
 opm_cold_counts()
     if !lbr_ready() then return

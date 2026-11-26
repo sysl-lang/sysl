@@ -4838,6 +4838,52 @@ of one is entitled to assume the address is aligned. Only the escaped address lo
 would lose it arbitrarily far from the `&` that made it. **The struct's own address is untouched**,
 being an ordinary pointer to an ordinary aggregate.
 
+**A `volatile` field off its boundary is refused.** A volatile access is exactly one access of its
+width ([`volatile`](/reference/memory/)) — on ARM one `ldr` or `str` — and that one instruction at an
+address off the type's boundary faults on an ARMv6-M core always, and on any core's device memory,
+which is what `volatile` is for. Byte-at-a-time is not an option: it would be four accesses to one
+register. So selecting such a field is refused where it is written:
+
+```sysl
+@packed
+struct Reg
+    tag: u8
+    word: volatile u32
+
+@export("get")
+get(r: *Reg) -> u32 = r.word
+```
+
+```error
+'Reg.word' is a 'volatile' uint at byte 1 of Reg, which is misaligned: 1 is not a multiple of 4, a uint's alignment on this target. A volatile access is exactly one access of its width, and one off that boundary faults on device memory — place it at a multiple of 4 bytes from the start of Reg
+```
+
+**Misaligned is exact**: a volatile value sits at a byte offset, counted from the start of the struct
+whose field is selected, that is not a multiple of its type's natural alignment on the target — what
+`alignof` says of the type outside any packed struct, so a `volatile usize` at byte 4 is refused on a
+64-bit target and accepted on a 32-bit one. The offset counts through every struct and array that holds
+the value by value: a packed struct held one byte into another, an ordinary struct held in a packed
+one, a packed one held in an ordinary one (it needs no alignment of its own, so it may begin at any
+byte), and an array's element, each a stride on from the last — so an array is on its boundary when
+its first two elements are. A bitfield struct is one volatile container of its width, and a C
+bitfield's unit is the access it names. A generic struct is checked at each instantiation, and a field
+of a type whose alignment is one byte (`u8`, `bool`) is never off its boundary. An ordinary field is
+unaffected: `Head.len` above still moves a byte at a time. Pad the register to its boundary instead:
+
+```sysl
+@packed
+struct Reg
+    tag: u8
+    pad: [3]u8
+    word: volatile u32
+
+print(sizeof(Reg))
+```
+
+```output
+8
+```
+
 ### Bitfields — an `iN` field in exactly N bits
 
 **Inside `@packed`, an integer field occupies exactly its declared width.** A packed struct whose
