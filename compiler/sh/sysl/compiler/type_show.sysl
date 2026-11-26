@@ -92,6 +92,9 @@ type_show(t: Type) -> string = t match
     Enum(d) -> qualified(module_show(d.base), d.targs)
     Constrained(d) ->
         if d.targs.is_empty() then module_show(d.name) else qualified(module_show(d.generic), d.targs)
+    // A scalar declared at a measured `c type` is quoted by the name the reader wrote.
+    Integer(_, _, _, Some(name)) -> module_show(name)
+    Floating(_, _, Some(name)) -> module_show(name)
     _ -> friendly_name(t) match
         Some(name) -> name
         None -> canonical_name(t)
@@ -130,14 +133,14 @@ end show_list
 // The names a program writes for the widths it uses most. They displace the canonical spelling, so
 // an `int` is quoted as `int` and not as `i32`.
 private friendly_name(t: Type) -> Option[string] = t match
-    Integer(32, true, false) -> Some("int")
-    Integer(16, true, false) -> Some("short")
-    Integer(64, true, false) -> Some("long")
-    Integer(8, false, false) -> Some("byte")
-    Integer(16, false, false) -> Some("ushort")
-    Integer(32, false, false) -> Some("uint")
-    Integer(64, false, false) -> Some("ulong")
-    Floating(64, _) -> Some("real")
+    Integer(32, true, false, _) -> Some("int")
+    Integer(16, true, false, _) -> Some("short")
+    Integer(64, true, false, _) -> Some("long")
+    Integer(8, false, false, _) -> Some("byte")
+    Integer(16, false, false, _) -> Some("ushort")
+    Integer(32, false, false, _) -> Some("uint")
+    Integer(64, false, false, _) -> Some("ulong")
+    Floating(64, _, _) -> Some("real")
     _ -> None
 
 // The width name a scalar has whatever friendlier name displaces it -- `u16` for `ushort`.
@@ -145,10 +148,10 @@ canonical_text(t: Type) -> string = canonical_name(t)
 
 // What a type is called where no friendlier name displaces it.
 private canonical_name(t: Type) -> string = t match
-    Integer(_, signed, true) -> if signed then "isize" else "usize"
-    Integer(bits, signed, _) -> s"${if signed then "i" else "u"}$bits"
-    Floating(16, true) -> "bf16"
-    Floating(bits, _) -> s"f$bits"
+    Integer(_, signed, true, _) -> if signed then "isize" else "usize"
+    Integer(bits, signed, _, _) -> s"${if signed then "i" else "u"}$bits"
+    Floating(16, true, _) -> "bf16"
+    Floating(bits, _, _) -> s"f$bits"
     Fixed(bits, frac, signed) -> fixed_show(bits, frac, signed)
     Char -> "char"
     Bool -> "bool"
@@ -491,7 +494,8 @@ mangle(t: Type) -> string = t match
         if name_only(d) then mangle(d.base)
         else if !d.targs.is_empty() then mangled(d.generic, d.targs)
         else mangled(d.name, buf())
-    _ -> type_show(t)
+    // A scalar mangles as the integer or float it is, whatever `c type` it was declared at.
+    _ -> type_show(unmeasured(t))
 
 private mangle_list(ts: Buf[Type]) -> string
     var b = str_builder()

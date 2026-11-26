@@ -63,11 +63,14 @@ widened(t: TExpr, expected: Option[Type]) -> TExpr
     TExpr(t.span, TCast(t, want))
 end widened
 
-// A type a widened value may be converted to directly. A named type over a scalar -- a subtype, a
-// `c type` -- is a type of its own, and nothing widens into it.
+// A type a widened value may be converted to directly. A named subtype over a scalar is a type of its
+// own, and nothing widens into it -- nor into a scalar declared at a measured `c type`, which is
+// the integer or float C said it is and is reached from another width only by a written conversion
+// (`reference/ffi.md § c type`): the width is the target's, so a `u32` sliding into a `Size` would
+// be one machine's answer. A value of the very scalar it was measured as needs no widening at all.
 private plain_scalar(t: Type) -> bool = t match
-    Integer(_, _, _) -> true
-    Floating(_, _) -> true
+    Integer(_, _, _, measured) -> measured.is_none()
+    Floating(_, _, measured) -> measured.is_none()
     Fixed(_, _, _) -> true
     _ -> false
 
@@ -80,25 +83,29 @@ private plain_scalar(t: Type) -> bool = t match
 // 32-bit target is `Integer(32, …)`, so `u32` reaches it there and on a 64-bit target, and on a
 // 16-bit one it does not.
 //
-// **Both sides are the scalars themselves**: a named type over one (a subtype, a `c type`) is a type
-// of its own and converts as written, here as anywhere.
-implicitly_widens(from: Type, to: Type) -> bool = from match
-    Integer(m, sm, _) -> to match
-        Integer(n, sn, _) -> integer_fits(m, sm, n, sn)
-        Floating(b, brain) -> m <= (if sm then significand_bits(b, brain) + 1 else significand_bits(b, brain))
+// **Both sides are the scalars themselves**: a named subtype over one is a type of its own and
+// converts as written, here as anywhere. **Nothing widens INTO a scalar declared at a measured `c
+// type`** (`plain_scalar`); a value of one widens out of it as the integer or float it is.
+implicitly_widens(from: Type, to: Type) -> bool =
+    if measured_name(to).is_some() then false else widens_between(from, to)
+
+private widens_between(from: Type, to: Type) -> bool = from match
+    Integer(m, sm, _, _) -> to match
+        Integer(n, sn, _, _) -> integer_fits(m, sm, n, sn)
+        Floating(b, brain, _) -> m <= (if sm then significand_bits(b, brain) + 1 else significand_bits(b, brain))
         Fixed(w, f, s) -> fixed_fits(m, 0, sm, w, f, s)
         _ -> false
     // The largest scalar value is 0x10FFFF, twenty-one bits.
     Char -> to match
-        Integer(n, sn, _) -> integer_fits(21, false, n, sn)
+        Integer(n, sn, _, _) -> integer_fits(21, false, n, sn)
         _ -> false
     // `f16` and `bf16` are both sixteen bits and neither holds the other's values.
-    Floating(a, _) -> to match
-        Floating(b, _) -> b > a
+    Floating(a, _, _) -> to match
+        Floating(b, _, _) -> b > a
         _ -> false
     Fixed(w, f, s) -> to match
         Fixed(w2, f2, s2) -> fixed_fits(w, f, s, w2, f2, s2)
-        Floating(b, brain) ->
+        Floating(b, brain, _) ->
             (if s then w - 1 else w) <= significand_bits(b, brain) && f <= subnormal_scale(b, brain)
         _ -> false
     _ -> false

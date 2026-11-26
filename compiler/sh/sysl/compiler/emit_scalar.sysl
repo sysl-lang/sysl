@@ -70,14 +70,14 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val, reassoc: bool) -> Val
 
     if is_sat_op(op)
         lane match
-            Integer(bits, signed, _) -> return saturating(e, op, bits, signed, lv, rv)
+            Integer(bits, signed, _, _) -> return saturating(e, op, bits, signed, lv, rv)
             _ -> ()
     end if
 
     val ety = lty(e, ty)
 
     val instr = lane match
-        Integer(_, signed, _) -> int_instr(e, op, signed)
+        Integer(_, signed, _, _) -> int_instr(e, op, signed)
         Char -> int_instr(e, op, false)
         Bool -> op match
             "&" -> OpAnd
@@ -86,7 +86,7 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val, reassoc: bool) -> Val
             _ ->
                 gap_here(e, s"mask arith '$op'")
                 OpAnd
-        Floating(_, _) -> op match
+        Floating(_, _, _) -> op match
             "+" -> if reassoc then OpFAddReassoc else OpFAdd
             "-" -> if reassoc then OpFSubReassoc else OpFSub
             "*" -> if reassoc then OpFMulReassoc else OpFMul
@@ -105,7 +105,7 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val, reassoc: bool) -> Val
     var divisor = rv
 
     underlying(ty) match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if op == "/" || op == "%"
                 val nz = fresh_reg(e)
 
@@ -141,7 +141,7 @@ arith(e: *Emit, op: string, ty: Type, lv: Val, rv: Val, reassoc: bool) -> Val
     // A shift amount at or past the operand's width is undefined on every machine instruction this
     // lowers to, and LLVM propagates that as poison rather than as a number.
     lane match
-        Integer(bits, _, _) ->
+        Integer(bits, _, _, _) ->
             if op == "<<" || op == ">>" then return bounded_shift(e, ty, bits, instr, lv, divisor)
         _ -> ()
 
@@ -226,7 +226,7 @@ constant_at(e: *Emit, ty: Type, value: BigInt) -> Val = underlying(ty) match
 // **wider** one is clamped at the shifted width *before* it is truncated, since truncating first
 // would turn a count of 256 into a count of 0.
 shift_amount(e: *Emit, ty: Type, amt_ty: Type, amt: Val) -> Val = (underlying(ty), underlying(amt_ty)) match
-    (Integer(to_bits, to_signed, _), Integer(from_bits, from_signed, _)) ->
+    (Integer(to_bits, to_signed, _, _), Integer(from_bits, from_signed, _, _)) ->
         if to_bits == from_bits then amt
         else if from_bits < to_bits then
             convert_int(e, from_bits, from_signed, to_bits, amt)
@@ -273,8 +273,8 @@ int_pred(e: *Emit, op: string, ty: Type) -> ICmp = ty match
     Ref(_, _) -> eq_pred(e, op)
     CFn(_, _, _) -> eq_pred(e, op)
     Char -> unsigned_pred(e, op)
-    Integer(_, false, _) -> unsigned_pred(e, op)
-    Integer(_, true, _) -> signed_pred(e, op)
+    Integer(_, false, _, _) -> unsigned_pred(e, op)
+    Integer(_, true, _, _) -> signed_pred(e, op)
     // A fixed-point value compares as the integer it is stored as: one scale on both sides.
     Fixed(_, _, false) -> unsigned_pred(e, op)
     Fixed(_, _, true) -> signed_pred(e, op)
@@ -373,7 +373,7 @@ compare_value(e: *Emit, op: string, base: Type, av: Val, bv: Val) -> Val
     end if
 
     ty match
-        Floating(_, _) -> emit(e, InFloatCmp(r, float_pred(e, op), lty(e, ty), av, bv))
+        Floating(_, _, _) -> emit(e, InFloatCmp(r, float_pred(e, op), lty(e, ty), av, bv))
         Vector(_, _, _) -> gap_here(e, "vector comparison")
         _ -> emit(e, InIntCmp(r, int_pred(e, op, ty), lty(e, ty), av, bv))
 
@@ -388,7 +388,7 @@ is_ranged(t: Type) -> bool = t match
     Constrained(d) ->
         if d.lo.is_none() && d.hi.is_none() then false
         else underlying(t) match
-            Integer(_, _, _) -> true
+            Integer(_, _, _, _) -> true
             _ -> false
     _ -> false
 
@@ -504,7 +504,7 @@ plain_checked(e: *Emit, op: string, ty: Type, site: Span) -> bool
     if (op != "+" && op != "-" && op != "*") || !checked_at(e, site) then return false
 
     underlying(ty) match
-        Integer(_, _, _) -> true
+        Integer(_, _, _, _) -> true
         _ -> false
 end plain_checked
 
@@ -937,7 +937,7 @@ end rotation_args
 
 private amount_type(amount: Option[TExpr]) -> Type = amount match
     Some(a) -> texpr_type(a)
-    None -> Integer(32, false, false)
+    None -> Integer(32, false, false, None)
 
 // One bit intrinsic, declared under the overload-mangled name that carries its width, and called.
 //
@@ -1010,9 +1010,9 @@ private rotate_by(e: *Emit, v: Val, from: Type, bits: int) -> Val
         emit(e, InBin(r, OpURem, lty(e, from), v, VInt(from_int(long(bits)))))
         r
 
-    resize_int(e, reduced, from, Integer(bits, false, false))
+    resize_int(e, reduced, from, Integer(bits, false, false, None))
 end rotate_by
 
 private int_bits_of(t: Type) -> int = underlying(t) match
-    Integer(bits, _, _) -> bits
+    Integer(bits, _, _, _) -> bits
     _ -> 32

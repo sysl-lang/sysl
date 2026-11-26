@@ -1234,7 +1234,7 @@ private ptr_cast_source_fault(from: Type) -> Option[string] = underlying(from) m
              "the address half by reading through it, rather than reinterpreting the pair")
     CFn(_, _, _) -> None
     Unknown -> None
-    Integer(_, _, wide) ->
+    Integer(_, _, wide, _) ->
         if wide then return None
 
         Some(s"'ptr_cast' reads an address, and ${type_show(underlying(from))} is not " +
@@ -1364,7 +1364,7 @@ private literal_target(arg: Expr, to: Type) -> Option[Type]
     val v = value.unwrap()
 
     to match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if fits(v, bits, signed) || !fits_int(v) then Some(to) else None
         _ -> None
 end literal_target
@@ -1378,7 +1378,7 @@ private written_literal(arg: Expr) -> bool = *arg.kind match
     _ -> false
 
 private fits_int(v: BigInt) -> bool = int_type() match
-    Integer(bits, signed, _) -> fits(v, bits, signed)
+    Integer(bits, signed, _, _) -> fits(v, bits, signed)
     _ -> true
 
 // The value of an unsuffixed integer literal, with the minus in front of it where one is written --
@@ -1416,7 +1416,7 @@ convert_to(cx: &Analyzer, span: Span, t: TExpr, to: Type, asked: Option[string])
 
     // A written integer conversion is the one a debug build checks (`build_mode.sysl`).
     (from, underlying(to)) match
-        (Integer(_, _, _), Integer(_, _, _)) -> note_written_conversion(cx.scope.src.name, span)
+        (Integer(_, _, _, _), Integer(_, _, _, _)) -> note_written_conversion(cx.scope.src.name, span)
         _ -> ()
 
     TExpr(span, TCast(t, to))
@@ -1497,7 +1497,7 @@ private rounded_convert(cx: &Analyzer, span: Span, written: string, to: Type, ar
     if default.is_none()
         // Into a float, or a pair no conversion joins -- which the conversion itself refuses.
         target match
-            Floating(_, _) ->
+            Floating(_, _, _) ->
                 return cx.err(args[1].span, s"a conversion from ${type_show(texpr_type(t))} " +
                               "into a float rounds to nearest, so it takes no rounding mode")
             _ -> return convert_to(cx, span, t, to, None)
@@ -1515,7 +1515,7 @@ private rounded_convert(cx: &Analyzer, span: Span, written: string, to: Type, ar
     // ordinary conversion is already exact.
     val drops = (from, target) match
         (Fixed(_, f1, _), Fixed(_, f2, _)) -> f1 > f2
-        (Integer(_, _, _), _) -> false
+        (Integer(_, _, _, _), _) -> false
         _ -> true
 
     if !drops then return plain
@@ -1534,9 +1534,9 @@ private int_lit_value(t: TExpr) -> BigInt = *t.kind match
 // The rounding a conversion takes when none is written, where the conversion reads one at all.
 private rounding_default(from: Type, to: Type) -> Option[string] = (from, to) match
     (Fixed(_, _, _), Fixed(_, _, _)) -> Some("HalfUp")
-    (Floating(_, _), Fixed(_, _, _)) -> Some("HalfUp")
-    (Integer(_, _, _), Fixed(_, _, _)) -> Some("HalfUp")
-    (Fixed(_, _, _), Integer(_, _, _)) -> Some("Down")
+    (Floating(_, _, _), Fixed(_, _, _)) -> Some("HalfUp")
+    (Integer(_, _, _, _), Fixed(_, _, _)) -> Some("HalfUp")
+    (Fixed(_, _, _), Integer(_, _, _, _)) -> Some("Down")
     _ -> None
 
 // The mode, which has to be one of `sysl.Rounding`'s names written here: the conversion is laid down
@@ -1581,7 +1581,7 @@ private refusal(asked: Option[string], from: Type, to: Type) -> string = asked m
 
 // An integer has no truth of its own to convert; the comparison that gives it one is the fix.
 private truth_hint(from: Type, to: Type) -> string = (underlying(from), underlying(to)) match
-    (Integer(_, _, _), Bool) -> " — write 'x != 0'"
+    (Integer(_, _, _, _), Bool) -> " — write 'x != 0'"
     _ -> ""
 
 private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
@@ -1596,32 +1596,32 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
 
     from match
         Abstract(_, _) -> return true
-        Integer(_, _, _) -> to match
-            Integer(_, _, _) -> return true
-            Floating(_, _) -> return true
+        Integer(_, _, _, _) -> to match
+            Integer(_, _, _, _) -> return true
+            Floating(_, _, _) -> return true
             Fixed(_, _, _) -> return true
             Char -> return true
             _ -> return false
-        Floating(_, _) -> to match
-            Integer(_, _, _) -> return true
-            Floating(_, _) -> return true
+        Floating(_, _, _) -> to match
+            Integer(_, _, _, _) -> return true
+            Floating(_, _, _) -> return true
             Fixed(_, _, _) -> return true
             _ -> return false
         // A fixed-point value converts to and from every number, each crossing rounding to nearest
         // and saturating -- into an integer it truncates toward zero, as a float does.
         Fixed(_, _, _) -> to match
-            Integer(_, _, _) -> return true
-            Floating(_, _) -> return true
+            Integer(_, _, _, _) -> return true
+            Floating(_, _, _) -> return true
             Fixed(_, _, _) -> return true
             _ -> return false
         Char -> to match
-            Integer(_, _, _) -> return true
+            Integer(_, _, _, _) -> return true
             Char -> return true
             _ -> return false
         // A `bool` is `1` or `0` at every integer width, and is no number to anything else. The way
         // back is a comparison, `n != 0`, never a conversion.
         Bool -> to match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if bits == 1 && signed then
                     cx.fault(span, s"cannot convert bool to ${type_show(to)} — an i1 cannot hold 1; use u1")
 
@@ -1630,7 +1630,7 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
         // Enum to integer is total: every enum value is one of its declared discriminants. Only a
         // simple enum has an integer value to give; a data enum is a tagged union, not a number.
         Enum(d) -> to match
-            Integer(_, _, _) ->
+            Integer(_, _, _, _) ->
                 if !d.simple then
                     cx.fault(span, s"only a simple enum converts to an integer — " +
                              s"${type_show(from)} carries data")
@@ -1640,7 +1640,7 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
         // A pointer to an integer is total: an address *is* a number of `usize`'s width. It goes
         // only this way; making a pointer out of an integer is `ptr_cast`.
         Ptr(inner, _) -> to match
-            Integer(_, _, pw) ->
+            Integer(_, _, pw, _) ->
                 if is_trait(*inner) then
                     cx.fault(span, "a pointer to a trait is two words — the address and the table " +
                              "of the type it was erased from — so it is not a number")
@@ -1652,7 +1652,7 @@ private converts(cx: &Analyzer, span: Span, from: Type, to: Type) -> bool
                 return true
             _ -> return false
         CFn(_, _, _) -> to match
-            Integer(_, _, pw) ->
+            Integer(_, _, pw, _) ->
                 if !pw then
                     cx.fault(span, s"an address is read as 'usize' or 'isize' rather than as " +
                              s"${type_show(to)} — a fixed width is not an address's width on " +
@@ -2181,7 +2181,7 @@ private enum_cast(cx: &Analyzer, span: Span, key: string, written: string,
             // A transparent subtype IS its base and is read as one; a `new` derivation is a type of
             // its own, so `repr` -- not `underlying` -- is the question.
             repr(vt) match
-                Integer(_, _, _) -> ()
+                Integer(_, _, _, _) -> ()
                 _ -> return cx.err(span, s"'$written' converts an integer, but the value has type " +
                                    type_show(vt))
 
@@ -2209,7 +2209,7 @@ private enum_cast_at(cx: &Analyzer, span: Span, en: Type, written: string, args:
             if vt == Unknown then return bad_expr(span)
 
             repr(vt) match
-                Integer(_, _, _) -> ()
+                Integer(_, _, _, _) -> ()
                 _ -> return cx.err(span, s"'$written' converts an integer, but the value has type " +
                                    type_show(vt))
 
@@ -2238,13 +2238,13 @@ end enum_cast_at
 // constrained alias over an integer is a type of its own, and `%d` over one is the same confusion
 // about which value is in the hole that `%d` over a string is.
 private written_integer(t: Type) -> bool = t match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     _ -> false
 
 // A float conversion renders a fixed-point value too: it is a number with a fraction, which is what
 // `%f`, `%e` and `%g` are about, and its value is exact in decimal, so nothing is lost by asking.
 private written_floating(t: Type) -> bool = t match
-    Floating(_, _) -> true
+    Floating(_, _, _) -> true
     Fixed(_, _, _) -> true
     _ -> false
 
@@ -2311,11 +2311,11 @@ end format_call
 private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: string,
                         counts: Buf[TExpr]) -> TExpr
     val bits = ty match
-        Integer(b, _, _) -> b
+        Integer(b, _, _, _) -> b
         _ -> 32
 
     val unsigned = ty match
-        Integer(_, s, _) -> !s
+        Integer(_, s, _, _) -> !s
         _ -> false
 
     // A `u128` above `i128`'s maximum crosses as a negative `i128`, which a signed conversion would
@@ -2326,7 +2326,7 @@ private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: str
 
     var lead: Buf[TExpr] = buf()
 
-    lead.push(TExpr(span, TCast(v, Integer(128, true, false))))
+    lead.push(TExpr(span, TCast(v, Integer(128, true, false, None))))
     lead.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
 
     library_format_call(cx, span, "format_int", lead, written, counts)
@@ -2341,10 +2341,10 @@ private float_format_call(cx: &Analyzer, span: Span, v: TExpr, spec: string,
     val ty = texpr_type(v)
 
     val single = underlying(ty) match
-        Floating(b, brain) -> b == 32 && !brain
+        Floating(b, brain, _) -> b == 32 && !brain
         _ -> false
 
-    val to = if single then Floating(32, false) else real_type()
+    val to = if single then Floating(32, false, None) else real_type()
     val value = if type_eq(ty, to) then v else TExpr(span, TCast(v, to))
 
     library_format_call(cx, span, if single then "format_f32" else "format_real", one_arg(value), spec,
@@ -2373,7 +2373,7 @@ private fixed_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: s
         return library_format_call(cx, span, "format_fixed_wide", lead, spec, counts)
     end if
 
-    lead.push(TExpr(span, TCast(raw, Integer(128, true, false))))
+    lead.push(TExpr(span, TCast(raw, Integer(128, true, false, None))))
     lead.push(TExpr(span, TIntLit(from_int(long(shape.0)), int_type())))
     lead.push(TExpr(span, TBoolLit(shape.2)))
     lead.push(TExpr(span, TIntLit(from_int(long(shape.1)), int_type())))
@@ -2417,7 +2417,7 @@ end library_format_call
 
 // An `f128` value, or one of a subtype over it, as the `f128` its renderer takes.
 private at_quad(span: Span, v: TExpr) -> TExpr =
-    if texpr_type(v) == Floating(128, false) then v else TExpr(span, TCast(v, Floating(128, false)))
+    if texpr_type(v) == Floating(128, false, None) then v else TExpr(span, TCast(v, Floating(128, false, None)))
 
 // One argument, as the list a renderer's call starts from.
 private one_arg(v: TExpr) -> Buf[TExpr]
@@ -2452,11 +2452,11 @@ private plain_float_call(cx: &Analyzer, span: Span, v: TExpr) -> Option[TExpr]
     val ty = texpr_type(v)
 
     val at: (string, Type) = underlying(ty) match
-        Floating(32, _) -> ("format_f32_plain", Floating(32, false))
-        Floating(16, true) -> ("format_bf16_plain", Floating(16, true))
-        Floating(16, _) -> ("format_f16_plain", Floating(16, false))
-        Floating(128, _) -> ("format_f128_plain", Floating(128, false))
-        Floating(_, _) -> ("format_real_plain", real_type())
+        Floating(32, _, _) -> ("format_f32_plain", Floating(32, false, None))
+        Floating(16, true, _) -> ("format_bf16_plain", Floating(16, true, None))
+        Floating(16, _, _) -> ("format_f16_plain", Floating(16, false, None))
+        Floating(128, _, _) -> ("format_f128_plain", Floating(128, false, None))
+        Floating(_, _, _) -> ("format_real_plain", real_type())
         _ -> ("", Unknown)
 
     if at.0 == "" then return None
@@ -2511,7 +2511,7 @@ private format_count(cx: &Analyzer, w: Expr) -> TExpr
                       s"is ${big_text(fixed.unwrap())} — the '-' flag is what left-justifies a field")
 
     library_result_call(cx, w.span, "format_count",
-                        TExpr(w.span, TCast(t, Integer(128, true, false))))
+                        TExpr(w.span, TCast(t, Integer(128, true, false, None))))
 end format_count
 
 // What a plain alias stands for, where the resolution has already made it real.
@@ -3726,7 +3726,7 @@ private signed_literal_preference(fitted: Buf[Buf[Type]], ranked: Buf[usize],
             for r in 0..<ranked.len()
                 val here = fitted[ranked[r]]
 
-                if j < here.len() && type_eq(here[j], Integer(32, true, false)) then return none
+                if j < here.len() && type_eq(here[j], Integer(32, true, false, None)) then return none
 
             differ.push(j)
         end if
@@ -3871,7 +3871,7 @@ end literal_follows_typed
 literal_default_at(e: Expr, param: Type) -> Type
     val own = literal_arith_default(e).unwrap()
     val float_param = param match
-        Floating(_, _) -> true
+        Floating(_, _, _) -> true
         _ -> false
 
     if float_param then real_type() else own
@@ -4073,7 +4073,7 @@ private signed_bits(params: Buf[Type], j: usize) -> int
     if j >= params.len() then return 0
 
     params[j] match
-        Integer(bits, true, _) -> bits
+        Integer(bits, true, _, _) -> bits
         _ -> 0
 end signed_bits
 
@@ -4846,10 +4846,10 @@ variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
     val ty = texpr_type(t)
 
     ty match
-        Integer(bits, signed, _) ->
-            if bits < 32 then return TExpr(a.span, TCast(t, Integer(32, signed, false)))
+        Integer(bits, signed, _, _) ->
+            if bits < 32 then return TExpr(a.span, TCast(t, Integer(32, signed, false, None)))
 
-            if bits > 64 && bits < 128 then return TExpr(a.span, TCast(t, Integer(128, signed, false)))
+            if bits > 64 && bits < 128 then return TExpr(a.span, TCast(t, Integer(128, signed, false, None)))
 
             if bits > 128
                 return cx.err(t.span, s"a ${type_show(ty)} cannot be passed to '...' — C passes an integer " +
@@ -4857,7 +4857,7 @@ variadic_extra(cx: &Analyzer, a: Expr, foreign: bool) -> TExpr
                               "than a register pair")
 
             t
-        Floating(bits, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
+        Floating(bits, _, _) -> if bits < 64 then TExpr(a.span, TCast(t, real_type())) else t
         Char -> t
         Ptr(_, _) -> t
         CFn(_, _, _) -> t
@@ -4883,8 +4883,8 @@ end variadic_extra
 // A CHECKING subtype -- one with a range or a predicate -- does not: C would read back a bare
 // integer the subtype's check never sees again, so `Small` is refused where `int` is not.
 private tail_scalar(t: Type) -> bool = tail_peeled(t) match
-    Integer(_, _, _) -> true
-    Floating(_, _) -> true
+    Integer(_, _, _, _) -> true
+    Floating(_, _, _) -> true
     Char -> true
     Ptr(_, _) -> true
     CFn(_, _, _) -> true

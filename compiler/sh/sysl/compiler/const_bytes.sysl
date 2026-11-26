@@ -14,8 +14,8 @@ import sysl.math.bigint.{BigInt, add, div_rem, from_int, mul, shl as big_shl, sh
 
 // How many bytes a value of `t` is laid out in, or `None` where the evaluator does not lay it out.
 laid_size(t: Type) -> Option[usize] = underlying(t) match
-    Integer(bits, _, _) -> if bits >= 8 && (bits & (bits - 1)) == 0 then Some(usize(bits / 8)) else None
-    Floating(bits, _) -> Some(usize(bits / 8))
+    Integer(bits, _, _, _) -> if bits >= 8 && (bits & (bits - 1)) == 0 then Some(usize(bits / 8)) else None
+    Floating(bits, _, _) -> Some(usize(bits / 8))
     Bool -> Some(1)
     Char -> Some(4)
     Array(n, elem, _) -> laid_size(*elem).map(each -> usize(n) * each)
@@ -32,14 +32,14 @@ laid_has_invalid(t: Type) -> bool = underlying(t) match
 // `v`, a value of `t`, laid out at the end of `out` in the byte order `little` names. False where `t`
 // has no layout here or `v` is not a value of it.
 laid_bytes(v: Const, t: Type, little: bool, out: Buf[u8]) -> bool = (v, underlying(t)) match
-    (ConstInt(n), Integer(bits, _, _)) -> laid_int(n, bits, little, out)
+    (ConstInt(n), Integer(bits, _, _, _)) -> laid_int(n, bits, little, out)
     (ConstBool(b), Bool) -> laid_int(from_int(if b then 1 else 0), 8, little, out)
     (ConstChar(c), Char) -> laid_int(from_int(long(u32(c))), 32, little, out)
-    (ConstFloat(f), Floating(64, _)) -> laid_int(from_u64(f.bits()), 64, little, out)
-    (ConstFloat(f), Floating(32, _)) -> laid_int(from_u64(u64(f32(f).bits())), 32, little, out)
-    (ConstFloat(f), Floating(16, brain)) ->
+    (ConstFloat(f), Floating(64, _, _)) -> laid_int(from_u64(f.bits()), 64, little, out)
+    (ConstFloat(f), Floating(32, _, _)) -> laid_int(from_u64(u64(f32(f).bits())), 32, little, out)
+    (ConstFloat(f), Floating(16, brain, _)) ->
         laid_int(from_u64(u64(if brain then bf16(f).bits() else f16(f).bits())), 16, little, out)
-    (ConstQuad(hi, lo), Floating(128, _)) -> laid_int(add(big_shl(from_u64(hi), 64), from_u64(lo)), 128, little, out)
+    (ConstQuad(hi, lo), Floating(128, _, _)) -> laid_int(add(big_shl(from_u64(hi), 64), from_u64(lo)), 128, little, out)
     (ConstArray(xs), Array(n, elem, _)) -> laid_elements(xs, n, *elem, little, out)
     _ -> false
 
@@ -80,7 +80,7 @@ value_of_bytes(bytes: Buf[u8], from: usize, t: Type, little: bool) -> Option[Con
     if from + size > bytes.len() then return None
 
     underlying(t) match
-        Integer(bits, signed, _) -> Some(ConstInt(wrap(int_of_bytes(bytes, from, size, little), bits, signed)))
+        Integer(bits, signed, _, _) -> Some(ConstInt(wrap(int_of_bytes(bytes, from, size, little), bits, signed)))
         Bool ->
             val b = bytes[from]
 
@@ -89,13 +89,13 @@ value_of_bytes(bytes: Buf[u8], from: usize, t: Type, little: bool) -> Option[Con
             val u = to_u64(int_of_bytes(bytes, from, 4, little)).unwrap_or(0xFFFFFFFF)
 
             if u > 0x10FFFF || (u >= 0xD800 && u <= 0xDFFF) then None else Some(ConstChar(char(u32(u))))
-        Floating(128, _) ->
+        Floating(128, _, _) ->
             val n = int_of_bytes(bytes, from, 16, little)
             val hi = to_u64(big_shr(n, 64)).unwrap_or(0)
             val lo = to_u64(wrap(n, 64, false)).unwrap_or(0)
 
             Some(ConstQuad(hi, lo))
-        Floating(bits, brain) ->
+        Floating(bits, brain, _) ->
             val u = to_u64(int_of_bytes(bytes, from, size, little)).unwrap_or(0)
 
             bits match

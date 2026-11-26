@@ -360,7 +360,7 @@ private range_value(cx: &Analyzer, span: Span, lo: Option[Expr], hi: Option[Expr
                  s"${type_show(texpr_type(thi))}" + mixing_hint(texpr_type(tlo), texpr_type(thi)))
 
     val vty = texpr_type(tlo) match
-        Integer(_, _, _) -> texpr_type(tlo)
+        Integer(_, _, _, _) -> texpr_type(tlo)
         Unknown -> Unknown
         other ->
             cx.fault(span, s"a range runs between integer bounds, not ${type_show(other)}")
@@ -1261,12 +1261,12 @@ end untyped_pattern_value
 // already is.
 private untyped_float(inner: &Analyzer, span: Span, name: string, init: Expr, value: Option[Const], ty: Type,
                       expected: Option[Type]) -> Option[TExpr]
-    if underlying(ty) != real_type() || expected.is_none() then return None
+    if !type_eq(underlying(ty), real_type()) || expected.is_none() then return None
 
     val at = scalar_wanted(expected.unwrap())
 
     val wanted = at match
-        Floating(_, _) -> at != real_type()
+        Floating(_, _, _) -> !type_eq(at, real_type())
         Fixed(_, _, _) -> true
         _ -> false
 
@@ -1330,7 +1330,7 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string,
     // module computes, folded there, rather than its arithmetic lowered under the reader's rule
     // (`no_fuse.sysl`).
     val floating = underlying(ty) match
-        Floating(_, _) -> true
+        Floating(_, _, _) -> true
         _ -> false
 
     if floating && no_fuse_here(inner) != no_fuse_here(cx)
@@ -1362,7 +1362,7 @@ private const_value_expr(cx: &Analyzer, span: Span, key: string,
     end if
 
     underlying(ty) match
-        Floating(_, _) ->
+        Floating(_, _, _) ->
             val ran = const_float_value(inner, d.init.unwrap(), ty)
 
             if ran.is_some() then
@@ -1386,7 +1386,7 @@ end const_value_expr
 // integer folded for a float constant has none: its initializer read at the float is the value.
 private const_literal(span: Span, v: Const, ty: Type) -> Option[TExpr] = v match
     ConstInt(n) -> underlying(ty) match
-        Floating(_, _) -> None
+        Floating(_, _, _) -> None
         _ -> Some(TExpr(span, TIntLit(n, ty)))
     ConstBool(b) -> Some(TExpr(span, TBoolLit(b)))
     ConstStr(s) -> Some(TExpr(span, TStrLit(s)))
@@ -2041,7 +2041,7 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
 
     if op == "-" then
         op_subject(ty) match
-            Integer(_, signed, _) ->
+            Integer(_, signed, _, _) ->
                 if !signed then
                     return cx.err(e.span, s"unary '-' is not defined for the unsigned type " +
                                   s"${type_show(ty)}")
@@ -2056,12 +2056,12 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
                                   s"${type_show(ty)}")
 
                 return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
-            Floating(_, _) -> return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
+            Floating(_, _, _) -> return produced(TExpr(e.span, TUnary("-", t, unary_type(ty))))
             _ -> return cx.err(e.span, s"unary '-' is not defined for ${type_show(ty)}")
 
     if op == "~" then
         op_subject(ty) match
-            Integer(_, _, _) -> return produced(TExpr(e.span, TUnary("~", t, unary_type(ty))))
+            Integer(_, _, _, _) -> return produced(TExpr(e.span, TUnary("~", t, unary_type(ty))))
             _ -> return cx.err(e.span, s"unary '~' is not defined for ${type_show(ty)}")
 
     cx.err(e.span, s"unary '$op' is not supported yet")
@@ -2181,7 +2181,7 @@ private inc_dec(cx: &Analyzer, span: Span, op: string, target: Expr, pre: bool) 
     underlying(ty) match
         // A step is a write of the place, so it owes every invariant the place reaches the re-check a
         // compound assignment owes.
-        Integer(_, _, _) ->
+        Integer(_, _, _, _) ->
             note_trap_name(cx.scope.src.name, span, s"${type_show(ty)}$op", s"${trap_operand(cx, place, place)}$op")
             rechecked(cx, span, place, TExpr(span, TIncDec(place, op, pre, ty, constraint_of(ty))))
         _ -> cx.err(span, s"'$op' is not defined for ${type_show(ty)}")
@@ -2312,8 +2312,8 @@ private scalar_subject_widened(cx: &Analyzer, span: Span, op: string, l: Expr, t
     // `unsigned long` is the `ulong` whose implementation it reaches, as it is as an argument.
     val plain = repr(got)
     val scalar = plain match
-        Integer(_, _, _) -> true
-        Floating(_, _) -> true
+        Integer(_, _, _, _) -> true
+        Floating(_, _, _) -> true
         Fixed(_, _, _) -> true
         _ -> false
 
@@ -2924,7 +2924,7 @@ private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TEx
         if firm[i].is_none() && is_literal(e)
             val own = literal_default(e)
 
-            if own.is_some() && own.unwrap() == int_type() && integer_operand(ty) then ()
+            if own.is_some() && type_eq(own.unwrap(), int_type()) && integer_operand(ty) then ()
             else if own.is_some() && !type_eq(own.unwrap(), ty) && reaches_position(own.unwrap(), expected) &&
                     !literal_fits(cx, e, ty) && literal_fits(cx, e, own.unwrap()) &&
                     holds_every_operand(cx, operands, firm, own.unwrap(), rescales) then
@@ -2932,7 +2932,7 @@ private literal_widened(cx: &Analyzer, operands: Buf[Expr], firm: Buf[Option[TEx
         else if firm[i].is_none() && told[i].is_some()
             val own = repr(texpr_type(told[i].unwrap()))
 
-            if own == int_type() && integer_operand(ty) then ()
+            if type_eq(own, int_type()) && integer_operand(ty) then ()
             else if own != Unknown && !type_eq(own, ty) && reaches_position(own, expected) &&
                     !reads_at(cx, e, ty) && holds_every_operand(cx, operands, firm, own, rescales) then
                 ty = own
@@ -2942,7 +2942,7 @@ end literal_widened
 
 // Whether the pair settled on an integer type, at which an integer literal beside it is read.
 private integer_operand(t: Type) -> bool = repr(t) match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     _ -> false
 
 // The readings with every operand in the literal's tier taken out, as the pair's type is worked out

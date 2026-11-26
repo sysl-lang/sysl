@@ -1141,8 +1141,8 @@ private unheld(t: Type) -> Option[string]
 
 private unheld_in(t: Type, seen: *Buf[string]) -> Option[string] = t match
     Constrained(d) -> unheld_in(d.base, seen)
-    Integer(_, _, _) -> None
-    Floating(_, _) -> None
+    Integer(_, _, _, _) -> None
+    Floating(_, _, _) -> None
     Fixed(_, _, _) -> None
     Array(_, elem, _) -> unheld_in(*elem, seen)
     Struct(d) ->
@@ -1601,8 +1601,8 @@ end float_pattern
 
 // The value a float literal of a width stands for.
 private float_at(f: real, t: Type) -> real = underlying(t) match
-    Floating(32, _) -> real(f32(f))
-    Floating(16, brain) -> half_of_double(f, brain)
+    Floating(32, _, _) -> real(f32(f))
+    Floating(16, brain, _) -> half_of_double(f, brain)
     _ -> f
 
 // What a step that has to produce a value produced, or the control it handed back.
@@ -2219,10 +2219,10 @@ end eval_bool
 
 @noinline
 private zero_value(r: &EvRun, at: Span, ty: Type) -> Flow = underlying(ty) match
-    Integer(_, _, _) -> EvGave(ConstInt(from_int(0)))
+    Integer(_, _, _, _) -> EvGave(ConstInt(from_int(0)))
     Char -> EvGave(ConstInt(from_int(0)))
-    Floating(128, _) -> EvGave(ConstQuad(0, 0))
-    Floating(_, _) -> EvGave(ConstFloat(0.0))
+    Floating(128, _, _) -> EvGave(ConstQuad(0, 0))
+    Floating(_, _, _) -> EvGave(ConstFloat(0.0))
     Fixed(_, _, _) -> EvGave(ConstInt(from_int(0)))
     Bool -> EvGave(ConstBool(false))
     Unit -> EvGave(ConstUnit)
@@ -2248,9 +2248,9 @@ private no_zero(r: &EvRun, at: Span, ty: Type) -> Flow =
 
 // Whether `zero_value` makes a value of `ty`, rather than refusing one.
 private holds_zero(ty: Type) -> bool = underlying(ty) match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     Char -> true
-    Floating(_, _) -> true
+    Floating(_, _, _) -> true
     Fixed(_, _, _) -> true
     Bool -> true
     Unit -> true
@@ -3003,7 +3003,7 @@ private rendered(r: &EvRun, at: Span, arg: TExpr) -> Flow
         (ConstChar(c), _) -> s"$c"
         (ConstInt(n), Char) -> s"${char(u32(n.to_long().unwrap_or(0)))}"
         (ConstInt(n), Fixed(_, frac, _)) -> fixed_text(n, frac)
-        (ConstInt(n), Integer(_, _, _)) -> to_string(n)
+        (ConstInt(n), Integer(_, _, _, _)) -> to_string(n)
         _ -> return refuse_form(r, at, s"a '${type_show(ty)}' rendered as text is not evaluated while compiling")
 
     built(r, at, text)
@@ -3536,7 +3536,7 @@ private subscript_index(r: &EvRun, operand: TExpr, ty: Type) -> Flow
     if cmp(n, from_int(0)) < 0 then return trap(r, operand.span, s"index ${to_string(n)} is negative")
 
     val bits = underlying(ty) match
-        Integer(b, _, _) -> b
+        Integer(b, _, _, _) -> b
         _ -> 64
 
     if cmp(n, big_shl(from_int(1), usize(bits))) >= 0 then
@@ -3551,7 +3551,7 @@ end subscript_index
 private checked_member(r: &EvRun, at: Span, op: string, operand: TExpr, amount: Option[TExpr],
                        width: Type, ty: Type) -> Flow
     val (bits, signed) = width match
-        Integer(b, s, _) -> (b, s)
+        Integer(b, s, _, _) -> (b, s)
         _ -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
 
     val a = eval_value(r, operand) match
@@ -3603,7 +3603,7 @@ end checked_member
 @noinline
 private carry_member(r: &EvRun, at: Span, op: string, operands: Buf[TExpr], width: Type, ty: Type) -> Flow
     val bits = width match
-        Integer(b, _, _) -> b
+        Integer(b, _, _, _) -> b
         _ -> return refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
 
     var xs: Buf[BigInt] = buf()
@@ -3716,10 +3716,10 @@ private global_value(r: &EvRun, at: Span, symbol: string, ty: Type, writable: bo
 
     folded match
         Some(ConstInt(n)) -> base match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if fits(n, bits, signed) then EvGave(ConstInt(n))
                 else refuse_form(r, at, s"$said is filled when the program runs")
-            Floating(_, _) -> EvGave(ConstFloat(float_at(int_to_float(n, 64), ty)))
+            Floating(_, _, _) -> EvGave(ConstFloat(float_at(int_to_float(n, 64), ty)))
             _ -> refuse_form(r, at, s"$said is filled when the program runs")
         Some(ConstFloat(f)) -> EvGave(ConstFloat(float_at(f, ty)))
         Some(ConstBool(b)) -> EvGave(ConstBool(b))
@@ -3776,7 +3776,7 @@ private unary(r: &EvRun, at: Span, op: string, operand: TExpr, ty: Type) -> Flow
                     other -> return other
 
             EvGave(ConstArray(out))
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             // Inside a `@checked` region negating the most negative value is the overflow it is; a
             // vector's lanes wrap, as they do when the program runs.
             val n = v match
@@ -3798,7 +3798,7 @@ private unary_value(r: &EvRun, at: Span, op: string, v: Const, ty: Type) -> Flow
             Fixed(_, _, _) ->
                 if op == "-" then EvGave(ConstInt(fixed_eval_negate(ty, n)))
                 else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if op == "-" then EvGave(ConstInt(wrap(negate(n), bits, signed)))
                 else if op == "~" then EvGave(ConstInt(wrap(big_not(n), bits, signed)))
                 else refuse_form(r, at, s"'$op' on ${type_show(ty)}")
@@ -3872,7 +3872,7 @@ private ev_contracted(r: &EvRun, at: Span, k: Contraction, addend: Option[TExpr]
             Err(f) -> return f
 
     val bits = vector_lane_of(ty) match
-        Floating(n, _) -> n
+        Floating(n, _, _) -> n
         _ -> 0
 
     underlying(ty) match
@@ -3930,15 +3930,15 @@ private operate(r: &EvRun, at: Span, op: string, lt: Type, x: Const, y: Const,
                 checked: bool) -> Flow
     val out = (x, y) match
         (ConstInt(a), ConstInt(b)) -> underlying(lt) match
-            Integer(bits, signed, _) -> run_int_binary(op, a, b, bits, signed, checked)
+            Integer(bits, signed, _, _) -> run_int_binary(op, a, b, bits, signed, checked)
             Char -> run_int_binary(op, a, b, 32, false, false)
             // Only a comparison reaches here: arithmetic is `fixed_operate`'s. One format's raw
             // values order as its values do.
             Fixed(bits, _, signed) -> run_int_binary(op, a, b, bits, signed, false)
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstFloat(a), ConstFloat(b)) -> underlying(lt) match
-            Floating(16, brain) -> run_half_binary(op, a, b, brain)
-            Floating(bits, _) -> run_float_binary(op, a, b, bits)
+            Floating(16, brain, _) -> run_half_binary(op, a, b, brain)
+            Floating(bits, _, _) -> run_float_binary(op, a, b, bits)
             _ -> Err(s"'$op' on ${type_show(lt)}")
         (ConstQuad(ah, al), ConstQuad(bh, bl)) -> run_quad_binary(op, (ah, al), (bh, bl))
         (ConstBool(a), ConstBool(b)) ->
@@ -4109,7 +4109,7 @@ private cast(r: &EvRun, at: Span, operand: TExpr, ty: Type) -> Flow
     // A written conversion inside a `@checked` region that cannot hold its value is the overflow it
     // would be when the program ran (`checked.sysl`).
     (held, from, underlying(ty)) match
-        (ConstInt(n), Integer(_, _, _), Integer(bits, signed, _)) ->
+        (ConstInt(n), Integer(_, _, _, _), Integer(bits, signed, _, _)) ->
             val file = here(r).src.name
 
             if !fits(n, bits, signed) && is_written_conversion(file, at) && checked_whatever_mode(file, at) then
@@ -4176,7 +4176,7 @@ private bit_operation(r: &EvRun, at: Span, op: string, operand: TExpr, amount: O
 
     v match
         ConstInt(n) -> width match
-            Integer(bits, signed, _) -> int_op_value(op, n, bits, signed, by) match
+            Integer(bits, signed, _, _) -> int_op_value(op, n, bits, signed, by) match
                 Some(out) -> EvGave(ConstInt(out))
                 None -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
             _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
@@ -4202,7 +4202,7 @@ private byte_order(r: &EvRun, at: Span, op: string, operand: TExpr, width: Type)
 
     v match
         ConstInt(n) -> width match
-            Integer(bits, signed, _) -> EvGave(if swaps then ConstInt(swapped_bytes(n, bits, signed)) else v)
+            Integer(bits, signed, _, _) -> EvGave(if swaps then ConstInt(swapped_bytes(n, bits, signed)) else v)
             _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
         _ -> refuse_form(r, at, s"'$op' is not evaluated while compiling yet")
 end byte_order
@@ -5471,7 +5471,7 @@ private ev_inc_dec(r: &EvRun, at: Span, place: TExpr, op: string, pre: bool, ty:
 
     val stepped = if op == "++" then add(cur, from_int(1)) else sub(cur, from_int(1))
     val nv = underlying(ty) match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             // Inside a `@checked` region a step past the width is the overflow it is (`checked.sysl`).
             if !fits(stepped, bits, signed) && checked_whatever_mode(here(r).src.name, at) then
                 return trap(r, at, s"${to_string(cur)} $op overflows ${type_show(ty)}")

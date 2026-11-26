@@ -150,7 +150,7 @@ const_fold(cx: &Analyzer, e: Expr) -> Option[Const] = *e.kind match
         // analyzer reads them (`bare_type_member`).
         if builtin_float(name).is_some()
             subject_named(cx, receiver) match
-                Some(Floating(_, _)) -> return Some(ConstFloat(builtin_float(name).unwrap()))
+                Some(Floating(_, _, _)) -> return Some(ConstFloat(builtin_float(name).unwrap()))
                 _ -> ()
 
         // `Op.Add` -- an enum's variant is a value known while compiling, and is typed and run as one.
@@ -674,7 +674,7 @@ private const_type_attr(cx: &Analyzer, receiver: Expr, attr: string) -> Option[C
     if t.is_none() then return None
 
     t.unwrap() match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if attr == "Min" then Some(ConstInt(min_of(bits, signed)))
             else if attr == "Max" then Some(ConstInt(max_of(bits, signed)))
             else None
@@ -728,7 +728,7 @@ private const_wrap(cx: &Analyzer, receiver: Expr, arg: Expr) -> Option[Const]
     if target.is_none() then return None
 
     target.unwrap() match
-        Integer(bits, signed, _) -> const_fold(cx, arg) match
+        Integer(bits, signed, _, _) -> const_fold(cx, arg) match
             Some(ConstInt(n)) -> Some(ConstInt(wrap(n, bits, signed)))
             _ -> None
         _ -> None
@@ -756,10 +756,10 @@ private made_new_const(cx: &Analyzer, callee: Expr, arg: Expr) -> Option[Const]
     if value.is_none() then return None
 
     val crosses = (value.unwrap(), base) match
-        (ConstInt(_), Floating(_, _)) -> true
+        (ConstInt(_), Floating(_, _, _)) -> true
         (ConstInt(_), Char) -> true
-        (ConstFloat(_), Integer(_, _, _)) -> true
-        (ConstChar(_), Integer(_, _, _)) -> true
+        (ConstFloat(_), Integer(_, _, _, _)) -> true
+        (ConstChar(_), Integer(_, _, _, _)) -> true
         _ -> false
 
     if !crosses then return value
@@ -775,9 +775,9 @@ end made_new_const
 
 private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[Const] = v match
     ConstInt(n) -> target match
-        Integer(bits, signed, _) -> Some(ConstInt(wrap(n, bits, signed)))
+        Integer(bits, signed, _, _) -> Some(ConstInt(wrap(n, bits, signed)))
         // Rounded once, to the width, as the machine rounds it (`run_convert`).
-        Floating(_, _) -> run_convert(v, target, target).ok()
+        Floating(_, _, _) -> run_convert(v, target, target).ok()
         Char ->
             val max = from_int(0x10FFFF)
 
@@ -788,15 +788,15 @@ private converted(cx: &Analyzer, span: Span, v: Const, target: Type) -> Option[C
             Some(ConstChar(char(u32(n.to_long().unwrap_or(0)))))
         _ -> None
     ConstFloat(f) -> target match
-        Integer(bits, signed, _) -> Some(ConstInt(saturated(f, bits, signed)))
-        Floating(_, _) -> run_convert(v, target, target).ok()
+        Integer(bits, signed, _, _) -> Some(ConstInt(saturated(f, bits, signed)))
+        Floating(_, _, _) -> run_convert(v, target, target).ok()
         _ -> None
     ConstQuad(_, _) -> run_convert(v, target, target).ok()
     ConstChar(c) -> target match
-        Integer(bits, signed, _) -> Some(ConstInt(wrap(from_int(long(u32(c))), bits, signed)))
+        Integer(bits, signed, _, _) -> Some(ConstInt(wrap(from_int(long(u32(c))), bits, signed)))
         _ -> None
     ConstBool(b) -> target match
-        Integer(bits, signed, _) -> bool_as_int(b, bits, signed)
+        Integer(bits, signed, _, _) -> bool_as_int(b, bits, signed)
         _ -> None
     _ -> None
 
@@ -1158,7 +1158,7 @@ private typed_byte_order(op: string, operand: TExpr, width: Type, m: FoldMachine
 
     v match
         Some(ConstInt(n)) -> width match
-            Integer(bits, signed, _) -> if swaps then Some(ConstInt(swapped_bytes(n, bits, signed))) else v
+            Integer(bits, signed, _, _) -> if swaps then Some(ConstInt(swapped_bytes(n, bits, signed))) else v
             _ -> None
         _ -> None
 end typed_byte_order
@@ -1279,8 +1279,8 @@ end bits_value
 // a predicate runs its check at run time, so it is not one.
 private folded_scalar(t: Type) -> Option[Type] = t match
     Constrained(d) -> if name_only(d) then folded_scalar(underlying(t)) else None
-    Integer(_, _, _) -> Some(t)
-    Floating(bits, brain) -> if !brain && (bits == 32 || bits == 64) then Some(t) else None
+    Integer(_, _, _, _) -> Some(t)
+    Floating(bits, brain, _) -> if !brain && (bits == 32 || bits == 64) then Some(t) else None
     Bool -> Some(t)
     Char -> Some(t)
     Str -> Some(t)
@@ -1289,13 +1289,13 @@ private folded_scalar(t: Type) -> Option[Type] = t match
 // A settled value as its type holds it, or `None` where the type cannot hold it as it stands.
 private held_at(v: Const, ty: Type) -> Option[Const] = v match
     ConstInt(n) -> ty match
-        Integer(bits, signed, _) -> if fits(n, bits, signed) then Some(v) else None
+        Integer(bits, signed, _, _) -> if fits(n, bits, signed) then Some(v) else None
         Char -> if scalar_value(n) then Some(v) else None
         _ -> None
     // A NaN's bits are the machine's choice -- x86 and Arm make different ones -- so one is not
     // written down for it.
     ConstFloat(f) -> ty match
-        Floating(bits, _) -> if f != f then None else Some(ConstFloat(if bits == 32 then real(f32(f)) else f))
+        Floating(bits, _, _) -> if f != f then None else Some(ConstFloat(if bits == 32 then real(f32(f)) else f))
         _ -> None
     ConstBool(_) -> if ty == Bool then Some(v) else None
     ConstStr(_) -> if ty == Str then Some(v) else None
@@ -1324,7 +1324,7 @@ private typed_unary(op: string, operand: TExpr, ty: Type, m: FoldMachine) -> Opt
 
     v.unwrap() match
         ConstInt(n) -> ty match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if op == "-" then Some(ConstInt(negate(n)))
                 // `~` is the complement within the width, which is the only reading a width has.
                 else if op == "~" then Some(ConstInt(wrap(big_not(n), bits, signed)))
@@ -1383,7 +1383,7 @@ private typed_contracted(k: Contraction, addend: TExpr, ty: Type, m: FoldMachine
             if x != x || y != y || z != z then return None
 
             val bits = underlying(ty) match
-                Floating(n, _) -> n
+                Floating(n, _, _) -> n
                 _ -> return None
 
             Some(ConstFloat(fused_parts(k, bits, x, y, z)))
@@ -1412,7 +1412,7 @@ private typed_int_binary(op: string, x: BigInt, y: BigInt, lt: Type) -> Option[C
 
     if op == "<<" || op == ">>"
         val bits = lt match
-            Integer(w, _, _) -> w
+            Integer(w, _, _, _) -> w
             _ -> 0
 
         if cmp(y, from_int(0)) < 0 || cmp(y, from_int(long(bits))) >= 0 then return None
@@ -1431,7 +1431,7 @@ private typed_int_binary(op: string, x: BigInt, y: BigInt, lt: Type) -> Option[C
 
     if is_wrap_sat_op(op)
         lt match
-            Integer(bits, signed, _) -> return Some(ConstInt(wrap_sat_value(op, x, y, bits, signed)))
+            Integer(bits, signed, _, _) -> return Some(ConstInt(wrap_sat_value(op, x, y, bits, signed)))
             _ -> return None
     end if
 
@@ -1456,29 +1456,29 @@ private typed_conversion(inner: TExpr, to: Type, m: FoldMachine) -> Option[Const
 
     v.unwrap() match
         ConstInt(n) -> to match
-            Integer(bits, signed, _) -> from.unwrap() match
-                Integer(_, _, _) -> Some(ConstInt(wrap(n, bits, signed)))
+            Integer(bits, signed, _, _) -> from.unwrap() match
+                Integer(_, _, _, _) -> Some(ConstInt(wrap(n, bits, signed)))
                 // A `char` read as an integer is its code point, and only where the width holds it.
                 Char -> if fits(n, bits, signed) then Some(ConstInt(n)) else None
                 _ -> None
             Char -> if scalar_value(n) then Some(ConstInt(n)) else None
             // Rounded once, straight to the width, as the machine's conversion rounds it -- an `f128`
             // too, which holds an integer a `real` would round.
-            Floating(128, _) ->
+            Floating(128, _, _) ->
                 val (hi, lo) = quad_of_int(n)
 
                 Some(ConstQuad(hi, lo))
-            Floating(bits, _) -> Some(ConstFloat(int_to_float(n, bits)))
+            Floating(bits, _, _) -> Some(ConstFloat(int_to_float(n, bits)))
             _ -> None
         ConstFloat(f) -> to match
-            Integer(bits, signed, _) -> big_of_real(f) match
+            Integer(bits, signed, _, _) -> big_of_real(f) match
                 Some(n) -> if fits(n, bits, signed) then Some(ConstInt(n)) else None
                 None -> None
-            Floating(_, _) -> Some(ConstFloat(f))
+            Floating(_, _, _) -> Some(ConstFloat(f))
             _ -> None
         ConstBool(b) -> to match
             Bool -> Some(ConstBool(b))
-            Integer(bits, signed, _) -> bool_as_int(b, bits, signed)
+            Integer(bits, signed, _, _) -> bool_as_int(b, bits, signed)
             _ -> None
         ConstStr(s) -> if to == Str then Some(ConstStr(s)) else None
         ConstChar(_) -> None
@@ -1513,7 +1513,7 @@ private big_abs(n: BigInt) -> BigInt = if cmp(n, from_int(0)) < 0 then negate(n)
 // (`emit_scalar.sysl`'s `checked_arith`, `checked_shl`). A comparison answers a `bool`.
 run_int_binary(op: string, x: BigInt, y: BigInt, bits: int, signed: bool,
                checked: bool) -> Result[Const, string]
-    val ty = type_show(Integer(bits, signed, false))
+    val ty = type_show(Integer(bits, signed, false, None))
 
     // A zero divisor traps, and so does the one quotient a signed width cannot hold; the remainder
     // of that same division is the zero it would have been, which is what the lowering divides by
@@ -1655,16 +1655,16 @@ end run_quad_binary
 // `from` and `to` are the types the two are laid out as.
 run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
     ConstInt(n) -> (from, to) match
-        (_, Integer(bits, signed, _)) -> Ok(ConstInt(wrap(n, bits, signed)))
-        (_, Floating(128, _)) ->
+        (_, Integer(bits, signed, _, _)) -> Ok(ConstInt(wrap(n, bits, signed)))
+        (_, Floating(128, _, _)) ->
             val (hi, lo) = quad_of_int(n)
 
             Ok(ConstQuad(hi, lo))
-        (_, Floating(16, brain)) ->
+        (_, Floating(16, brain, _)) ->
             if n.is_zero() then return Ok(ConstFloat(0.0))
 
             Ok(ConstFloat(half_of_ratio(cmp(n, from_int(0)) < 0, big_abs(n), from_int(1), brain)))
-        (_, Floating(bits, _)) -> Ok(ConstFloat(int_to_float(n, bits)))
+        (_, Floating(bits, _, _)) -> Ok(ConstFloat(int_to_float(n, bits)))
         (Char, Char) -> Ok(v)
         (_, Char) ->
             val u = wrap(n, 64, false)
@@ -1673,23 +1673,23 @@ run_convert(v: Const, from: Type, to: Type) -> Result[Const, string] = v match
             else Err(s"${to_string(n)} is not a Unicode scalar value")
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstFloat(f) -> to match
-        Integer(bits, signed, _) -> Ok(ConstInt(saturated(f, bits, signed)))
-        Floating(128, _) ->
+        Integer(bits, signed, _, _) -> Ok(ConstInt(saturated(f, bits, signed)))
+        Floating(128, _, _) ->
             val (hi, lo) = quad_of_double(f.bits())
 
             Ok(ConstQuad(hi, lo))
-        Floating(16, brain) -> Ok(ConstFloat(half_of_double(f, brain)))
-        Floating(bits, _) -> Ok(ConstFloat(if bits == 32 then real(f32(f)) else f))
+        Floating(16, brain, _) -> Ok(ConstFloat(half_of_double(f, brain)))
+        Floating(bits, _, _) -> Ok(ConstFloat(if bits == 32 then real(f32(f)) else f))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstQuad(hi, lo) -> to match
-        Integer(bits, signed, _) -> Ok(ConstInt(quad_to_int((hi, lo), bits, signed)))
-        Floating(128, _) -> Ok(v)
-        Floating(16, brain) -> Ok(ConstFloat(narrowed_half((hi, lo), brain)))
-        Floating(bits, _) -> Ok(ConstFloat(narrowed_real((hi, lo), bits)))
+        Integer(bits, signed, _, _) -> Ok(ConstInt(quad_to_int((hi, lo), bits, signed)))
+        Floating(128, _, _) -> Ok(v)
+        Floating(16, brain, _) -> Ok(ConstFloat(narrowed_half((hi, lo), brain)))
+        Floating(bits, _, _) -> Ok(ConstFloat(narrowed_real((hi, lo), bits)))
         _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
     ConstBool(b) -> to match
         Bool -> Ok(v)
-        Integer(bits, signed, _) -> bool_as_int(b, bits, signed).ok_or(s"a conversion from bool to ${type_show(to)}")
+        Integer(bits, signed, _, _) -> bool_as_int(b, bits, signed).ok_or(s"a conversion from bool to ${type_show(to)}")
         _ -> Err(s"a conversion from bool to ${type_show(to)}")
     _ -> Err(s"a conversion from ${type_show(from)} to ${type_show(to)}")
 

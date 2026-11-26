@@ -270,9 +270,9 @@ end arm_storage_ok
 // The bits of a scalar a volatile access moves on 32-bit ARM; 0 for anything whose width is not its
 // own (a pointer, an `int`) or that is not a scalar.
 private arm_scalar_bits(t: Type) -> int = underlying(t) match
-    Integer(bits, _, wide) -> if wide then 0 else bits
+    Integer(bits, _, wide, _) -> if wide then 0 else bits
     Fixed(bits, _, _) -> bits
-    Floating(bits, _) -> bits
+    Floating(bits, _, _) -> bits
     Enum(d) -> if d.simple then bitfield_width(t).unwrap_or(0) else 0
     _ -> 0
 
@@ -341,9 +341,9 @@ private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type, field: 
 
     val why = underlying(t) match
         Unknown -> return false
-        Integer(bits, _, wide) -> return a64_wide_ok(a, scope, span, shown, if wide then 0 else bits)
+        Integer(bits, _, wide, _) -> return a64_wide_ok(a, scope, span, shown, if wide then 0 else bits)
         Fixed(bits, _, _) -> return a64_wide_ok(a, scope, span, shown, bits)
-        Floating(bits, _) -> return a64_wide_ok(a, scope, span, shown, bits)
+        Floating(bits, _, _) -> return a64_wide_ok(a, scope, span, shown, bits)
         Char -> return true
         Bool -> return true
         Enum(d) ->
@@ -1586,7 +1586,7 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
         end if
 
         ty match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if !fits(folded.unwrap(), bits, signed)
                     a.fault(scope, span, s"$what does not fit ${type_show(ty)}: ${to_string(folded.unwrap())}")
                     return None
@@ -1709,7 +1709,7 @@ end value_arg_reading
 // Whether a value parameter's declared type is one of the kinds a value argument is checked
 // against: an integer, a `char`, a `bool` or a simple enum, under any name.
 private value_arg_kind_known(ty: Type) -> bool = repr(ty) match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     Char -> true
     Bool -> true
     Enum(_) -> true
@@ -1717,7 +1717,7 @@ private value_arg_kind_known(ty: Type) -> bool = repr(ty) match
     _ -> false
 
 private integral(ty: Type) -> bool = repr(ty) match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     Constrained(d) -> integral(d.base)
     _ -> false
 
@@ -1918,7 +1918,7 @@ width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
 
     if b[0] == u8('f') then
         if bits == 128 then note_quad_runtime(a)
-        if bits == 16 || bits == 32 || bits == 64 || bits == 128 then return Some(Floating(bits, false))
+        if bits == 16 || bits == 32 || bits == 64 || bits == 128 then return Some(Floating(bits, false, None))
 
         // `bf16` is named rather than measured -- it is `f16`'s width and not its format -- so it is
         // not a width this shape could have produced, and the message names it where a reader
@@ -1928,7 +1928,7 @@ width_type(a: &Analysis, scope: Scope, span: Span, name: string) -> Option[Type]
 
         return Some(Unknown)
 
-    if bits >= 1 && bits <= MaxIntegerBits then return Some(Integer(bits, b[0] == u8('i'), false))
+    if bits >= 1 && bits <= MaxIntegerBits then return Some(Integer(bits, b[0] == u8('i'), false, None))
 
     a.fault(scope, span, s"'$name' is wider than the $MaxIntegerBits bits the back end lowers")
     Some(Unknown)
@@ -2421,7 +2421,7 @@ instantiate_enum(a: &Analysis, scope: Scope, span: Span, written: string, key: s
                     s"'${d.name}' carries data")
         else
             underlying match
-                Integer(_, _, _) -> ()
+                Integer(_, _, _, _) -> ()
                 _ ->
                     a.fault(scope, span, s"an enum's underlying type must be an integer, not " +
                             type_show(underlying))
@@ -2532,7 +2532,7 @@ end instantiate_enum
 private fitting_tag(a: &Analysis, scope: Scope, span: Span, name: string, n: BigInt,
                     underlying: Type, report: bool) -> BigInt
     underlying match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if !fits(n, bits, signed) && report
                 a.fault(scope, span, s"discriminant ${to_string(n)} of variant '$name' does not " +
                         s"fit ${type_show(underlying)}")
@@ -2805,8 +2805,10 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
     // **An exported alias is its base everywhere but in a header** (`reference/ffi.md § Naming a type
     // in the header`): it checks nothing and flows to and from its base with no conversion, so every
     // analysis is handed the base itself and none has to see through a name. The header's reading (`header_spelling.sysl`) keeps the name,
-    // filed apart so the two readings never meet.
-    val spelled = a.header_spelling && names_in_header(d)
+    // filed apart so the two readings never meet. **A measured `c type` is its base the same way**,
+    // carrying its name on the scalar (`measured_as`) for the one rule it keeps: nothing widens into
+    // it (`reference/ffi.md § c type`).
+    val spelled = a.header_spelling && (names_in_header(d) || is_measured(d))
     val slot = if spelled then s"$key\u{1}header" else key
     val already = a.tables.constrained_insts.get(slot)
 
@@ -2898,7 +2900,8 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
         Some(e) -> Some(e.symbol.unwrap_or(module_bare(spelled_key(key))))
         None -> None
 
-    if !is_plain_alias(d) && (spelled || !names_in_header(d)) then
+    if is_measured(d) && !spelled then made = measured_as(base, key)
+    else if !is_plain_alias(d) && (spelled || !names_in_header(d)) then
         made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname,
                                     d.wrapping.is_some(), d.c_spelling)
 
@@ -3089,8 +3092,8 @@ private declared_at(a: &Analysis, key: string, fallback: Span) -> Span = a.table
 
 // The bases a subtype may narrow or derive from.
 scalar_base(t: Type) -> bool = underlying(t) match
-    Integer(_, _, _) -> true
-    Floating(_, _) -> true
+    Integer(_, _, _, _) -> true
+    Floating(_, _, _) -> true
     Fixed(_, _, _) -> true
     Char -> true
     _ -> false
@@ -3152,10 +3155,10 @@ private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -
         _ -> const_kind(value)
 
     val wanted = b match
-        Integer(_, _, _) -> value match
+        Integer(_, _, _, _) -> value match
             ConstInt(_) -> None
             _ -> Some("an integer subtype needs integer bounds")
-        Floating(_, _) -> value match
+        Floating(_, _, _) -> value match
             ConstInt(_) -> None
             ConstFloat(_) -> None
             _ -> Some("a floating-point subtype needs numeric bounds")
@@ -3183,7 +3186,7 @@ private bound_holds(a: &Analysis, scope: Scope, at: Span, base: Type, e: Expr) -
 
     value match
         ConstInt(n) -> b match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if !fits(n, bits, signed)
                     a.fault(scope, at, s"the bound ${to_string(n)} does not fit ${type_show(b)}")
                     return false
@@ -3292,8 +3295,8 @@ private const_type_refused(a: &Analysis, v: ValueDecl, t: Type) -> bool
         None -> false
 
     val scalar = t match
-        Integer(_, _, _) -> true
-        Floating(_, _) -> true
+        Integer(_, _, _, _) -> true
+        Floating(_, _, _) -> true
         Bool -> true
         Char -> true
         Str -> true
@@ -3351,11 +3354,11 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
 
     val kind_fits = value match
         ConstInt(_) -> t match
-            Integer(_, _, _) -> true
-            Floating(_, _) -> true
+            Integer(_, _, _, _) -> true
+            Floating(_, _, _) -> true
             _ -> false
         ConstFloat(_) -> t match
-            Floating(_, _) -> true
+            Floating(_, _, _) -> true
             _ -> false
         ConstQuad(_, _) -> is_quad(t)
         ConstBool(_) -> t match
@@ -3386,13 +3389,13 @@ private const_fits(a: &Analysis, v: ValueDecl, value: Const, t: Type) -> bool
 
     value match
         ConstInt(n) -> t match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 if !fits(n, bits, signed)
                     a.fault(v.scope, at, s"'${v.name}' does not fit ${type_show(t)}: ${to_string(n)}")
                     return false
                 end if
             // A whole number is a float constant's value where the float holds it exactly.
-            Floating(_, _) ->
+            Floating(_, _, _) ->
                 if !exactly_float(n, t)
                     a.fault(v.scope, at, s"'${v.name}' is not exactly ${float_named(t)}: ${to_string(n)}")
                     return false
@@ -3445,15 +3448,10 @@ end folds_to_nan
 
 // Whether a declaration is another spelling of its base rather than a type of its own.
 //
-// **A measured `c type` is written in exactly this shape and is not one.** It is a distinct scalar
-// whose width came from the C compiler, so a signature naming it says `Tick` where a transparent
-// alias would have said `uint` -- which is the whole point of writing one: the header owns the width
-// and the program names the typedef.
-//
-// **Nor is an exported one**, for the same reason seen from the header's side: `@export` asks a
-// generated header to spell the type by a name of its own, and a name that dissolved into its base
-// here would leave nothing there to spell. It is built as a transparent type with no constraint,
-// interchangeable with its base in both directions, as before.
+// **A measured `c type` is written in exactly this shape and is not one**, and neither is an exported
+// alias: each is its base to the analysis too (`transparent_alias`), but a generated header spells it
+// by a name of its own -- `TickType_t` for `Tick`, the `typedef` for an exported one -- and a measured
+// one keeps a name on the scalar besides, which nothing widens into (`is_measured`).
 is_plain_alias(d: TypeDecl) -> bool =
     !d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none() &&
         d.wrapping.is_none()
@@ -3469,16 +3467,22 @@ is_phantom_new(d: TypeDecl) -> bool =
 // exported alias, which the header declares as a `typedef`. It checks nothing and is told apart from
 // its base by nothing.
 //
-// **A measured `c type` is not one**, though it is built the same way: a value of another integer
-// type reaches it only through a written conversion (`Size(xs.len)`, `reference/ffi.md § c type`),
-// since the width is the target's and an implicit widening into it would be one machine's answer.
+// **A measured `c type` is not one** (`is_measured`): a value of another integer type reaches it only
+// through a written conversion (`Size(xs.len)`, `reference/ffi.md § c type`), since the width is the
+// target's and an implicit widening into it would be one machine's answer.
 names_in_header(d: TypeDecl) -> bool =
     !d.derived && d.range.is_none() && d.pred.is_none() && d.wrapping.is_none() && !d.from_c &&
         d.cname.is_some()
 
-// Whether a name is its base to the analysis: a plain alias, or an exported one, whose name only a
-// generated header reads.
-transparent_alias(d: TypeDecl) -> bool = is_plain_alias(d) || names_in_header(d)
+// Whether a name is its base to the analysis: a plain alias, an exported one, whose name only a
+// generated header reads, or a measured `c type`, whose name rides on the scalar for the widening.
+transparent_alias(d: TypeDecl) -> bool = is_plain_alias(d) || names_in_header(d) || is_measured(d)
+
+// Whether a declaration is a measured `c type`: the scalar C said a name is, and nothing more. The
+// analysis reads it as that scalar with the name on it (`Type.Integer`'s `measured`); only a
+// generated header reads the declaration itself, to spell the C name.
+is_measured(d: TypeDecl) -> bool =
+    d.from_c && !d.derived && d.range.is_none() && d.pred.is_none() && d.wrapping.is_none()
 
 // Whether a declaration is an alias a C header is asked to declare as a `typedef`.
 private is_exported_alias(d: TypeDecl) -> bool =

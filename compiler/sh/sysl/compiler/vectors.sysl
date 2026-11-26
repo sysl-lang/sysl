@@ -51,9 +51,9 @@ is_vector(t: Type) -> bool = t match
 // **A fixed-point type is a lane**: it is a scalar held as its raw integer, so `<2>q15` is LLVM's
 // `<2 x i16>` and its saturating `+` is one `QADD16` on a core with the DSP extension.
 can_be_lane(t: Type) -> bool = underlying(t) match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     Fixed(_, _, _) -> true
-    Floating(bits, _) -> bits != 128
+    Floating(bits, _, _) -> bits != 128
     Bool -> true
     Char -> true
     _ -> false
@@ -112,10 +112,10 @@ vec_compare(cx: &Analyzer, span: Span, ts: Buf[TExpr], ops: Buf[string]) -> TExp
 
     val equality = op == "==" || op == "!="
     val ok = lanes.1 match
-        Integer(_, _, _) -> true
+        Integer(_, _, _, _) -> true
         // A fixed-point lane compares as the integer it is held as, one scale on both sides.
         Fixed(_, _, _) -> true
-        Floating(_, _) -> true
+        Floating(_, _, _) -> true
         Bool -> equality
         _ -> false
 
@@ -154,7 +154,7 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
             cx.fault(span, s"'bits' takes no arguments — it reads the lanes of the ${type_show(v)} it is " +
                      "read off")
 
-        return TExpr(span, TVecOp("bits", one_operand(tr), Integer(parts.0, false, false)))
+        return TExpr(span, TVecOp("bits", one_operand(tr), Integer(parts.0, false, false, None)))
     end if
 
     if name == "select"
@@ -203,8 +203,8 @@ vector_method(cx: &Analyzer, span: Span, v: Type, tr: TExpr, name: string,
                       "in the order you mean, or hold the lanes in a 'wrapping' type, whose sum has one")
 
     val op = lane match
-        Floating(_, _) -> if name == "sum" then "fadd" else s"f$name"
-        Integer(_, signed, _) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
+        Floating(_, _, _) -> if name == "sum" then "fadd" else s"f$name"
+        Integer(_, signed, _, _) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
         Fixed(_, _, signed) -> if name == "sum" then "add" else s"${signed_tag(signed)}$name"
         _ -> ""
 
@@ -225,7 +225,7 @@ end vector_method
 private vector_dot(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, lane: Type, tr: TExpr,
                    args: Buf[Expr]) -> TExpr
     val info = lane match
-        Integer(bits, signed, _) -> Some((bits, signed))
+        Integer(bits, signed, _, _) -> Some((bits, signed))
         _ -> None
 
     if info.is_none() then
@@ -244,7 +244,7 @@ private vector_dot(cx: &Analyzer, span: Span, v: Type, n: int, elem: Type, lane:
 
     val (bits, signed) = info.unwrap()
     val width = if bits <= 16 then 32 else if bits <= 32 then 64 else bits
-    val acc = Integer(width, signed, false)
+    val acc = Integer(width, signed, false, None)
     val wide = Vector(n, acc, buf())
     val product = TExpr(span, TBinary("*%", TExpr(span, TCast(tr, wide)), TExpr(span, TCast(b, wide)), wide))
 
@@ -265,8 +265,8 @@ private vector_abs(cx: &Analyzer, span: Span, v: Type, lane: Type, tr: TExpr,
                  s"${type_show(v)} it is read off")
 
     val op = lane match
-        Floating(_, _) -> "fabs"
-        Integer(_, signed, _) -> if signed then "abs" else ""
+        Floating(_, _, _) -> "fabs"
+        Integer(_, signed, _, _) -> if signed then "abs" else ""
         _ -> ""
 
     if op == "" then
@@ -294,12 +294,12 @@ end one_operand
 private vector_lane_float(cx: &Analyzer, span: Span, v: Type, lane: Type, tr: TExpr, name: string,
                           args: Buf[Expr]) -> TExpr
     val wide = lane match
-        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        Floating(bits, brain, _) -> !brain && (bits == 32 || bits == 64)
         _ -> false
 
     if !wide
         val instead = lane match
-            Floating(_, _) -> " — widen the lanes to f32 first, as the scalar method does"
+            Floating(_, _, _) -> " — widen the lanes to f32 first, as the scalar method does"
             _ -> ""
 
         return cx.err(span, s"'$name' is defined for f32 and f64 lanes, and ${type_show(v)} is not " +
@@ -321,7 +321,7 @@ is_mask_bits(operands: Buf[TExpr]) -> bool = texpr_type(operands[0]) match
 
 // The unsigned integer of a float lane's own width: what `FloatBits` calls its `Word`.
 private float_word(lane: Type) -> Option[Type] = lane match
-    Floating(bits, _) -> if bits == 128 then None else Some(Integer(bits, false, false))
+    Floating(bits, _, _) -> if bits == 128 then None else Some(Integer(bits, false, false, None))
     _ -> None
 
 // `v.bits()` -- every lane's IEEE 754 encoding as the unsigned integer of its width, `<4>f32` to
@@ -405,7 +405,7 @@ end vector_static
 private vector_mul_add(cx: &Analyzer, span: Span, v: Type, elem: Type, lane: Type,
                        tr: TExpr, args: Buf[Expr]) -> TExpr
     val wide = lane match
-        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        Floating(bits, brain, _) -> !brain && (bits == 32 || bits == 64)
         _ -> false
 
     if !wide then
@@ -461,12 +461,12 @@ end mul_add_operand
 private vector_maximum(cx: &Analyzer, span: Span, v: Type, elem: Type, lane: Type, tr: TExpr,
                        name: string, args: Buf[Expr]) -> TExpr
     val wide = lane match
-        Floating(bits, brain) -> !brain && (bits == 32 || bits == 64)
+        Floating(bits, brain, _) -> !brain && (bits == 32 || bits == 64)
         _ -> false
 
     if !wide
         val instead = lane match
-            Floating(_, _) -> "widen the lanes to f32 first"
+            Floating(_, _, _) -> "widen the lanes to f32 first"
             _ -> "a lane with no NaN has none to propagate, so compare and choose: '(a > b).select(a, b)'"
 
         return cx.err(span, s"'$name' is IEEE 754's NaN-propagating $name, defined for f32 and f64 " +
@@ -630,7 +630,7 @@ private lane_positions(cx: &Analyzer, span: Span, name: string, form: string,
         _ -> (0, Unknown)
 
     val integral = parts.1 match
-        Integer(_, _, _) -> true
+        Integer(_, _, _, _) -> true
         _ -> false
 
     if !integral
@@ -754,7 +754,7 @@ private shuffle_list(cx: &Analyzer, list: Expr, v: Type, n: int, elem: Type,
                 val ti = type_expr(cx, item, None)
 
                 repr(texpr_type(ti)) match
-                    Integer(_, _, _) -> ()
+                    Integer(_, _, _, _) -> ()
                     other ->
                         if other != Unknown then
                             cx.fault(item.span, s"a lane number must be an integer, not ${type_show(other)}")
@@ -831,7 +831,7 @@ private not_a_lane_list(t: Type) -> string =
 // Whether a type is what a list of lane numbers is held in: an array of integers.
 private is_lane_list(t: Type) -> bool = repr(t) match
     Array(_, e, _) -> repr(*e) match
-        Integer(_, _, _) -> true
+        Integer(_, _, _, _) -> true
         _ -> false
     _ -> false
 
@@ -932,7 +932,7 @@ private run_start(cx: &Analyzer, tr: TExpr, e: Expr) -> TExpr
     val ti = type_expr(cx, e, Some(usize_type(word_bits(cx))))
 
     repr(texpr_type(ti)) match
-        Integer(_, _, _) -> unchecked_wrap(cx, tr, ti)
+        Integer(_, _, _, _) -> unchecked_wrap(cx, tr, ti)
         other -> cx.err(e.span, s"the index a run starts at must be an integer, not " +
                         s"${type_show(other)}")
 end run_start

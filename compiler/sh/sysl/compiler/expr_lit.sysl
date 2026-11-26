@@ -87,7 +87,7 @@ int_literal(cx: &Analyzer, span: Span, value: BigInt, suffix: string,
     val ty = if suffix != "" then suffixed_int(cx, span, suffix) else expected_int(cx, expected)
 
     ty match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if !fits(value, bits, signed) then
                 return cx.err(span, s"${literal_named(value, named)} does not fit ${declared_show(cx, ty)}")
         _ -> ()
@@ -107,7 +107,7 @@ literal_shown(shown: string, named: string) -> string =
 // -- seen through a vector, as the literal's integer type is.
 private float_wanted(expected: Option[Type]) -> Option[Type] = expected match
     Some(t) -> scalar_wanted(t) match
-        Floating(bits, brain) -> Some(Floating(bits, brain))
+        Floating(bits, brain, m) -> Some(Floating(bits, brain, m))
         _ -> None
     None -> None
 
@@ -135,10 +135,10 @@ exactly_float(value: BigInt, ty: Type) -> bool
     if value.is_zero() then return true
 
     val (precision, emax) = ty match
-        Floating(16, true) -> (8, 127)
-        Floating(16, false) -> (11, 15)
-        Floating(32, _) -> (24, 127)
-        Floating(128, _) -> (113, 16383)
+        Floating(16, true, _) -> (8, 127)
+        Floating(16, false, _) -> (11, 15)
+        Floating(32, _, _) -> (24, 127)
+        Floating(128, _, _) -> (113, 16383)
         _ -> (53, 1023)
 
     val width = bit_length(value)
@@ -170,12 +170,12 @@ char_literal(cx: &Analyzer, span: Span, cp: char, expected: Option[Type]) -> TEx
                       "more than one byte in UTF-8 and cannot be a u8 — write a string for its " +
                       "bytes, or u8(0x..) for one byte")
 
-    TExpr(span, TIntLit(from_int(long(code)), Integer(8, false, false)))
+    TExpr(span, TIntLit(from_int(long(code)), Integer(8, false, false, None)))
 end char_literal
 
 // Whether a position wants a byte -- seen through a vector, as an integer literal's is.
 wants_byte(expected: Option[Type]) -> bool = expected match
-    Some(t) -> scalar_wanted(t) == Integer(8, false, false)
+    Some(t) -> type_eq(scalar_wanted(t), byte_type())
     None -> false
 
 private suffixed_int(cx: &Analyzer, span: Span, suffix: string) -> Type
@@ -183,7 +183,7 @@ private suffixed_int(cx: &Analyzer, span: Span, suffix: string) -> Type
 
     named match
         Some(t) -> t match
-            Integer(_, _, _) -> t
+            Integer(_, _, _, _) -> t
             _ ->
                 cx.fault(span, s"'$suffix' is not an integer type")
                 Unknown
@@ -201,7 +201,7 @@ private expected_int(cx: &Analyzer, expected: Option[Type]) -> Type
     if expected.is_none() then return int_type()
 
     scalar_wanted(expected.unwrap()) match
-        Integer(bits, signed, pw) -> Integer(bits, signed, pw)
+        Integer(bits, signed, pw, m) -> Integer(bits, signed, pw, m)
         Abstract(n, bs) -> Abstract(n, bs)
         _ -> int_type()
 end expected_int
@@ -237,7 +237,7 @@ float_literal(cx: &Analyzer, span: Span, text: string, suffix: string,
     // A hex float is exact or it is refused (`hex_float.sysl`).
     if is_hex_float_text(text)
         val refused = ty match
-            Floating(_, _) -> hex_float_refusal(text, ty)
+            Floating(_, _, _) -> hex_float_refusal(text, ty)
             Abstract(_, _) -> hex_float_refusal(text, ty)
             _ -> None
 
@@ -268,7 +268,7 @@ private suffixed_float(cx: &Analyzer, span: Span, suffix: string) -> Type
 
     named match
         Some(t) -> t match
-            Floating(_, _) -> t
+            Floating(_, _, _) -> t
             _ ->
                 cx.fault(span, s"'$suffix' is not a floating-point type")
                 Unknown
@@ -281,7 +281,7 @@ private expected_float(cx: &Analyzer, expected: Option[Type]) -> Type
     if expected.is_none() then return real_type()
 
     scalar_wanted(expected.unwrap()) match
-        Floating(bits, brain) -> Floating(bits, brain)
+        Floating(bits, brain, m) -> Floating(bits, brain, m)
         Abstract(n, bs) -> Abstract(n, bs)
         _ -> real_type()
 end expected_float
@@ -440,8 +440,8 @@ arith_type(cx: &Analyzer, span: Span, op: string, a: Type, b: Type, rhs: Span) -
     if is_wrap_sat_op(op) then return wrap_sat_type(cx, span, op, a, result)
 
     underlying(a) match
-        Integer(_, _, _) -> if integer_op(op) then result else undefined_for(cx, span, op, a)
-        Floating(_, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        Integer(_, _, _, _) -> if integer_op(op) then result else undefined_for(cx, span, op, a)
+        Floating(_, _, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
         // A fixed-point value has the four a float has -- saturating, and `*` and `/` rescaling and
         // rounding. Its bits are reached through `.bits`, never through `&` or `%`.
         Fixed(_, _, _) -> if floating_op(op) || shift then result else undefined_for(cx, span, op, a)
@@ -512,9 +512,9 @@ scales_derivation(op: string, a: Type, b: Type, scale: bool) -> bool =
 // because the six are not defined per lane.
 private wrap_sat_type(cx: &Analyzer, span: Span, op: string, a: Type, result: Type) -> Type
     underlying(a) match
-        Integer(_, _, _) -> result
+        Integer(_, _, _, _) -> result
         Fixed(_, _, _) -> result
-        Floating(_, _) ->
+        Floating(_, _, _) ->
             val base = base_of_wrap_sat(op)
 
             cx.fault(span, s"'$op' is not defined for ${type_show(a)} — floating-point arithmetic " +
@@ -542,7 +542,7 @@ private floating_op(op: string) -> bool = op == "+" || op == "-" || op == "*" ||
 private vector_arith(cx: &Analyzer, span: Span, op: string, a: Type, lane: Type,
                      result: Type) -> Type
     underlying(lane) match
-        Integer(_, _, _) ->
+        Integer(_, _, _, _) ->
             if op == "/" || op == "%" then
                 cx.fault(span, s"'$op' is not defined on ${type_show(a)} — integer division traps " +
                          "per lane and a register traps as a whole, so divide the lanes in a loop " +
@@ -551,7 +551,7 @@ private vector_arith(cx: &Analyzer, span: Span, op: string, a: Type, lane: Type,
                 return Unknown
 
             if integer_op(op) then result else undefined_for(cx, span, op, a)
-        Floating(_, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
+        Floating(_, _, _) -> if floating_op(op) then result else undefined_for(cx, span, op, a)
         // A fixed-point lane has its scalar's `+`, `-` and `*`, each saturating and rounding exactly
         // as the scalar does. Its `/` traps on a zero divisor as an integer's does, which a register
         // cannot do for one lane, so it is refused for the same reason.
@@ -577,5 +577,5 @@ private undefined_for(cx: &Analyzer, span: Span, op: string, a: Type) -> Type
 end undefined_for
 
 private is_integer(t: Type) -> bool = t match
-    Integer(_, _, _) -> true
+    Integer(_, _, _, _) -> true
     _ -> false

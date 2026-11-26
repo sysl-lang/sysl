@@ -90,7 +90,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // A float constant is the `double` bit pattern whatever the type is, so a narrower one is that
     // constant rounded down to it -- which costs nothing at run time.
     TFloatLit(bits, ty) ->
-        if ty == real_type() then VFloat(bits)
+        if type_eq(ty, real_type()) then VFloat(bits)
         else
             val r = fresh_reg(e)
 
@@ -810,7 +810,7 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
     val rv = if op == "<<" || op == ">>" then shift_amount(e, bt, texpr_type(r), rv0) else rv0
 
     bt match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if op == "<<" && is_ranged(texpr_type(l)) then return checked_shl(e, bits, signed, lv, rv)
 
             // A sum proved not to wrap is the `nuw` add in either mode: there is nothing to check.
@@ -960,7 +960,7 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) ->
         if is_fixed(vector_lane_of(ty)) then return fixed_neg(e, ty, v)
 
         vector_lane_of(ty) match
-            Integer(bits, signed, _) ->
+            Integer(bits, signed, _, _) ->
                 underlying(ty) match
                     Vector(_, _, _) -> emit(e, InBin(r, OpSub, ety, VZero, v))
                     _ ->
@@ -971,7 +971,7 @@ private gen_unary(e: *Emit, op: string, operand: TExpr, ty: Type, site: Span) ->
                                                  s"-${type_show(ty)}", site)
 
                         emit(e, InBin(r, OpSub, ety, VInt(from_int(0)), v))
-            Floating(_, _) -> emit(e, InNeg(r, ety, v))
+            Floating(_, _, _) -> emit(e, InNeg(r, ety, v))
             other -> gap_here(e, s"negation of ${type_show(other)}")
 
         return r
@@ -1274,7 +1274,7 @@ private gen_inc_dec(e: *Emit, place: TExpr, op: string, pre: bool, ty: Type,
     val bin = if op == "++" then "+" else "-"
 
     val nv = underlying(ty) match
-        Integer(bits, signed, _) if plain_checked(e, bin, ty, site) ->
+        Integer(bits, signed, _, _) if plain_checked(e, bin, ty, site) ->
             checked_arith(e, bin, bits, signed, cur, VInt(from_int(1)), s"${type_show(ty)}$op", site)
         _ ->
             val r = fresh_reg(e)
@@ -1313,7 +1313,7 @@ combine(e: *Emit, op: string, ty: Type, value_ty: Type, dispatch: Option[TDispat
     val rv = if bin == "<<" || bin == ">>" then shift_amount(e, bt, value_ty, v) else v
 
     bt match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if bin == "<<" && is_ranged(ty) then return checked_shl(e, bits, signed, cur, rv)
 
             if ((bin == "+" || bin == "-" || bin == "*") && is_ranged(ty)) || plain_checked(e, bin, bt, site)
@@ -1338,7 +1338,7 @@ emit_constraint_checks(e: *Emit, v: Val, c: Type)
                 // constants: a narrower value is widened first, which is exact. An `f128` is the one
                 // width a `double` cannot hold, so it is compared as itself, against ends rounded to
                 // binary128 from their decimals.
-                Floating(bits, _) ->
+                Floating(bits, _, _) ->
                     val quad = bits == 128
                     val wide = if quad then base else real_type()
                     val x = if bits == 64 || quad then v else cast_to(e, CastFPExt, base, wide, v)
@@ -2041,7 +2041,7 @@ private gen_cast(e: *Emit, operand: TExpr, ty: Type, site: Span) -> Val
     if constant then return convert(e, from, ty, v)
 
     (from, underlying(ty)) match
-        (Integer(a_bits, a_signed, _), Integer(b_bits, b_signed, _)) ->
+        (Integer(a_bits, a_signed, _, _), Integer(b_bits, b_signed, _, _)) ->
             val file = e.src match
                 Some(s) -> s.name
                 None -> ""
@@ -2066,14 +2066,14 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
     if is_fixed(from) || is_fixed(ut) then return fixed_convert(e, underlying(from), ut, v)
 
     (from, ut) match
-        (Integer(a_bits, a_signed, _), Integer(b_bits, _, _)) ->
+        (Integer(a_bits, a_signed, _, _), Integer(b_bits, _, _, _)) ->
             convert_int(e, a_bits, a_signed, b_bits, v)
         // Past 128 bits neither direction is an LLVM conversion (`emit_wide_float.sysl`).
-        (Integer(a_bits, a_signed, _), Floating(_, _)) ->
+        (Integer(a_bits, a_signed, _, _), Floating(_, _, _)) ->
             if a_bits > 128 then return wide_int_to_float(e, a_bits, a_signed, v, ut, 0)
 
             cast_to(e, if a_signed then CastSIToFP else CastUIToFP, from, ut, v)
-        (Floating(_, _), Integer(b_bits, b_signed, _)) ->
+        (Floating(_, _, _), Integer(b_bits, b_signed, _, _)) ->
             if b_bits > 128 then return wide_float_to_int(e, from, b_bits, b_signed, v)
 
             saturating_to_int(e, from, ut, b_signed, v)
@@ -2081,29 +2081,29 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
         // has no instruction turning one into the other -- `fptrunc` and `fpext` both require the
         // widths to differ. So the pair goes through `f32`, which holds both exactly: the
         // intermediate rounds nothing and the only rounding is the destination's own.
-        (Floating(a_bits, _), Floating(b_bits, _)) ->
+        (Floating(a_bits, _, _), Floating(b_bits, _, _)) ->
             if a_bits == b_bits
-                val wide = Floating(32, false)
+                val wide = Floating(32, false, None)
 
                 return convert(e, wide, ut, convert(e, from, wide, v))
 
             cast_to(e, if b_bits > a_bits then CastFPExt else CastFPTrunc, from, ut, v)
-        (Char, Integer(b_bits, _, _)) -> convert_int(e, 32, false, b_bits, v)
+        (Char, Integer(b_bits, _, _, _)) -> convert_int(e, 32, false, b_bits, v)
         // An `i1` read as unsigned, so `true` is `1` at a signed width too -- a `zext`, never a branch.
-        (Bool, Integer(b_bits, _, _)) -> convert_int(e, 1, false, b_bits, v)
-        (Integer(a_bits, a_signed, _), Char) -> checked_char(e, a_bits, a_signed, v)
-        (Enum(d), Integer(_, _, _)) -> convert(e, underlying(d.underlying), ut, v)
+        (Bool, Integer(b_bits, _, _, _)) -> convert_int(e, 1, false, b_bits, v)
+        (Integer(a_bits, a_signed, _, _), Char) -> checked_char(e, a_bits, a_signed, v)
+        (Enum(d), Integer(_, _, _, _)) -> convert(e, underlying(d.underlying), ut, v)
         (Ptr(_, _), Ptr(_, _)) -> v
         // Only `is_null` writes this one -- `ptr_cast` refuses a reference -- and it reads the address
         // to compare it with null, taking no share of what it names.
         (Ref(_, _), Ptr(_, _)) -> v
-        (Ptr(_, _), Integer(_, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
-        (Integer(_, _, _), Ptr(_, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
+        (Ptr(_, _), Integer(_, _, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
+        (Integer(_, _, _, _), Ptr(_, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
         (Ptr(_, _), CFn(_, _, _)) -> v
         (CFn(_, _, _), Ptr(_, _)) -> v
         (CFn(_, _, _), CFn(_, _, _)) -> v
-        (CFn(_, _, _), Integer(_, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
-        (Integer(_, _, _), CFn(_, _, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
+        (CFn(_, _, _), Integer(_, _, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
+        (Integer(_, _, _, _), CFn(_, _, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
         _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
 end convert
 
@@ -2189,9 +2189,9 @@ zero_of(e: *Emit, ty: Type) -> Val
         _ -> ()
 
     underlying(ty) match
-        Integer(_, _, _) -> VInt(from_int(0))
+        Integer(_, _, _, _) -> VInt(from_int(0))
         Fixed(_, _, _) -> VInt(from_int(0))
-        Floating(bits, _) -> if bits == 128 then VQuad(0, 0) else v_float(0.0)
+        Floating(bits, _, _) -> if bits == 128 then VQuad(0, 0) else v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))
         Ptr(_, _) -> if erased(underlying(ty)) then VZero else VNull

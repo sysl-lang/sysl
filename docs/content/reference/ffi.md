@@ -4643,6 +4643,39 @@ c type
 extern "vTaskDelay" c_task_delay(ticks: Tick)
 ```
 
+**Everything the integer does, the measured type does**: it has the integer's methods, bounds a
+`for` range and a slice, instantiates a generic as that integer, and is matched exhaustively as it
+— a `bool` measured from `_Bool` needs no `else` arm:
+
+```sysl
+@include("<stddef.h>")
+@include("<stdbool.h>")
+
+c type
+    Size = "size_t"
+    Truth = "bool"
+
+val xs: [5]int = [1, 2, 3, 4, 5]
+val lo: Size = 1
+val hi: Size = 4
+var sum = 0
+
+for k in lo..<hi
+    sum += xs[k]
+
+val done: Truth = sum > 5
+
+print(sum, hi.count_ones(), xs[lo..<hi].len)
+print(done match
+    true -> "done"
+    false -> "not yet")
+```
+
+```output
+9 1 3
+done
+```
+
 Everything `c const` says holds here: the same contextual `c`, the same quoting, the same `@include`
 headers, the same probe compiled and never run, and the same rule that a library ships the answer
 rather than the C name. **A file writing both blocks asks the C compiler once**, since the two are one
@@ -4706,7 +4739,11 @@ print(take(n))
 ```
 
 A silent narrowing is exactly what breaks on the target where the typedef is sixteen bits, so it is
-refused here where it can be seen. The [contracts](/tour/contracts/) page has the general rule, of
+refused here where it can be seen. The rule is the same wherever a value is put — an argument, a
+field, an element, an assignment — and for every other integer, however narrow, and every narrower
+float into a measured `double`. Two things reach one unconverted: a literal, and a value of the very
+integer it was measured as, which includes another `c type` measured as that integer. What leaves
+one is its integer, so it widens *out* as that integer does (`val w: u128 = n`). The [contracts](/tour/contracts/) page has the general rule, of
 which this is one case.
 
 **What comes back is a width and a signedness.** Three things follow, and each was measured against

@@ -636,12 +636,12 @@ fixed_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
             if b1 == b2 && f1 == f2 && s1 == s2 then return v
 
             fixed_rescale(e, b1, f1, s1, b2, f2, s2, v)
-        (Integer(b1, s1, _), Fixed(b2, f2, s2)) ->
+        (Integer(b1, s1, _, _), Fixed(b2, f2, s2)) ->
             val n = (if b1 > b2 then b1 else b2) + f2 + 2
             val y = fx_bin(e, OpShl, n, fx_resize(e, b1, s1, n, v), fx_small(long(f2)))
 
             narrowed(e, n, b2, s2, y)
-        (Fixed(b1, f1, s1), Integer(b2, s2, _)) ->
+        (Fixed(b1, f1, s1), Integer(b2, s2, _, _)) ->
             val n = (if b1 > b2 then b1 else b2) + 2
             val x = fx_resize(e, b1, s1, n, v)
 
@@ -654,8 +654,8 @@ fixed_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
             val clamped = fx_clamp(e, n, y, min_of(b2, s2), max_of(b2, s2))
 
             fx_resize(e, n, true, b2, clamped)
-        (Floating(_, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, false, v)
-        (Fixed(b1, f1, s1), Floating(_, _)) -> fixed_to_float(e, b1, f1, s1, to, v)
+        (Floating(_, _, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, false, v)
+        (Fixed(b1, f1, s1), Floating(_, _, _)) -> fixed_to_float(e, b1, f1, s1, to, v)
         _ -> gap_at(e, s"a conversion from ${type_show(from)} to ${type_show(to)}")
 end fixed_convert
 
@@ -674,12 +674,12 @@ fixed_floor_convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
             val x = fx_resize(e, b1, s1, n, v)
 
             narrowed(e, n, b2, s2, fx_bin(e, OpAShr, n, x, fx_small(long(k))))
-        (Fixed(b1, f1, s1), Integer(b2, s2, _)) ->
+        (Fixed(b1, f1, s1), Integer(b2, s2, _, _)) ->
             val n = (if b1 > b2 then b1 else b2) + 2
             val y = fx_bin(e, OpAShr, n, fx_resize(e, b1, s1, n, v), fx_small(long(f1)))
 
             narrowed(e, n, b2, s2, y)
-        (Floating(_, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, true, v)
+        (Floating(_, _, _), Fixed(b2, f2, s2)) -> float_to_fixed(e, from, b2, f2, s2, true, v)
         _ -> fixed_convert(e, from, to, v)
 end fixed_floor_convert
 
@@ -744,10 +744,10 @@ private pow2_double(k: int) -> Val = VFloat(long(1023 + k) << 52)
 private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool, floor: bool,
                        v: Val) -> Val
     val narrow_source = from match
-        Floating(b, _) -> b <= 32
+        Floating(b, _, _) -> b <= 32
         _ -> false
     val single = narrow_source && bits <= 24 && frac >= 0 && frac <= 24
-    val work = if single then Floating(32, false) else real_type()
+    val work = if single then Floating(32, false, None) else real_type()
     val fty = lty(e, work)
     val wide = if type_eq(from, work) then v else convert(e, from, work, v)
     val y = fx_scaled(e, fty, wide, frac)
@@ -755,7 +755,7 @@ private float_to_fixed(e: *Emit, from: Type, bits: int, frac: int, signed: bool,
     // Two bits wider than the format, read saturating and converted back as `convert` does both, which
     // past 128 bits is no single instruction (`emit_wide_float.sysl`).
     val k = bits + 2
-    val kty = Integer(k, true, false)
+    val kty = Integer(k, true, false, None)
     val t = convert(e, work, kty, y)
     val lo = big_sub(min_of(bits, signed), from_int(1))
     val hi = big_add(max_of(bits, signed), from_int(1))
@@ -799,7 +799,7 @@ end float_to_fixed
 // round once more on the way down.
 private fixed_to_float(e: *Emit, bits: int, frac: int, signed: bool, to: Type, v: Val) -> Val
     val fbits = to match
-        Floating(b, _) -> b
+        Floating(b, _, _) -> b
         _ -> 64
 
     val target = if fbits >= 32 then to else real_type()
@@ -812,7 +812,7 @@ private fixed_to_float(e: *Emit, bits: int, frac: int, signed: bool, to: Type, v
     if bits > 128
         r = wide_int_to_float(e, bits, signed, v, target, -frac)
     else
-        r = fx_scaled(e, ft, convert(e, Integer(bits, signed, false), target, v), -frac)
+        r = fx_scaled(e, ft, convert(e, Integer(bits, signed, false, None), target, v), -frac)
 
     if fbits >= 32 then return r
 

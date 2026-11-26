@@ -114,7 +114,7 @@ private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
     // **An `f128` renders at its own width**, in the fewest digits that read back as it: widening the
     // other floats to a `real` is exact, but narrowing this one would print a number the program does
     // not hold.
-    if is_quad(ty) then return library_call(cx, span, "printq", widened(span, t, Floating(128, false)))
+    if is_quad(ty) then return library_call(cx, span, "printq", widened(span, t, Floating(128, false, None)))
 
     // **A fixed-point value renders itself**, as the shortest decimal that reads back as the same
     // value -- C has no conversion for one -- into a buffer on the caller's stack, and goes out as a
@@ -129,17 +129,17 @@ private print_one(cx: &Analyzer, span: Span, t: TExpr) -> TExpr
         // A width past 64 bits has no printf conversion to be widened to, so it renders itself
         // first and goes out as the string that came back. That is the one scalar whose printing
         // allocates, and it allocates because C cannot be asked to do this one.
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if bits > 64 then return library_call(cx, span, "prints", TExpr(span, TStr(t)))
 
-            if signed then library_call(cx, span, "printi", widened(span, t, Integer(64, true, false)))
-            else library_call(cx, span, "printu", widened(span, t, Integer(64, false, false)))
+            if signed then library_call(cx, span, "printi", widened(span, t, Integer(64, true, false, None)))
+            else library_call(cx, span, "printu", widened(span, t, Integer(64, false, false, None)))
         // Widening an `f32` is exact, but the widened value needs more digits than the `f32` did,
         // so `f32(0.1)` would print as `0.10000000149011612`.
-        Floating(32, _) -> library_call(cx, span, "printf32", t)
-        Floating(16, true) -> library_call(cx, span, "printbf16", t)
-        Floating(16, _) -> library_call(cx, span, "printf16", t)
-        Floating(_, _) -> library_call(cx, span, "printr", widened(span, t, Floating(64, false)))
+        Floating(32, _, _) -> library_call(cx, span, "printf32", t)
+        Floating(16, true, _) -> library_call(cx, span, "printbf16", t)
+        Floating(16, _, _) -> library_call(cx, span, "printf16", t)
+        Floating(_, _, _) -> library_call(cx, span, "printr", widened(span, t, Floating(64, false, None)))
         Bool -> library_call(cx, span, "printb", t)
         Char -> library_call(cx, span, "printc", t)
         Str -> library_call(cx, span, "prints", t)
@@ -195,8 +195,8 @@ end stdout_call
 // Whether a value renders through a printf conversion rather than through an `impl`: the five types
 // the library has a renderer of its own for.
 scalar_render(t: Type) -> bool = t match
-    Integer(_, _, _) -> true
-    Floating(_, _) -> true
+    Integer(_, _, _, _) -> true
+    Floating(_, _, _) -> true
     // A fixed-point value, and a subtype over one, renders through the compiler's own renderer --
     // there is no `Display` for one to reach.
     Fixed(_, _, _) -> true
@@ -391,9 +391,9 @@ private debugger(cx: &Analyzer, span: Span, t: TExpr, asked: string,
     // the value is the same, a field of a bitfield's `u3` is shown as the number it holds, and a
     // program printing a dozen widths carries one renderer rather than a dozen.
     here match
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if bits < 64
-                here = Integer(64, signed, false)
+                here = Integer(64, signed, false, None)
                 shown = TExpr(span, TCast(t, here))
             end if
         _ -> ()
@@ -503,7 +503,7 @@ placeholder_of(cx: &Analyzer, ty: Type) -> Option[(string, string)]
 
     here match
         Abstract(_, _) -> return None
-        Integer(_, _, _) -> return None
+        Integer(_, _, _, _) -> return None
         _ -> ()
 
     if is_fixed(here) || conforms(cx.an, dbg, here) || satisfies(cx.an, dbg, here) then return None
@@ -809,7 +809,7 @@ str_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
         // Either view will do: making a string out of bytes reads them, and a `[]const u8` is the
         // shape `s.bytes` hands over, which is the commonest thing anyone validates.
         Slice(inner, _) ->
-            if *inner != Integer(8, false, false)
+            if !type_eq(*inner, byte_type())
                 return cx.err(span, s"'str_cast' takes a []u8, but the value has type " +
                               s"${type_show(texpr_type(t))}")
 
@@ -817,7 +817,7 @@ str_cast_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
         // An array of bytes is a view of itself here, on the same terms every other position takes
         // one on: this form asks for a `[]u8` and is one of the places that asks.
         Array(_, elem, _) ->
-            if *elem != Integer(8, false, false)
+            if !type_eq(*elem, byte_type())
                 return cx.err(span, s"'str_cast' takes a []u8, but the value has type " +
                               s"${type_show(texpr_type(t))}")
 
@@ -848,13 +848,13 @@ str_alias_call(cx: &Analyzer, span: Span, args: Buf[Expr]) -> TExpr
 
     underlying(texpr_type(t)) match
         Slice(inner, _) ->
-            if *inner != byte_type()
+            if !type_eq(*inner, byte_type())
                 return cx.err(span, s"'str_alias' takes a []u8, but the value has type " +
                               s"${type_show(texpr_type(t))}")
 
             TExpr(span, TStrView(t))
         Array(_, elem, _) ->
-            if *elem != byte_type()
+            if !type_eq(*elem, byte_type())
                 return cx.err(span, s"'str_alias' takes a []u8, but the value has type " +
                               s"${type_show(texpr_type(t))}")
 
@@ -941,7 +941,7 @@ private va_readable(cx: &Analyzer, span: Span, ty: Type, written: Type)
             cx.fault(span, s"a variadic argument cannot be read as ${type_show(written)} — it checks " +
                      s"its values, and C hands back a bare ${type_show(underlying(d.base))} that " +
                      "check would never see; read it as that and convert")
-        Integer(bits, signed, _) ->
+        Integer(bits, signed, _, _) ->
             if (bits >= 32 && bits <= 64) || bits == 128 then return
 
             if bits < 32
@@ -955,7 +955,7 @@ private va_readable(cx: &Analyzer, span: Span, ty: Type, written: Type)
             else
                 cx.fault(span, s"a variadic argument is at most 128 bits wide, so it cannot be read as " +
                          s"${va_shown(ty, written)} — C passes a wider integer by address")
-        Floating(bits, _) ->
+        Floating(bits, _, _) ->
             // A binary128 value is not promoted -- C passes a `long double` and a `__float128` as
             // itself -- so it is read at its own width, by the walk `emit_va_arg.sysl` writes for it.
             if bits == 64 || bits == 128 then return
@@ -971,6 +971,8 @@ private va_readable(cx: &Analyzer, span: Span, ty: Type, written: Type)
                      "or a type that is one of those under another name, such as a 'c type'")
 end va_readable
 
-// The type a refusal quotes: as written, with what it turned out to be beside it where the two differ.
+// The type a refusal quotes: as written, with what it turned out to be beside it where the two differ
+// -- the scalar a measured `c type` is, `Short (short here)`.
 private va_shown(ty: Type, written: Type) -> string =
-    if ty == written then type_show(ty) else s"${type_show(written)} (${type_show(ty)} here)"
+    if type_show(unmeasured(ty)) == type_show(written) then type_show(written)
+    else s"${type_show(written)} (${type_show(unmeasured(ty))} here)"

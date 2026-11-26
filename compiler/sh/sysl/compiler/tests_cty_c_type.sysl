@@ -758,7 +758,7 @@ cty_an_unsigned_type_refuses_a_negative_value()
     if !cty_ready() then return
 
     cty_refuses(cty_err("c type\n    U = \"unsigned char\"\n\nval x: U = -1\n\nprint(x.to_string())\n"),
-                "the literal -1 does not fit byte")
+                "the literal -1 does not fit U (aka byte)")
 
 @test("a block inside a body, which has no file's headers to be compiled against")
 cty_a_block_inside_a_body()
@@ -979,3 +979,229 @@ cty_a_sysl_function_whose_address_c_was_handed()
                               "#include <stdint.h>\n#include <stdbool.h>\n\n" +
                               "int probe_call(bool (*f)(uint8_t)) { return f(7) && !f(8) ? 0 : 999; }\n"),
               "0\n")
+
+// -- the base everywhere, with one marker ---------------------------------------------------------
+//
+// A measured type is the scalar C said it is to the whole analysis (`resolve_type.sysl`'s
+// `is_measured`); the scalar carries the type's name, which only the widening and a diagnostic read.
+// So every place the base works the name works, and a value of ANY other integer type -- of every
+// width, either sign, an address-width one, a `char`, another `c type` measured differently -- reaches
+// it only through a written conversion, at every position a value is put: an argument, a field, an
+// element, an assignment, a binding whose type was inferred from one.
+//
+// The axes: where the type is used (an argument, a field, an array and a slice element, a `for` range,
+// a slice's bounds, a generic's argument, a `const`, an `@export` signature and struct, a match
+// scrutinee, a method receiver) crossed with what reaches it (its own base, another `c type` of the
+// same base, every other width, a literal, a float). Skipped: a module `var` (an assignment, already
+// here at a local and a field) and `build-lib` (the name is dropped at instantiation, so a `.syslib`
+// carries the base exactly as `Buf[Size]` already shows).
+
+private cty_ctype_head() -> string = raw"""
+    @include("<stddef.h>")
+    @include("<stdbool.h>")
+
+    import sysl.buf.{Buf, buf}
+
+    c type
+        Size = "size_t"
+        ULong = "unsigned long"
+        UInt = "unsigned int"
+        UChar = "unsigned char"
+        Dbl = "double"
+        Truth = "bool"
+
+    struct Holder
+        n: Size
+
+    take(n: Size) -> Size = n
+
+    """
+
+@test("a measured type has its base's methods, an integer's and a float's")
+cty_has_its_bases_methods()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + "main()\n    val n: Size = 9\n    print(n.count_ones(), Dbl(2.25).sqrt())\n"),
+              "2 1.5\n")
+
+@test("a measured type is matched exhaustively as its base, with no 'else'")
+cty_matched_exhaustively_as_its_base()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + raw"""
+        main()
+            val c: UChar = 200
+            val f: Truth = false
+            print(c match
+                0..127 -> "low"
+                128..255 -> "high")
+            print(f match
+                true -> "yes"
+                false -> "no")
+        """), "high\nno\n")
+
+@test("a measured type bounds a for range and a slice, and indexes")
+cty_bounds_a_range_and_a_slice()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + raw"""
+        main()
+            val xs: [5]int = [1, 2, 3, 4, 5]
+            val lo: Size = 1
+            val hi: Size = 4
+            var t = 0
+            for k in lo..<hi
+                t += xs[k]
+            print(t, xs[lo..<hi].len, xs[hi])
+        """), "9 3 5\n")
+
+@test("a measured type instantiates a generic as its base, and is shown by its name only outside one")
+cty_instantiates_a_generic_as_its_base()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + raw"""
+        id[T](x: T) -> T = x
+
+        main()
+            val n: Size = 9
+            var a: Buf[Size] = buf()
+            a.push(n)
+            val b: Buf[u64] = a
+            print(id(n) + 1, id[Size](n), b[0])
+        """), "10 9 9\n")
+
+@test("a const at a measured type folds, and one computed from it too")
+cty_a_const_folds()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + "const K: Size = 3 * 4\nconst L = K + 1\n\nmain()\n    print(K, L, take(K))\n"),
+              "12 13 12\n")
+
+@test("a measured type in a field and an element holds its own values, and its base's")
+cty_in_a_field_and_an_element()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + raw"""
+        main()
+            val n: Size = 9
+            val plain: u64 = 4
+            var h = Holder(n)
+            h.n = plain
+            var ys: [2]Size = [1, 2]
+            ys[0] = n
+            val s: []Size = ys[..]
+            s[1] = plain
+            print(h.n, s[0] + s[1])
+        """), "4 13\n")
+
+// The pair the user settled: another `c type` of the same base IS that base, so it is accepted; one
+// measured as a different integer is a different integer, and refused.
+@test("another c type of the same base reaches it, and one of a different base does not")
+cty_another_c_type_of_the_same_base()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + "main()\n    val u: ULong = 7\n    val p: u64 = 2\n    print(take(u), take(p), take(3))\n"),
+              "7 2 3\n")
+    cty_refuses(cty_err(cty_ctype_head() + "main()\n    val k: UInt = 1\n    print(take(k))\n"),
+                "'n' of 'take' is Size, but UInt was given")
+
+// Every width that would widen into a `u64` implicitly, and the ones that would not: each is refused
+// with the same sentence, which names the type the reader wrote.
+@test("a value of every other integer type reaches it only through a written conversion")
+cty_every_other_width_is_refused()
+    if !cty_ready() then return
+
+    val widths = ["u8", "u16", "u32", "i8", "i16", "i64", "usize", "isize", "u128", "i128"]
+
+    for w in widths
+        cty_refuses(cty_err(cty_ctype_head() + s"main()\n    val x: $w = 1\n    print(take(x))\n"),
+                    s"'n' of 'take' is Size, but $w was given")
+
+    cty_refuses(cty_err(cty_ctype_head() + "main()\n    val x: i32 = 1\n    print(take(x))\n"),
+                "'n' of 'take' is Size, but i32 was given")
+    cty_refuses(cty_err(cty_ctype_head() + "main()\n    val x = 'a'\n    print(take(x))\n"),
+                "'n' of 'take' is Size, but char was given")
+    assert_eq(cty_ran(cty_ctype_head() + "main()\n    val x: u32 = 5\n    print(take(Size(x)))\n"), "5\n")
+end cty_every_other_width_is_refused
+
+// The marker rides wherever the type was written: a field, an element through an array and through a
+// slice, and a binding whose type was inferred from a call answering one.
+@test("and at every position a value is put, not only an argument")
+cty_refused_at_every_position()
+    if !cty_ready() then return
+
+    val said = cty_err(cty_ctype_head() + raw"""
+        main()
+            val c: u32 = 1
+            val x = Holder(c)
+            var y = Holder(1)
+            y.n = c
+            var zs: [2]Size = [1, 2]
+            zs[0] = c
+            val s: []Size = zs[..]
+            s[1] = c
+            var inferred = take(1)
+            inferred = c
+            print(x.n, y.n, inferred)
+        """)
+
+    cty_refuses(said, "'n' of 'Holder' is Size, but u32 was given")
+    cty_refuses(said, "cannot assign u32 to field 'n' of type Size")
+    cty_refuses(said, "cannot assign u32 to this element of type Size")
+    cty_refuses(said, "cannot assign u32 to 'inferred' of type Size")
+end cty_refused_at_every_position
+
+// Floats keep the rule as integers do; the float it was measured as flows in.
+@test("a float c type refuses a narrower float and takes its own")
+cty_a_float_c_type_refuses_a_narrower_float()
+    if !cty_ready() then return
+
+    val dbl = "dbl(x: Dbl) -> Dbl = x\n\n"
+
+    cty_refuses(cty_err(cty_ctype_head() + dbl + "main()\n    val g: f32 = 1.5\n    print(dbl(g))\n"),
+                "'x' of 'dbl' is Dbl, but f32 was given")
+    assert_eq(cty_ran(cty_ctype_head() + dbl + "main()\n    val g: f64 = 0.5\n    print(dbl(g), dbl(0.25))\n"),
+              "0.5 0.25\n")
+end cty_a_float_c_type_refuses_a_narrower_float
+
+// What leaves one is its integer, so it widens OUT as that integer does.
+@test("a measured type widens out as its integer does")
+cty_widens_out_as_its_integer()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran(cty_ctype_head() + "main()\n    val n: Size = 9\n    val w: u128 = n\n    print(w)\n"), "9\n")
+
+// Both ways across `@export`: C calls a sysl function taking and answering one, and sysl calls C
+// through an `extern` answering one -- each side reading the other's `size_t`.
+@test("a measured type crosses an export and an extern both ways")
+cty_crosses_an_export_both_ways()
+    if !cty_ready() then return
+
+    assert_eq(cty_ran_project("@include(\"<stddef.h>\")\n\nc type\n    Size = \"size_t\"\n\n" +
+                              "@export(\"probe_twice\")\ntwice(n: Size) -> Size = n * 2\n\n" +
+                              "extern \"probe_ask\" ask(n: Size) -> Size\n\n" +
+                              "check() -> int = if ask(21) == 42 then 0 else 999\n",
+                              "#include <stddef.h>\n\nsize_t probe_twice(size_t n);\n\n" +
+                              "size_t probe_ask(size_t n) { return probe_twice(n); }\n"), "0\n")
+
+// The header still spells it by its C name in a struct's field, as it does in a signature.
+@test("an exported struct's field is spelled by its C name in the header")
+cty_an_exported_field_is_spelled_by_its_c_name()
+    if !cty_ready() then return
+
+    val root = make_temp_dir("sysl-ctype").unwrap()
+
+    make_dir_all(s"$root/demo").unwrap()
+    write_text(s"$root/demo/demo.sysl",
+               "module demo\n@include(\"<stddef.h>\")\n\nc type\n    Size = \"size_t\"\n\n" +
+               "@export\nstruct Span\n    len: Size\n\n@export\nlength(s: *Span) -> Size = s.len\n").unwrap()
+
+    val said = c_header_of(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(text) -> text
+
+    remove_dir_all(root).unwrap_or(())
+
+    cty_refuses(said, "size_t len;")
+    cty_refuses(said, "size_t length(")
+end cty_an_exported_field_is_spelled_by_its_c_name

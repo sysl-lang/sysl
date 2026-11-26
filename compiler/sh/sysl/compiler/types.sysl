@@ -50,8 +50,10 @@ struct Bound
     assocs: Buf[(string, Type)]
     bounded: Buf[(string, Bound)]
 
-    // The spelling a table keys on -- the module-qualified name with its arguments.
-    key(self) -> string = qualified(self.name, self.args)
+    // The spelling a table keys on -- the module-qualified name with its arguments, each as the type
+    // it is rather than a name it was written with: `Add[Ulong]` over a measured `unsigned long` is
+    // `Add[ulong]`'s row.
+    key(self) -> string = qualified(self.name, nameless_all(self.args))
 
     // The spelling a diagnostic quotes, which shows a module with dots rather than the separator.
     show(self) -> string = if self.assocs.is_empty() && self.bounded.is_empty() then
@@ -283,7 +285,14 @@ enum Type
     // `int`, `u8`, `usize` -- an integer of a width, signed or not. `pointer_width` marks the two
     // that are as wide as an address, which is a property of the target rather than of the number
     // and is what lets a diagnostic call one `usize` instead of `u64`.
-    Integer(bits: int, signed: bool, pointer_width: bool)
+    //
+    // `measured` is the name of the `c type` this integer was declared at (`Size` for `Size =
+    // "size_t"`), and `None` for every other integer. **It takes no part in equality**: a measured
+    // type IS the integer C said it is (`reference/ffi.md § c type`). Two things read it -- the
+    // implicit widening, which nothing does into a measured type (the width is the target's, so a
+    // `u32` sliding into a `Size` would be one machine's answer), and a diagnostic, which quotes the
+    // name the reader wrote.
+    Integer(bits: int, signed: bool, pointer_width: bool, measured: Option[string])
 
     // `real`, `f32`, `bf16` -- a binary floating-point number of a width.
     //
@@ -295,7 +304,10 @@ enum Type
     // that spell the format out read the flag. The one place the width stops answering is a
     // conversion between the two sixteen-bit formats, which goes through `f32`. `brain` is set only
     // at sixteen bits.
-    Floating(bits: int, brain: bool)
+    //
+    // `measured` is `Integer`'s: the `c type` a float was declared at, read by the widening and by a
+    // diagnostic alone.
+    Floating(bits: int, brain: bool, measured: Option[string])
 
     // `i32q31`, `q15`, `u32q16` -- a `bits`-wide two's-complement (or unsigned) integer counting
     // units of 2^-`frac`: an `i32` read in 2^-31ths. It is a variant of its own rather than a flag on
@@ -420,17 +432,37 @@ end Type
 // -- the scalars, by name ------------------------------------------------------------------------
 
 // `int` -- the width an integer literal falls to when nothing else settles it.
-int_type() -> Type = Integer(32, true, false)
+int_type() -> Type = Integer(32, true, false, None)
 
 // `real`.
-real_type() -> Type = Floating(64, false)
+real_type() -> Type = Floating(64, false, None)
 
 // `byte` -- the element of every slice of bytes.
-byte_type() -> Type = Integer(8, false, false)
+byte_type() -> Type = Integer(8, false, false, None)
 
 // `usize` and `isize` at a target's address width.
-usize_type(word_bits: int) -> Type = Integer(word_bits, false, true)
-isize_type(word_bits: int) -> Type = Integer(word_bits, true, true)
+usize_type(word_bits: int) -> Type = Integer(word_bits, false, true, None)
+isize_type(word_bits: int) -> Type = Integer(word_bits, true, true, None)
+
+// A scalar declared at a measured `c type` -- the integer or float C said it is, carrying the name
+// for the widening and a diagnostic -- or the type itself where it is no number.
+measured_as(t: Type, name: string) -> Type = t match
+    Integer(b, s, pw, _) -> Integer(b, s, pw, Some(name))
+    Floating(b, brain, _) -> Floating(b, brain, Some(name))
+    _ -> t
+
+// The scalar with the `c type` it was declared at taken off: what a symbol and an instantiation key
+// on, so `Buf[Size]` is `Buf[u64]`'s instantiation whichever was met first.
+unmeasured(t: Type) -> Type = t match
+    Integer(b, s, pw, Some(_)) -> Integer(b, s, pw, None)
+    Floating(b, brain, Some(_)) -> Floating(b, brain, None)
+    _ -> t
+
+// The name of the `c type` a scalar was declared at, if it was.
+measured_name(t: Type) -> Option[string] = t match
+    Integer(_, _, _, m) -> m
+    Floating(_, _, m) -> m
+    _ -> None
 
 // The scalar a name spells, or nothing where it names something else. The two address-width ones
 // depend on the target, so it is asked with the word size rather than read from a table.
@@ -439,18 +471,18 @@ scalar_named(name: string, word_bits: int) -> Option[Type] = name match
     "char" -> Some(Char)
     "string" -> Some(Str)
     "unit" -> Some(Unit)
-    "int" -> Some(Integer(32, true, false))
-    "short" -> Some(Integer(16, true, false))
-    "long" -> Some(Integer(64, true, false))
-    "byte" -> Some(Integer(8, false, false))
-    "ushort" -> Some(Integer(16, false, false))
-    "uint" -> Some(Integer(32, false, false))
-    "ulong" -> Some(Integer(64, false, false))
-    "real" -> Some(Floating(64, false))
+    "int" -> Some(Integer(32, true, false, None))
+    "short" -> Some(Integer(16, true, false, None))
+    "long" -> Some(Integer(64, true, false, None))
+    "byte" -> Some(Integer(8, false, false, None))
+    "ushort" -> Some(Integer(16, false, false, None))
+    "uint" -> Some(Integer(32, false, false, None))
+    "ulong" -> Some(Integer(64, false, false, None))
+    "real" -> Some(Floating(64, false, None))
     // `bf16` is the one floating-point type whose name is not a width, because no width tells it
     // apart from `f16` -- so it is a name here rather than a shape the width families recognise,
     // and a type annotation, a cast and a literal suffix all find it the same way.
-    "bf16" -> Some(Floating(16, true))
+    "bf16" -> Some(Floating(16, true, None))
     // The three fixed-point formats CMSIS names, and no others: every other format is spelled out
     // as its width and its fraction.
     "q7" -> Some(Fixed(8, 7, true))
@@ -492,11 +524,12 @@ end field_slot
 // the same type because they came from the same declaration, not because their fields happen to
 // agree today.
 type_eq(a: Type, b: Type) -> bool = a match
-    Integer(ab, asg, apw) -> b match
-        Integer(bb, bsg, bpw) -> ab == bb && asg == bsg && apw == bpw
+    // The `c type` a scalar was measured as is no part of it.
+    Integer(ab, asg, apw, _) -> b match
+        Integer(bb, bsg, bpw, _) -> ab == bb && asg == bsg && apw == bpw
         _ -> false
-    Floating(ab, abr) -> b match
-        Floating(bb, bbr) -> ab == bb && abr == bbr
+    Floating(ab, abr, _) -> b match
+        Floating(bb, bbr, _) -> ab == bb && abr == bbr
         _ -> false
     Fixed(ab, af, asg) -> b match
         Fixed(bb, bf, bsg) -> ab == bb && af == bf && asg == bsg

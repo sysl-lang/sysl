@@ -262,7 +262,8 @@ name_only(d: &ConstrainedType) -> bool =
 // one of its own. A `new` type that is only `new` is one, and so is every name-only subtype.
 constraint_free(d: &ConstrainedType) -> bool = d.lo.is_none() && d.hi.is_none() && d.pred_fn.is_none()
 
-// The type with every name-only constrained type in it replaced by its base, at any depth. This is
+// The type with every name-only constrained type in it replaced by its base, and every scalar's
+// measured `c type` taken off (`Type.Integer`), at any depth. This is
 // the identity such a name has everywhere the language checks types -- agreement (through `repr`),
 // and the key an instantiation is filed under -- so `Buf[H]` and `Buf[u64]` are one instantiation and
 // `*H` is a `*u64`. The name stays visible only to what reads a type as written: the C header. A named
@@ -272,6 +273,8 @@ nameless(t: Type) -> Type = if !holds_name_only(t) then t else stripped_names(t)
 // Whether there is anything for `nameless` to take off, so the common case allocates nothing.
 private holds_name_only(t: Type) -> bool = t match
     Constrained(d) -> name_only(d)
+    Integer(_, _, _, m) -> m.is_some()
+    Floating(_, _, m) -> m.is_some()
     Ptr(inner, _) -> holds_name_only(*inner)
     Ref(inner, _) -> holds_name_only(*inner)
     Weak(inner) -> holds_name_only(*inner)
@@ -292,6 +295,8 @@ end any_name_only
 
 private stripped_names(t: Type) -> Type = t match
     Constrained(d) -> if name_only(d) then nameless(d.base) else t
+    Integer(_, _, _, _) -> unmeasured(t)
+    Floating(_, _, _) -> unmeasured(t)
     Ptr(inner, ro) -> Ptr(nameless(*inner), ro)
     Ref(inner, sync) -> Ref(nameless(*inner), sync)
     Weak(inner) -> Weak(nameless(*inner))
@@ -525,8 +530,8 @@ is_trait(t: Type) -> bool = t match
 
 // Whether arithmetic is defined on the type itself.
 is_numeric(t: Type) -> bool = underlying(t) match
-    Integer(_, _, _) -> true
-    Floating(_, _) -> true
+    Integer(_, _, _, _) -> true
+    Floating(_, _, _) -> true
     Fixed(_, _, _) -> true
     _ -> false
 
@@ -610,8 +615,8 @@ end wrap
 // reference that never had an object and one whose object is gone are the same state, which is the
 // one place `weak T` parts company with `&T`.
 has_zero(t: Type) -> bool = t match
-    Integer(_, _, _) -> true
-    Floating(_, _) -> true
+    Integer(_, _, _, _) -> true
+    Floating(_, _, _) -> true
     Fixed(_, _, _) -> true
     Char -> true
     Bool -> true
