@@ -37,7 +37,7 @@ gen_if(e: *Emit, cond: Buf[TCondTerm], then_block: TBlock, else_block: Option[TB
 
     e.moves.dying = if else_block.is_some() then dying else set()
 
-    val handed = hand_in(e, cond, paths.scopes)
+    val handed = hand_in(e, cond, paths.scopes, ty)
 
     // A clause's guards may leave the branch for the `else` (`TFallthrough`).
     e.falls.push(GenFall(target, owned_depth, temp_depth))
@@ -111,10 +111,15 @@ private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)]
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
     e.moves.last_uses = lasts.1
     e.moves.dying = dying_for(b.result.unwrap(), lasts.3)
+
+    val was_calm = e.moves.calm
+
+    e.moves.calm = calm_tail(e, b.stmts, b.result.unwrap(), e.moves.ready)
     gen_into(e, dest, b.result.unwrap())
+    e.moves.calm = was_calm
     e.moves.dying = set()
     e.moves.last_uses = was
     pop_owned(e)
@@ -870,13 +875,13 @@ gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
     e.moves.last_uses = lasts.1
 
     b.result match
         Some(r) ->
             e.moves.dying = dying_for(r, lasts.3)
-            gen_expr(e, r)
+            gen_tail(e, b, r)
             e.moves.dying = set()
         None -> ()
 
@@ -896,14 +901,14 @@ gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result)
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
     e.moves.last_uses = lasts.1
 
     val v = b.result match
         Some(r) ->
             e.moves.dying = dying_for(r, lasts.3)
 
-            val got = gen_expr(e, r)
+            val got = gen_tail(e, b, r)
 
             e.moves.dying = set()
             retain_moving(e, r, texpr_type(r), got)
@@ -926,11 +931,16 @@ gen_stmts(e: *Emit, xs: Buf[TStmt]) = gen_stmts_with(e, xs, buf())
 //
 // `tail` is the block's value, which follows the last statement: a copy out of storage that the next
 // statement lets go of is drained rather than copied (`slot_drain.sysl`), and that next one may be it.
+//
+// `quiet_end` says the scope ends with nothing but releases, which is what lets a statement that
+// nothing observable follows hand a destructor-running local over (`calm_keeps.sysl`).
 gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set[string]] = buf(),
-               tail: Option[TExpr] = None)
+               tail: Option[TExpr] = None, quiet_end: bool = false)
     val mark = nowrap_mark(e)
     val was = e.moves.last_uses
+    val was_calm = e.moves.calm
     val none: Set[string] = set()
+    val suffix = calm_suffix(e, xs, tail, quiet_end && !lasts.is_empty())
 
     for i in 0..<xs.len()
         val item = xs[i]
@@ -938,6 +948,7 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
         nowrap_before(e, item)
         e.moves.last_uses = if i < lasts.len() then lasts[i] else none
         e.moves.dying = if i < dying.len() then dying_for_stmt(item, dying[i]) else none
+        e.moves.calm = calm_at(xs, i, tail, suffix)
         // A drain is matched by the node it reads, so the one a loop is being emitted for stays set
         // while its body's own statements are.
         // A drained loop that may be relocated whole runs only where the relocation could not be.
@@ -963,12 +974,25 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
         nowrap_after(e, item)
 
     e.moves.last_uses = was
+    e.moves.calm = was_calm
     nowrap_release(e, mark)
 end gen_stmts_with
+
+// A block's value emitted under the calm nothing after it disturbs, and the enclosing calm put back.
+private gen_tail(e: *Emit, b: TBlock, r: TExpr) -> Val
+    val was_calm = e.moves.calm
+
+    e.moves.calm = calm_tail(e, b.stmts, r, e.moves.ready)
+
+    val v = gen_expr(e, r)
+
+    e.moves.calm = was_calm
+    v
+end gen_tail
 
 // A body whose scope was opened just for it -- a loop's -- with moves inferred over it.
 private gen_body(e: *Emit, body: Buf[TStmt])
     val lasts = last_uses_of(e, body, None)
 
-    gen_stmts_with(e, body, lasts.0, lasts.2)
+    gen_stmts_with(e, body, lasts.0, lasts.2, None, true)
 end gen_body

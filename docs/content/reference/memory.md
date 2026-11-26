@@ -4400,9 +4400,62 @@ through a closure, function value, trait object or C reaches a borrowing entry; 
 `async` or `@scoped` function, or one with a contract, keeps the borrowed convention.
 
 **A value whose release can run a destructor is still destroyed where its scope ends**: such a local is
-retained for the call, not handed over at its last use, and never handed into an `if`'s arms, since
+retained for the call, not handed over at its last use, and not handed into an `if`'s arms, since
 the call might keep it only in a result that goes at the end of the statement while a view of what it
-owns is still being read.
+owns is still being read. Two cases are exempt because nothing can tell the difference. A call that
+is the whole statement, with nothing after it to the end of the scope but plain reads, arithmetic,
+writes of uncounted places and a `return`, hands the local over when the callee keeps it calmly: it
+puts the value in a buffer's slot, or hands it to a parameter that does so, and runs nothing after
+that which could let it go. An `if` that is the last thing in its scope takes the local into its arms.
+So `xs.push(shape)` as a function's last statement costs a `&Trait` or a `&Fn` no count, as it costs a
+`&Node` none. `xs.push(shape)` followed by `xs.clear()` still retains, and the destructor still runs
+where the scope ends:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+trait Shape
+    area(self) -> int
+
+struct Noisy
+    id: int
+
+impl Drop for Noisy
+    drop(self)
+        print(s"dropped ${self.id}")
+
+impl Shape for Noisy
+    area(self) -> int = self.id
+
+put(xs: Buf[&Shape], id: int)
+    val a: &Shape = Noisy(id)
+
+    xs.push(a)
+
+put_and_clear(id: int)
+    var xs: Buf[&Shape] = buf()
+    val a: &Shape = Noisy(id)
+
+    xs.push(a)
+    xs.clear()
+    print("cleared")
+
+main()
+    val xs: Buf[&Shape] = buf()
+
+    put(xs, 1)
+    print("put 1")
+    put_and_clear(2)
+    print(s"held ${xs.len()}")
+```
+
+```output
+put 1
+cleared
+dropped 2
+held 1
+dropped 1
+```
 
 ### A count that would be taken and given straight back is not taken
 
