@@ -1,0 +1,483 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.math.bigint.{BigInt, from_int, mul as big_mul}
+import sysl.process.capture
+
+// The normal form of a computed value argument (`value_terms.sysl`, `docs/design/type-level-consts.md
+// § 5.1`, rows N1-N11 of § 10): a polynomial over ℤ in the declaration's value parameters -- each
+// numbered by its place, not its spelling -- and atoms, each an operator over its operands' own forms.
+//
+// The axes: the operation (the ring's `+ - *`, exact and inexact `/` and `%`, a comparison, `!`,
+// `&&`, `||`, `if`, `min`/`max`, a `const` call), the operands (a parameter, a constant, a sum, an
+// atom, a nested atom), the coefficient's size (inside a machine word, past every one), the cap (at
+// it, one past it, by terms and by degree), and the order the parts were written in. The first half
+// asks the form itself; the second half asks the same through programs, where a reading at the
+// definition is what the form decides -- inside a body or a field, since a signature may not compute
+// yet (TL3 lifts that; rows p01-p11 pin what it says today).
+//
+// Cells skipped: a `.syslib` and codegen units (a form is never emitted -- an instance's arguments are
+// concrete), bare metal (nothing is emitted), and `min`/`max` through a program (no type position may
+// call them yet; their form is asked directly).
+
+// -- building forms by hand -----------------------------------------------------------------------
+
+private tlk_n() -> Buf[Mono] = term_param(0, "N")
+private tlk_m() -> Buf[Mono] = term_param(1, "M")
+private tlk_c(n: long) -> Buf[Mono] = term_const(from_int(n))
+private tlk_add(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono] = term_add(p, q)
+private tlk_sub(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono] = term_add(p, term_neg(q))
+private tlk_mul(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono] = term_mul(p, q)
+
+private tlk_list(xs: []const Buf[Mono]) -> Buf[Buf[Mono]]
+    var out: Buf[Buf[Mono]] = buf()
+
+    for x in xs
+        out.push(x)
+
+    out
+
+private tlk_one(p: Buf[Mono], q: Buf[Mono])
+    assert(terms_eq(p, q), s"expected one form: '${term_text(p)}' and '${term_text(q)}'")
+    assert_eq(term_key(p), term_key(q))
+
+private tlk_two(p: Buf[Mono], q: Buf[Mono])
+    assert(!terms_eq(p, q), s"expected two forms: '${term_text(p)}' and '${term_text(q)}'")
+    assert(term_key(p) != term_key(q), term_key(p))
+    assert_eq(term_cmp(p, q), -term_cmp(q, p))
+
+// -- the form ---------------------------------------------------------------------------------------
+
+@test("N1: N + M and M + N are one form, shown in the declaration's order")
+tlk_n1_commuted_sum()
+    tlk_one(tlk_add(tlk_n(), tlk_m()), tlk_add(tlk_m(), tlk_n()))
+    assert_eq(term_text(tlk_add(tlk_m(), tlk_n())), "N + M")
+    assert_eq(term_text(tlk_mul(tlk_m(), tlk_n())), "N * M")
+    assert_eq(term_text(tlk_add(tlk_c(1), tlk_n())), "N + 1")
+
+@test("N2: 2 * N, N + N and N * 2 are one form")
+tlk_n2_doubling()
+    tlk_one(tlk_mul(tlk_c(2), tlk_n()), tlk_add(tlk_n(), tlk_n()))
+    tlk_one(tlk_mul(tlk_n(), tlk_c(2)), tlk_add(tlk_n(), tlk_n()))
+    assert_eq(term_text(tlk_add(tlk_n(), tlk_n())), "2 * N")
+    tlk_two(tlk_mul(tlk_c(2), tlk_n()), tlk_mul(tlk_c(3), tlk_n()))
+
+@test("N3: a product distributes")
+tlk_n3_distributes()
+    tlk_one(tlk_mul(tlk_n(), tlk_add(tlk_m(), tlk_c(1))), tlk_add(tlk_mul(tlk_n(), tlk_m()), tlk_n()))
+    assert_eq(term_text(tlk_mul(tlk_n(), tlk_add(tlk_m(), tlk_c(1)))), "N + N * M")
+    // (N + 1) * (N - 1) - N * N + 1 cancels to nothing.
+    val square = tlk_mul(tlk_add(tlk_n(), tlk_c(1)), tlk_sub(tlk_n(), tlk_c(1)))
+
+    tlk_one(tlk_add(tlk_sub(square, tlk_mul(tlk_n(), tlk_n())), tlk_c(1)), tlk_c(0))
+
+@test("N4: N - N is 0, and a coefficient cancelled to zero leaves no monomial")
+tlk_n4_cancels()
+    val zero = tlk_sub(tlk_n(), tlk_n())
+
+    assert(zero.is_empty(), term_text(zero))
+    assert_eq(term_text(zero), "0")
+
+    val left = tlk_sub(tlk_add(tlk_mul(tlk_c(3), tlk_n()), tlk_m()), tlk_mul(tlk_c(3), tlk_n()))
+
+    tlk_one(left, tlk_m())
+    assert_eq(left.len(), 1)
+
+@test("N5: (2 * N + 4) / 2 is N + 2, a constant monomial divided too, and its % is 0")
+tlk_n5_exact_division()
+    val p = tlk_add(tlk_mul(tlk_c(2), tlk_n()), tlk_c(4))
+
+    tlk_one(term_div("/", p, tlk_c(2)), tlk_add(tlk_n(), tlk_c(2)))
+    tlk_one(term_div("%", p, tlk_c(2)), tlk_c(0))
+    // A negative divisor divides exactly too: (2 * N + 4) / -2 is -N - 2.
+    tlk_one(term_div("/", p, tlk_c(-2)), tlk_sub(tlk_c(-2), tlk_n()))
+
+@test("N6: (2 * N + 3) / 2 is an atom, not N + 1, and so is its %")
+tlk_n6_inexact_division()
+    val p = tlk_add(tlk_mul(tlk_c(2), tlk_n()), tlk_c(3))
+    val q = term_div("/", p, tlk_c(2))
+
+    tlk_two(q, tlk_add(tlk_n(), tlk_c(1)))
+    assert_eq(term_text(q), "(2 * N + 3) / 2")
+    assert_eq(term_text(tlk_mul(tlk_c(2), q)), "2 * ((2 * N + 3) / 2)")
+    assert_eq(term_text(term_div("%", p, tlk_c(2))), "(2 * N + 3) % 2")
+    // A divisor that is no constant, or zero, is an atom as well.
+    assert_eq(term_text(term_div("/", tlk_n(), tlk_m())), "N / M")
+    assert_eq(term_text(term_div("/", tlk_n(), tlk_c(0))), "N / 0")
+    // Two constants divide as an instantiation would: truncating, the remainder the dividend's sign.
+    tlk_one(term_div("/", tlk_c(-7), tlk_c(2)), tlk_c(-3))
+    tlk_one(term_div("%", tlk_c(-7), tlk_c(2)), tlk_c(-1))
+
+@test("N7: min and max sort, flatten and deduplicate their operands")
+tlk_n7_min_max()
+    val nm = term_min_max("min", tlk_list([tlk_n(), tlk_m()]))
+
+    tlk_one(nm, term_min_max("min", tlk_list([tlk_m(), tlk_n(), tlk_n()])))
+    tlk_one(nm, term_min_max("min", tlk_list([term_min_max("min", tlk_list([tlk_m(), tlk_n()])), tlk_n()])))
+    assert_eq(term_text(nm), "min(N, M)")
+    tlk_one(term_min_max("min", tlk_list([tlk_n(), tlk_n()])), tlk_n())
+    tlk_two(nm, term_min_max("max", tlk_list([tlk_n(), tlk_m()])))
+    // A max nested in a min is not flattened into it.
+    val mixed = term_min_max("min", tlk_list([term_min_max("max", tlk_list([tlk_n(), tlk_m()])), tlk_n()]))
+
+    assert_eq(term_text(mixed), "min(N, max(N, M))")
+
+@test("N8: a comparison whose sides differ by a constant is that constant's truth")
+tlk_n8_comparison_folds()
+    val n1 = tlk_add(tlk_n(), tlk_c(1))
+
+    tlk_one(term_compare(">", n1, tlk_n()), tlk_c(1))
+    tlk_one(term_compare("<", n1, tlk_n()), tlk_c(0))
+    tlk_one(term_compare(">=", tlk_n(), tlk_n()), tlk_c(1))
+    tlk_one(term_compare("==", n1, tlk_n()), tlk_c(0))
+    tlk_one(term_compare("!=", n1, tlk_n()), tlk_c(1))
+    tlk_one(term_compare("<=", tlk_sub(tlk_n(), tlk_c(2)), tlk_n()), tlk_c(1))
+
+    val apart = term_compare(">", tlk_n(), tlk_m())
+
+    assert_eq(term_text(apart), "N > M")
+    tlk_two(apart, term_compare("<", tlk_m(), tlk_n()))
+
+@test("!, && and || fold a constant operand and keep anything else as written")
+tlk_logic_folds()
+    val apart = term_compare(">", tlk_n(), tlk_m())
+
+    tlk_one(term_not(tlk_c(1)), tlk_c(0))
+    tlk_one(term_not(tlk_c(0)), tlk_c(1))
+    assert_eq(term_text(term_not(apart)), "!(N > M)")
+    assert_eq(term_text(term_not(tlk_n())), "!N")
+    tlk_one(term_logic("&&", tlk_c(1), apart), apart)
+    tlk_one(term_logic("&&", apart, tlk_c(0)), tlk_c(0))
+    tlk_one(term_logic("||", tlk_c(0), apart), apart)
+    tlk_one(term_logic("||", apart, tlk_c(1)), tlk_c(1))
+
+    val both = term_logic("&&", apart, term_compare("<", tlk_n(), tlk_c(9)))
+
+    assert_eq(term_text(both), "(N > M) && (N < 9)")
+    tlk_one(term_if(tlk_c(1), tlk_n(), tlk_m()), tlk_n())
+    tlk_one(term_if(tlk_c(0), tlk_n(), tlk_m()), tlk_m())
+    assert_eq(term_text(term_if(apart, tlk_n(), tlk_m())), "if N > M then N else M")
+
+@test("N9: a call is an atom keyed by its function, not by how the call names it")
+tlk_n9_call_key()
+    val bare = term_call("util.double", "double", tlk_list([tlk_n()]))
+    val qualified = term_call("util.double", "util.double", tlk_list([tlk_n()]))
+
+    tlk_one(bare, qualified)
+    tlk_two(bare, term_call("util.triple", "double", tlk_list([tlk_n()])))
+    tlk_two(bare, term_call("util.double", "double", tlk_list([tlk_m()])))
+    assert_eq(term_text(tlk_add(bare, tlk_c(1))), "double(N) + 1")
+
+@test("N10: past 64 monomials or degree 8 the cap speaks, and at the cap it does not")
+tlk_n10_cap()
+    var at = tlk_c(1)
+
+    // (1 + P0) * ... * (1 + P5) has 2^6 = 64 monomials, of degree 6.
+    for i in 0..<6
+        at = tlk_mul(at, tlk_add(tlk_c(1), term_param(i, s"P$i")))
+
+    assert_eq(at.len(), 64)
+    assert(term_cap_text(at).is_none(), term_cap_text(at).unwrap_or(""))
+
+    val past = tlk_mul(at, tlk_add(tlk_c(1), term_param(6, "P6")))
+
+    assert_eq(past.len(), 128)
+    assert_eq(term_cap_text(past).unwrap_or(""), "over 64 terms")
+
+    var power = tlk_n()
+
+    for _ in 1..<8
+        power = tlk_mul(power, tlk_n())
+
+    assert(term_cap_text(power).is_none(), term_text(power))
+    assert_eq(term_cap_text(tlk_mul(power, tlk_n())).unwrap_or(""), "of degree over 8")
+
+@test("N11: parameters renamed in the same order are one form")
+tlk_n11_renamed()
+    val nm = tlk_add(tlk_mul(tlk_c(2), tlk_n()), tlk_m())
+    val ab = tlk_add(tlk_mul(tlk_c(2), term_param(0, "A")), term_param(1, "B"))
+
+    tlk_one(nm, ab)
+    assert_eq(term_text(ab), "2 * A + B")
+    // The same names in another order are two forms.
+    tlk_two(nm, tlk_add(tlk_mul(tlk_c(2), term_param(1, "N")), term_param(0, "M")))
+
+@test("atoms are ordered totally, nested ones included, whatever order they were written in")
+tlk_atoms_ordered()
+    val half = term_div("/", tlk_n(), tlk_c(2))
+    val third = term_div("/", tlk_m(), tlk_c(3))
+    val nested = term_min_max("min", tlk_list([half, tlk_m()]))
+
+    tlk_one(tlk_add(half, third), tlk_add(third, half))
+    tlk_one(tlk_add(tlk_add(nested, half), tlk_n()), tlk_add(tlk_n(), tlk_add(half, nested)))
+    tlk_one(nested, term_min_max("min", tlk_list([tlk_m(), half])))
+    tlk_one(tlk_mul(half, third), tlk_mul(third, half))
+    // A parameter comes before an atom, and one atom before another by its operator, then operands.
+    assert_eq(term_text(tlk_add(half, tlk_n())), "N + (N / 2)")
+    assert(factor_cmp(tlk_n()[0].factors[0], half[0].factors[0]) < 0)
+    assert(factor_cmp(term_div("/", tlk_n(), tlk_c(3))[0].factors[0], half[0].factors[0]) != 0)
+    tlk_two(half, term_div("%", tlk_n(), tlk_c(2)))
+
+@test("a coefficient past every machine word stays exact, and the cap does not count its size")
+tlk_coefficient_unbounded()
+    // 2^70 * N - 2^70 * N + N is N.
+    var big: BigInt = from_int(1)
+
+    for _ in 0..<70
+        big = big_mul(big, from_int(2))
+
+    val huge = tlk_mul(term_const(big), tlk_n())
+
+    tlk_one(tlk_add(tlk_sub(huge, huge), tlk_n()), tlk_n())
+    assert_eq(term_text(huge), "1180591620717411303424 * N")
+    assert(term_cap_text(tlk_mul(huge, huge)).is_none())
+    tlk_two(huge, tlk_mul(term_const(big_mul(big, from_int(2))), tlk_n()))
+
+// -- through programs -------------------------------------------------------------------------------
+
+private tlk_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end tlk_skip
+
+// What the program PRINTS, or what the build had to say about it. `files` are (path, text) beside
+// `main.sysl`.
+private tlk_ran(main: string, files: []const (string, string) = []) -> string
+    val root = make_temp_dir("sysl-tlk").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    // Each file sits one directory down: `util/util.sysl`.
+    for f in files
+        val slash = f.0.index_of("/").unwrap()
+
+        make_dir_all(root + "/" + f.0[0..<slash]).unwrap()
+        write_text(root + "/" + f.0, f.1).unwrap()
+    end for
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tlk_ran
+
+private tlk_said(said: string, message: string)
+    assert(said.index_of(s"error: $message").is_some(), s"expected 'error: $message', got: $said")
+
+private tlk_buf() -> string = "struct Buf[const N: usize]\n    used: usize\n\n    room(self) -> usize = N - self.used\n"
+
+@test("the ring's identities hold at a definition and each instance computes its own (p12)")
+tlk_ring_through_a_body()
+    if tlk_skip() then return
+
+    assert_eq(tlk_ran(tlk_buf() + raw"""
+        struct W[const N: usize]
+            inner: Buf[N + 1]
+        comm[const N: usize, const M: usize]() -> usize
+            val a: Buf[N + M] = Buf[M + N](1)
+            val b: Buf[N * (M + 1)] = Buf[N * M + N](2)
+            val c: Buf[(2 * N + 4) / 2] = Buf[N + 2](3)
+            val d: Buf[(N + 1) * (N - 1) + 1 + N - N * N] = Buf[N](4)
+            a.used + b.used + c.used + d.used
+        val w = W[2](Buf(0))
+        print(w.inner.room())
+        print(comm[2, 3]())
+        """), "3\n10\n")
+
+@test("an inexact division is refused as written, its parentheses kept (p14)")
+tlk_inexact_division_text()
+    if tlk_skip() then return
+
+    tlk_said(tlk_ran(tlk_buf() + raw"""
+        odd[const N: usize]() -> usize
+            val a: Buf[(2 * N + 3) / 2] = Buf[N + 1](1)
+            a.used
+        print(odd[2]())
+        """), "cannot initialize 'a': declared Buf[(2 * N + 3) / 2] but the value is Buf[N + 1] — 'N + 1' and " +
+           "'(2 * N + 3) / 2' are not the same value for every N")
+
+    tlk_said(tlk_ran(tlk_buf() + raw"""
+        odd[const N: usize]() -> usize
+            val a: Buf[N] = Buf[(N + 1) % 3 * 2](1)
+            a.used
+        print(1)
+        """), "cannot initialize 'a': declared Buf[N] but the value is Buf[2 * ((N + 1) % 3)] — " +
+           "'2 * ((N + 1) % 3)' and 'N' are not the same value for every N")
+
+@test("a comparison folds to its truth, and one that does not fold is a bool argument of its own")
+tlk_comparison_through_a_body()
+    if tlk_skip() then return
+
+    assert_eq(tlk_ran(raw"""
+        struct Flag[const B: bool]
+            v: int
+        check[const N: usize]() -> int
+            val f: Flag[true] = Flag[N + 1 > N](1)
+            val g: Flag[N > 3] = Flag[N > 3](2)
+            f.v + g.v
+        print(check[5]())
+        """), "3\n")
+
+    tlk_said(tlk_ran(raw"""
+        struct Flag[const B: bool]
+            v: int
+        check[const N: usize]() -> int
+            val g: Flag[false] = Flag[N > 3](2)
+            g.v
+        print(1)
+        """), "cannot initialize 'g': declared Flag[false] but the value is Flag[N > 3] — 'N > 3' stands for")
+
+@test("N9: a const call is one atom however it is named, and two functions are two")
+tlk_call_through_modules()
+    if tlk_skip() then return
+
+    val util = [("util/util.sysl", "module util\n\nconst double(n: usize) -> usize = n * 2\n" +
+                                   "const triple(n: usize) -> usize = n * 3\n")]
+
+    assert_eq(tlk_ran("import util.double\nimport util\n" + tlk_buf() + raw"""
+        twice[const N: usize]() -> usize
+            val a: Buf[double(N) + 1] = Buf[1 + util.double(N)](5)
+            a.room()
+        print(twice[3]())
+        """, util), "2\n")
+
+    tlk_said(tlk_ran("import util.{double, triple}\n" + tlk_buf() + raw"""
+        twice[const N: usize]() -> usize
+            val a: Buf[double(N)] = Buf[triple(N)](5)
+            a.used
+        print(1)
+        """, util), "cannot initialize 'a': declared Buf[double(N)] but the value is Buf[triple(N)] — " +
+           "'triple(N)' and 'double(N)' are not the same value for every N")
+
+@test("N10: an argument past the cap is refused where it is written, called or not")
+tlk_cap_through_a_body()
+    if tlk_skip() then return
+
+    val said = tlk_ran(tlk_buf() + raw"""
+        big[const A: usize, const B: usize, const C: usize, const D: usize, const E: usize, const F: usize, const G: usize]() -> usize
+            val x: Buf[(A + 1) * (B + 1) * (C + 1) * (D + 1) * (E + 1) * (F + 1) * (G + 1)] = Buf(1)
+            x.used
+        print(1)
+        """)
+
+    tlk_said(said, "the type argument '(A + 1) * (B + 1) * (C + 1) * (D + 1) * (E + 1) * (F + 1) * (G + 1)' is " +
+             "too large to compare (over 64 terms)")
+
+    tlk_said(tlk_ran(tlk_buf() + raw"""
+        deep[const N: usize]() -> usize
+            val x: Buf[N * N * N * N * N * N * N * N * N] = Buf(1)
+            x.used
+        print(1)
+        """), "the type argument 'N * N * N * N * N * N * N * N * N' is too large to compare (of degree over 8)")
+
+    // At the cap, nothing is said.
+    assert_eq(tlk_ran(tlk_buf() + raw"""
+        deep[const N: usize]() -> usize
+            val x: Buf[N * N * N * N * N * N * N * N] = Buf[N * N * N * N * N * N * N * N](1)
+            x.used
+        print(deep[1]())
+        """), "1\n")
+
+@test("N11: a member's own value parameter is not its block's, however both are named")
+tlk_member_and_block_parameters()
+    if tlk_skip() then return
+
+    val member = tlk_ran(tlk_buf() + raw"""
+        impl[const N: usize] Buf[N]
+            other[const M: usize](self, b: Buf[M]) -> Buf[N] = b
+        print(1)
+        """)
+
+    tlk_said(member, "function 'Buf.other' should return Buf[N], but its body yields Buf[M] — 'M' and 'N' are " +
+             "different value parameters")
+
+    val nested = tlk_ran(tlk_buf() + raw"""
+        outer[const N: usize]() -> usize
+            inner[const M: usize](b: Buf[M]) -> Buf[N] = b
+            1
+        print(1)
+        """)
+
+    assert(nested.index_of("but its body yields Buf[M] — 'M' and 'N' are different value parameters").is_some(),
+           nested)
+
+// -- what §2 of the design says today (p01-p11): TL2 and TL3 change these ------------------------------
+
+@test("p01-p07: computing in a signature, a field's length or a body's length is still refused")
+tlk_signature_computation_refused()
+    if tlk_skip() then return
+
+    tlk_said(tlk_ran("f[const N: usize](xs: [N]int) -> [N + 1]int = xs\n\nprint(1)\n"),
+             "the length 'N + 1' computes with the value parameter 'N'")
+    tlk_said(tlk_ran("struct S[const N: usize]\n    data: [N * 2]int\n\nprint(1)\n"),
+             "the length 'N * 2' computes with the value parameter 'N'")
+    tlk_said(tlk_ran(tlk_buf() + "grow[const N: usize](b: Buf[N]) -> Buf[N + 1] = Buf(b.used)\nprint(1)\n"),
+             "the value argument 'N + 1' computes with the value parameter 'N'")
+    tlk_said(tlk_ran("twice[const N: usize]() -> usize\n    var r: [N + N]int = [0; N + N]\n    r.len\n\n" +
+                     "print(twice[3]())\n"), "the length 'N + N' computes with the value parameter 'N'")
+    tlk_said(tlk_ran(raw"""
+        struct Q[const L: i8, const T: i8]
+            v: real
+        impl[const L1: i8, const T1: i8] Q[L1, T1]
+            per[const L2: i8, const T2: i8](self, o: Q[L2, T2]) -> Q[L1 - L2, T1 - T2] = Q(self.v / o.v)
+        print(1)
+        """), "the value argument 'L1 - L2' computes with the value parameter 'L1'")
+    tlk_said(tlk_ran(raw"""
+        struct Q[const L: i8, const T: i8]
+            v: real
+        impl[const L1: i8, const T1: i8, const L2: i8, const T2: i8] Div[Q[L2, T2], Q[L1, T1]] for Q[L1, T1]
+            div(self, o: Q[L2, T2]) -> Q[L1, T1] = Q(self.v / o.v)
+        print(1)
+        """), "'L2', 'T2' is declared by this 'impl' but does not appear in 'Q[L1, T1]', so nothing would ever fix it")
+    tlk_said(tlk_ran(tlk_buf() + "shrink[const N: usize](b: Buf[N + 1]) -> usize = N\nprint(shrink(Buf[4](0)))\n"),
+             "the value argument 'N + 1' computes with the value parameter 'N'")
+
+@test("p08-p11: cast and wrong are refused at the declaration; @assert and a value bound as before")
+tlk_definition_refusals()
+    if tlk_skip() then return
+
+    tlk_said(tlk_ran(tlk_buf() + "cast[const N: usize, const M: usize](b: Buf[N]) -> Buf[M] = b\nprint(1)\n"),
+             "function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' are different " +
+             "value parameters")
+    tlk_said(tlk_ran(tlk_buf() + "wrong[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)\nprint(1)\n"),
+             "function 'wrong' should return Buf[N], but its body yields Buf[N + 1] — the two differ by 1 for every N")
+    tlk_said(tlk_ran("struct Ring[const N: usize]\n    @assert(N > 0)\n    used: usize\n\nprint(1)\n"),
+             "'@assert' stands where a declaration stands")
+    tlk_said(tlk_ran("sum[const N: usize](xs: [N]int) -> int where N: Display = 0\n\nprint(1)\n"),
+             "'N' stands for a value rather than a type, and a value implements no trait")
+
+@test("p13: min is not yet a function a type position may call")
+tlk_min_not_callable()
+    if tlk_skip() then return
+
+    tlk_said(tlk_ran(tlk_buf() + raw"""
+        mm[const N: usize, const M: usize]() -> usize
+            val a: Buf[min(N, M)] = Buf[min(M, N)](1)
+            a.used
+        print(mm[2, 3]())
+        """), "undefined function 'min'")

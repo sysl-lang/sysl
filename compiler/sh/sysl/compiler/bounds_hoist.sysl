@@ -53,58 +53,91 @@ struct HoistSub
     signed: bool
 
 // What a walk over a candidate body found: its subscripts, as receiver and index, whether anything in
-// it rules a copy out, and how many expressions it holds.
+// it rules a copy out and the first thing that did, and how many expressions it holds.
 private struct HoistScan
     subs: Buf[(TExpr, TExpr)]
     refused: bool
+    why: string
     nodes: int
 
-private hoist_scan() -> &HoistScan = HoistScan(buf(), false, 0)
+private hoist_scan() -> &HoistScan = HoistScan(buf(), false, "", 0)
+
+// Rules the copy out, keeping the first reason, which `--explain-checks` gives.
+private hoist_refuse(s: &HoistScan, why: string)
+    if !s.refused then s.why = why
+
+    s.refused = true
+end hoist_refuse
 
 private hoist_on_expr(s: &HoistScan, x: TExpr)
     s.nodes += 1
 
     *x.kind match
         TIndex(receiver, index, _) -> s.subs.push((receiver, index))
-        TFor(_, _, _, _, _, _, _, _) -> s.refused = true
-        TWhile(_, _, _, _) -> s.refused = true
-        TDoWhile(_, _, _, _) -> s.refused = true
-        TLoop(_, _) -> s.refused = true
-        TCFor(_, _, _, _, _, _) -> s.refused = true
-        TForEach(_, _, _, _, _, _) -> s.refused = true
-        TIterate(_, _, _, _, _, _, _, _) -> s.refused = true
-        TCheckedLoop(_, _, _) -> s.refused = true
-        TTry(_, _, _, _, _, _, _) -> s.refused = true
-        TAwait(_, _) -> s.refused = true
-        TBlockOn(_, _) -> s.refused = true
-        TYieldNow -> s.refused = true
-        TStep(_, _) -> s.refused = true
-        TPark(_) -> s.refused = true
+        TFor(_, _, _, _, _, _, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TWhile(_, _, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TDoWhile(_, _, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TLoop(_, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TCFor(_, _, _, _, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TForEach(_, _, _, _, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TIterate(_, _, _, _, _, _, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TCheckedLoop(_, _, _) -> hoist_refuse(s, "its body holds a loop of its own")
+        TTry(_, _, _, _, _, _, _) -> hoist_refuse(s, "its body can leave the function through '?'")
+        TAwait(_, _) -> hoist_refuse(s, "its body can suspend")
+        TBlockOn(_, _) -> hoist_refuse(s, "its body can suspend")
+        TYieldNow -> hoist_refuse(s, "its body can suspend")
+        TStep(_, _) -> hoist_refuse(s, "its body can suspend")
+        TPark(_) -> hoist_refuse(s, "its body can suspend")
         _ -> ()
 end hoist_on_expr
 
 private hoist_on_stmt(s: &HoistScan, st: TStmt)
     st match
-        TReturn(_) -> s.refused = true
-        TBecome(_) -> s.refused = true
-        TDefer(_, _) -> s.refused = true
-        TAsm(_, _, _, _) -> s.refused = true
-        TRefDecl(_, _, _) -> s.refused = true
+        TReturn(_) -> hoist_refuse(s, "its body can return")
+        TBecome(_) -> hoist_refuse(s, "its body can leave the function through 'become'")
+        TDefer(_, _) -> hoist_refuse(s, "its body defers a statement")
+        TAsm(_, _, _, _) -> hoist_refuse(s, "its body holds inline assembly")
+        TRefDecl(_, _, _) -> hoist_refuse(s, "its body declares a 'ref'")
         _ -> ()
 end hoist_on_stmt
 
 // The subscripts of a counted loop's body that a test in front of it can prove, or none where the
-// body is not one to copy or holds nothing worth copying it for.
+// body is not one to copy or holds nothing worth copying it for. **Each refusal says why**, to the
+// loop `--explain-checks` is recording (`explain_checks.sysl`), which costs nothing unasked.
 hoist_plan(e: *Emit, name: string, var_ty: Type, hi: TExpr, inclusive: bool,
            body: Buf[TStmt]) -> Option[Buf[HoistSub]]
-    if !e.nowrap.ready || e.coro.is_some() then return None
-    if !nowrap_untouched(e, name, body) then return None
+    if !e.nowrap.ready
+        hoist_refused("it is in a body the hoist does not read")
+        return None
+    end if
+
+    if e.coro.is_some()
+        hoist_refused("an 'async' body is never copied")
+        return None
+    end if
+
+    if !nowrap_untouched(e, name, body)
+        if check_ledger_armed() then hoist_refused(s"its body writes '$name' or takes its address")
+        return None
+    end if
 
     val s = hoist_scan()
 
     walk_stmts(body, TWalk(true, x -> hoist_on_expr(s, x), w -> (), st -> hoist_on_stmt(s, st)))
 
-    if s.refused || s.nodes > HoistBodyLimit || s.subs.is_empty() then return None
+    if s.refused
+        hoist_refused(s.why)
+        return None
+    end if
+
+    if s.nodes > HoistBodyLimit
+        if check_ledger_armed()
+            hoist_refused(s"its body has ${s.nodes} expressions, more than the $HoistBodyLimit worth a " +
+                          "second copy")
+        return None
+    end if
+
+    if s.subs.is_empty() then return None
 
     var found: Buf[HoistSub] = buf()
     var worth = false
@@ -119,7 +152,15 @@ hoist_plan(e: *Emit, name: string, var_ty: Type, hi: TExpr, inclusive: bool,
                 found.push(h)
             None -> ()
 
-    if !worth then None else Some(found)
+    if found.is_empty() then return None
+
+    if !worth
+        hoist_refused("every subscript it could prove is one the loop's own condition proves, so " +
+                      "nothing was copied")
+        return None
+    end if
+
+    Some(found)
 end hoist_plan
 
 // A subscript the test can prove, or none.
@@ -131,15 +172,36 @@ private hoist_sub(e: *Emit, name: string, receiver: TExpr, index: TExpr,
         Integer(b, sg, _) -> (b, sg)
         _ -> return None
 
-    if bits > e.word_bits then return None
+    if bits > e.word_bits
+        hoist_sub_refused(index, "its index is wider than a word")
+        return None
+    end if
 
     nameless(texpr_type(receiver)) match
         Array(_, _, _) -> ()
-        Slice(_, _) -> if !hoist_steady_view(e, receiver, body) then return None
-        _ -> return None
+        Slice(_, _) ->
+            if !hoist_steady_view(e, receiver, body)
+                hoist_sub_refused(index, "the view it indexes is not held by a local the loop leaves alone")
+                return None
+        _ ->
+            hoist_sub_refused(index, "it indexes neither an array nor a view")
+            return None
 
-    if !hoist_affine(e, name, index, bits, signed, body) then return None
-    if hoist_uses(index, name) > 1 || hoist_terms(index) > HoistTerms then return None
+    if !hoist_affine(e, name, index, bits, signed, body)
+        hoist_sub_refused(index, "its index is not built with '+' and '-' from the loop's variable, " +
+                          "literals, locals the loop leaves alone and the lengths of views it leaves alone")
+        return None
+    end if
+
+    if hoist_uses(index, name) > 1
+        hoist_sub_refused(index, "its index reads the loop's variable more than once")
+        return None
+    end if
+
+    if hoist_terms(index) > HoistTerms
+        hoist_sub_refused(index, "its index has more terms than the test works out")
+        return None
+    end if
 
     Some(HoistSub(index, receiver, bits, signed))
 end hoist_sub

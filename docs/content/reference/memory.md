@@ -865,7 +865,7 @@ run(c: bool)
 ```
 
 **A local holding a copy of the parameter is followed along the same ways.** Written over with
-something else on every way to where it is stored or its address handed over, it no longer holds the
+something else on every way to where it is stored, answered or its address handed over, it no longer holds the
 parameter there; written over on only some — an `if` without an `else`, a loop body that may not run,
 one `match` arm, a `break` or `continue` past the store — it still does. Only a store of the whole
 local counts as writing it over: a store through a pointer to it, or in a closure's body, does not;
@@ -911,6 +911,32 @@ run()
 
 ```error
 'note' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
+```
+
+The same holds of an answer ([below](#handing-it-back-is-not-keeping-it)): a copy written over on every
+way to a `return` or to the body's result is not what the function hands back there.
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+pick(p: *int) -> *int
+    var q = p
+    print(*q)
+    q = &spare
+    q
+
+run()
+    var n = 41
+    held = pick(&n)
+
+run()
+print(*held)
+```
+
+```output
+41
+0
 ```
 
 ### Handing it back is not keeping it
@@ -983,6 +1009,68 @@ function's pointer answer is taken to be made of its pointer arguments that coul
 at — one to the same type or to a struct holding it, and bytes from bytes, as `strchr`'s is — and not
 of an out-parameter of another type, so a handle a library allocated is not made of the `*i32` it
 reported an error code through.
+
+**An object behind a trait holds an address only where some type the program makes one of does.** A
+program's build sees every type erased to each trait, so a `&Shape` whose every implementation holds
+only numbers and counted references is as plain as they are, wherever it sits — the answer itself, a
+field, an `Option`, a `weak Shape` — and a closure handed a local's address may answer one:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    s: int
+
+impl Shape for Sq
+    area(self) -> int = self.s
+
+through(f: &Fn(*int) -> &Shape) -> &Shape
+    var x = 3
+    f(&x)
+
+main()
+    print(through((p) -> Sq(*p)).area())
+```
+
+```output
+3
+```
+
+One implementation that can hold the address — a `*int` field, a closure, an object of a trait that
+can — makes every object of the trait able to; a generic trait is asked at its own arguments. A closure
+behind a `&Fn` may hold anything, and so may every object in a build that does not see every table —
+`build-lib`, and `build-c`, whose C half can be handed an object made where the build cannot look:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    s: int
+
+impl Shape for Sq
+    area(self) -> int = self.s
+
+struct Pt
+    p: *int
+
+impl Shape for Pt
+    area(self) -> int = *self.p
+
+through(f: &Fn(*int) -> &Shape) -> &Shape
+    var x = 3
+    f(&x)
+
+main()
+    var y = 1
+    val a: &Shape = Pt(&y)
+    print(through((p) -> Sq(*p)).area() + a.area())
+```
+
+```error
+'f' is returned, but it holds the address of a local of 'through'
+```
 
 #### An address as an integer leaves the analysis
 
@@ -1404,13 +1492,21 @@ frame is laid in the frame**, not on the heap: the header and the payload a heap
 same way, in a slot of the frame. The destructor still runs when the last count goes, at the end of
 the scope as before; only the allocation is gone. A **factory** — a function whose answer is a box it
 built and kept nowhere else — lays that box in its caller's frame wherever the caller keeps it no
-longer than itself:
+longer than itself. So does a function whose answer is the box **another factory's call** answers it,
+kept nowhere else: `counter_plus` below hands its caller's slot on to `counter`, however deep the
+chain.
 
 ```sysl
 struct Counter
     n: int
 
 counter(start: int) -> &Counter = Counter(start)
+
+counter_plus(start: int) -> &Counter
+    val c = counter(start)
+
+    c.n += 1
+    c
 
 struct Res
     n: int
@@ -1425,6 +1521,7 @@ main()
 
     c.n += 2
     print(c.n)
+    print(counter_plus(1).n)
 
     val r: &Res = Res(1)
 
@@ -1434,12 +1531,13 @@ main()
 
 ```output
 7
+2
 1
 end
 closed 1
 ```
 
-Neither box above touches the heap. **A box stays on the heap wherever it may get out**: stored
+None of the boxes above touches the heap. **A box stays on the heap wherever it may get out**: stored
 anywhere but a local of the frame (module storage, a field reached through a reference or a pointer,
 a buffer, another box), returned other than as a factory's answer, captured by a closure, handed to a
 parameter whose body may let it out or answer it into something that does, weakened, given up with
@@ -4039,6 +4137,10 @@ wait_for(n: u64)
   convert on arrival) and a data enum are refused; a simple enum and a bitfield (a read-modify-write of
   its container, see [`@packed`](/reference/attributes/)) are admitted. A struct holding a register
   carries no `invariant`.
+- **A qualified field is on its type's boundary**: one a `@packed` struct places at an offset that is
+  not a multiple of its type's alignment on the target (`tag: u8, word: volatile u32`) is refused where
+  it is selected, since its one access would be off the boundary — the rule and its exact definition
+  are in [`@packed`](/reference/attributes/).
 - **What the compiler does**: `load volatile` / `store volatile`, with no runtime cost. A qualified
   field is reached at its own address, never lifted out of the block; copying a whole block is an
   access to every register in it; `&regs.status` is a `*volatile u32`; a type parameter never binds a

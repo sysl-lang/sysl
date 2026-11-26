@@ -21,8 +21,17 @@ enum {
     SYSL_FS_OPEN_CREATE = 4,
     SYSL_FS_OPEN_TRUNCATE = 8,
     SYSL_FS_OPEN_APPEND = 16,
-    SYSL_FS_OPEN_UNCACHED = 32
+    SYSL_FS_OPEN_UNCACHED = 32,
+    SYSL_FS_OPEN_EXCLUSIVE = 64,
+    SYSL_FS_OPEN_SYNC = 128,
+    SYSL_FS_OPEN_DSYNC = 256,
+    SYSL_FS_OPEN_NOFOLLOW = 512
 };
+
+// A C library with no `O_DSYNC` gets `O_SYNC`, which promises everything `O_DSYNC` does and more.
+#if !defined(O_DSYNC) && defined(O_SYNC)
+#define O_DSYNC O_SYNC
+#endif
 
 // glibc shows `O_DIRECT` only to `_GNU_SOURCE`, under its own name `__O_DIRECT` otherwise.
 #if defined(__linux__) && !defined(O_DIRECT) && defined(__O_DIRECT)
@@ -44,6 +53,16 @@ static int sysl_fs_host_how(unsigned flags) {
 #ifdef O_DIRECT
     if (flags & SYSL_FS_OPEN_UNCACHED) how |= O_DIRECT;
 #endif
+    if (flags & SYSL_FS_OPEN_EXCLUSIVE) how |= O_EXCL;
+#ifdef O_SYNC
+    if (flags & SYSL_FS_OPEN_SYNC) how |= O_SYNC;
+#endif
+#ifdef O_DSYNC
+    if (flags & SYSL_FS_OPEN_DSYNC) how |= O_DSYNC;
+#endif
+#ifdef O_NOFOLLOW
+    if (flags & SYSL_FS_OPEN_NOFOLLOW) how |= O_NOFOLLOW;
+#endif
 
     return how;
 }
@@ -53,10 +72,26 @@ static int sysl_fs_host_how(unsigned flags) {
 // An uncached open is `O_DIRECT` where the C library has it (Linux). Darwin has no such flag: the
 // same effect is `fcntl(F_NOCACHE)` on the descriptor afterwards. A C library with neither refuses
 // the open with `ENOTSUP` rather than quietly handing back a cached file.
+//
+// A flag this C library has no `O_*` for is refused the same way, with `ENOSYS` ("not supported on
+// this target"), never an open that quietly drops it: a program asking not to follow a link, or for
+// its writes to be durable, must not be handed a file that does neither.
 int sysl_fs_host_open(const char *path, unsigned flags, unsigned mode) {
 #if !defined(O_DIRECT) && !defined(F_NOCACHE)
     if (flags & SYSL_FS_OPEN_UNCACHED) {
         errno = ENOTSUP;
+        return -1;
+    }
+#endif
+#if !defined(O_SYNC)
+    if (flags & (SYSL_FS_OPEN_SYNC | SYSL_FS_OPEN_DSYNC)) {
+        errno = ENOSYS;
+        return -1;
+    }
+#endif
+#if !defined(O_NOFOLLOW)
+    if (flags & SYSL_FS_OPEN_NOFOLLOW) {
+        errno = ENOSYS;
         return -1;
     }
 #endif
@@ -356,6 +391,45 @@ int sysl_fs_host_unlink_beneath(int dir, char *rel) {
     return rc;
 #else
     (void) dir; (void) rel;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+// -- a rename that never replaces -------------------------------------------------------------------
+//
+// `from` moved to `to` only where nothing is at `to`, the check and the move one operation in the
+// kernel (`EEXIST` where something is there):
+//
+// - **Darwin**: `renamex_np` with `RENAME_EXCL` (macOS 10.12). It keeps `rename(2)`'s rule that two
+//   names of ONE file -- the same path twice, or two hard links -- is success with nothing done, where
+//   Linux answers `EEXIST` because something is at the destination. The two are made to agree on
+//   Linux's answer: names that `lstat` finds to be one file are `EEXIST` before the call. Between that
+//   check and the call nothing can be replaced; the most a race can do is turn a rename that would
+//   have done nothing into a refusal.
+// - **Linux**: `renameat2` with `RENAME_NOREPLACE` (3.15), as the raw system call because glibc
+//   declares its wrapper only to `_GNU_SOURCE` and only from 2.28. A filesystem that cannot do it
+//   answers `EINVAL`; a kernel without the call answers `ENOSYS`.
+// - **Anything else** answers `ENOSYS` -- never a check followed by a plain `rename`, which is a race
+//   that replaces what appears between the two.
+
+#if defined(__APPLE__)
+#include <stdio.h>
+#endif
+
+int sysl_fs_host_rename_no_replace(const char *from, const char *to) {
+#if defined(__APPLE__) && defined(RENAME_EXCL)
+    struct stat a, b;
+
+    if (lstat(from, &a) == 0 && lstat(to, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
+        errno = EEXIST;
+        return -1;
+    }
+    return renamex_np(from, to, RENAME_EXCL);
+#elif defined(__linux__) && defined(SYS_renameat2)
+    return (int) syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, 1 /* RENAME_NOREPLACE */);
+#else
+    (void) from; (void) to;
     errno = ENOSYS;
     return -1;
 #endif

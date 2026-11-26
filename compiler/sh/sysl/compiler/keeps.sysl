@@ -2418,7 +2418,7 @@ struct Track
     endless: bool
 
     // **The locals whose copy of what is tracked every way to the piece being asked has overwritten**
-    // (`keeps_flow.sysl`'s `copies_gone`), set by the walk of the body's ways (`walk_track`) and empty
+    // (`keeps_flow.sysl`'s `copies_gone`), set by the walk of the body's ways (`walk_track`, `answered`) and empty
     // anywhere else. Such a local holds nothing tracked there, whatever it held before.
     gone: Buf[string]
 
@@ -2824,16 +2824,85 @@ end clear_store
 // Whether what `f` answers can be made of its parameter at `i`.
 private walk_answers(cx: &KeepsCx, f: TFunc, i: usize, raw: bool) -> KeptWhy = answered(track(cx, f, i, raw), f)
 
+// **What a body answers is asked along its ways** where a local holds a copy of what is tracked: an
+// answer made of a copy every way to it has overwritten -- `var b = a`, `b = &spare`, then `b` -- is not
+// made of what is tracked. The answers are each `return`'s value and each leaf of the body's result (an
+// arm of an `if` or a `match`, a block's result, a sequence's last), each asked as the walk of the body's
+// ways reaches it as a piece of its own. One it never reaches so -- inside a larger piece, in a loop's
+// value, after a way out -- is asked with no copy overwritten.
 private answered(t: &Track, f: TFunc) -> KeptWhy
+    val ans: &Answers = Answers(buf(), buf())
+
     walk_block_stmts(f.body, stmt_walk(false, s -> s match
-        TReturn(v) -> if v.is_some() && carries(t, v.unwrap()) then keep(t, "", v.unwrap().span)
+        TReturn(v) -> if v.is_some() then ans.items.push(v.unwrap())
         _ -> ()))
 
-    if f.body.result.is_some() && carries(t, f.body.result.unwrap())
-        keep(t, "", f.body.result.unwrap().span)
+    if f.body.result.is_some() then answer_leaves(f.body.result.unwrap(), ans)
+
+    t.copies = copy_locals(t)
+
+    if !t.copies.is_empty()
+        val w = flow_walk(t.org, s -> track_stmt_events(t, s), e -> answer_events(t, ans, e),
+                          (x, p, matched) -> arm_clears(t.hs, x, p, matched))
+
+        w.sees = st -> t.gone = copies_gone(st.cleared)
+        flow_body(w, f.body)
+        t.gone = buf()
+    end if
+
+    for x in ans.items
+        if !holds_node(ans.seen, node_id(x)) && carries(t, x) then keep(t, "", x.span)
 
     t.why
 end answered
+
+// What a body answers (`answered`), and the ones the walk of its ways has asked.
+private struct Answers
+    items: Buf[TExpr]
+    seen: Buf[usize]
+
+// The leaves of an answer the walk of the body's ways reaches as pieces of their own, as `carries`
+// takes them apart.
+private answer_leaves(e: TExpr, out: &Answers)
+    *e.kind match
+        TIf(_, then_block, else_block, _) ->
+            block_leaves(then_block, out)
+
+            if else_block.is_some() then block_leaves(else_block.unwrap(), out)
+        TMatch(_, arms, _) ->
+            for arm in arms
+                block_leaves(arm.body, out)
+        TBlockExpr(b) -> block_leaves(b, out)
+        TSeq(exprs) -> if !exprs.is_empty() then answer_leaves(exprs[exprs.len() - 1], out)
+        _ -> out.items.push(e)
+end answer_leaves
+
+private block_leaves(b: TBlock, out: &Answers) = if b.result.is_some() then answer_leaves(b.result.unwrap(), out)
+
+// What a piece does, and, where it is an answer, whether it is made of what is tracked on this way --
+// asked after the piece's own put-backs (`rebinds`) are taken out of the copies overwritten.
+private answer_events(t: &Track, ans: &Answers, e: TExpr) -> Buf[FlowEv]
+    val evs = track_expr_events(t, e)
+    val id = node_id(e)
+
+    for x in ans.items
+        if node_id(x) == id
+            ans.seen.push(id)
+
+            if carries(t, e) then keep(t, "", e.span)
+
+            break
+        end if
+
+    evs
+end answer_events
+
+private holds_node(ids: Buf[usize], id: usize) -> bool
+    for x in ids
+        if x == id then return true
+
+    false
+end holds_node
 
 private keep(t: &Track, how: string, at: Span)
     if !t.why.kept then t.why = KeptWhy(true, how, at, buf())
@@ -3788,8 +3857,16 @@ private rebinds(t: &Track, walk: &Fn(&TWalk) -> unit, evs: &EvBuf)
     walk(TWalk(false, e -> bind_expr(t, e), w -> bind_store(t, w.place, w.value), s -> bind_stmt(t, s)))
     t.noting = false
 
-    for n in t.noted
-        if holds_string(t.gone, n) then evs.items.push(copy_back_ev(n, span_zero()))
+    var still: Buf[string] = buf()
+
+    for n in t.gone
+        if holds_string(t.noted, n) then evs.items.push(copy_back_ev(n, span_zero()))
+        else still.push(n)
+
+    // **A copy the piece puts back holds what is tracked in the rest of the piece as well**: `same(c
+    // match { true -> { b = a; b }, false -> b })` answers it, though the way to the piece had
+    // overwritten it.
+    t.gone = still
 end rebinds
 
 // **A whole store into a copy of something not tracked overwrites the copy** -- not a field of it,
@@ -4313,18 +4390,23 @@ private loop_carries(t: &Track, body: Buf[TStmt], else_block: Option[TBlock]) ->
 end loop_carries
 
 // Whether a value of this type can hold a raw pointer, through a box as well as in place: a box of a
-// struct that holds one holds it too, and an object behind a trait -- a closure behind a `&Fn` among
-// them -- may hold anything, its type saying nothing of what it captured.
+// struct that holds one holds it too. **An object behind a trait holds one where some type the
+// program erases to that trait does** (`object_holds`): a whole program's build sees every table
+// (`Analysis.closed`), so every value an object can stand for is the type of one of them, and an
+// object whose every implementation holds only counted references and numbers is as plain as a `&T`
+// of one of them. A closure behind a `&Fn` may hold anything, its type saying nothing of what it
+// captured, and so may any object in a build that does not see every table -- a library, or C's
+// half of a program, which may be handed an object made where it cannot look.
 //
-// Asked of nearly every value a body passes around, so a struct's or an enum's answer is worked out
-// once per compilation.
+// Asked of nearly every value a body passes around, so a struct's, an enum's or a trait's answer is
+// worked out once per compilation.
 //
 // **A pointer to an `opaque struct` is a handle, never an address of anybody's frame**: a type with
 // no layout cannot be a local, a field or an element, so the storage it points at is C's. Making one
 // out of a local's address takes a `ptr_cast`, which is unchecked.
 may_hold_pointer(cx: &KeepsCx, t: Type) -> bool = t match
     Ptr(inner, _) -> !is_opaque_struct(*inner)
-    Trait(_, _, _) -> true
+    Trait(name, _, _) -> !cx.an.closed || fn_is_call(name) || aggregate_holds(cx, t, s"trait ${type_show(t)}")
     Ref(inner, _) -> may_hold_pointer(cx, *inner)
     Weak(inner) -> may_hold_pointer(cx, *inner)
     Volatile(inner) -> may_hold_pointer(cx, *inner)
@@ -4340,31 +4422,42 @@ private aggregate_holds(cx: &KeepsCx, t: Type, key: string) -> bool
         None -> ()
 
     var seen: Buf[string] = buf()
-    val out = holds_pointer_within(t, &seen)
+    val out = holds_pointer_within(cx, t, &seen)
 
     cx.pointerish.put(key, out)
     out
 end aggregate_holds
 
-// The same, with the structs and enums already being asked about, which a type reaching itself
-// through a box answers nothing new for.
-private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
+// The same, with the structs, enums and traits already being asked about, which a type reaching
+// itself through a box answers nothing new for.
+private holds_pointer_within(cx: &KeepsCx, t: Type, seen: *Buf[string]) -> bool = t match
     Ptr(inner, _) -> !is_opaque_struct(*inner)
-    Trait(_, _, _) -> true
-    Ref(inner, _) -> holds_pointer_within(*inner, seen)
-    Weak(inner) -> holds_pointer_within(*inner, seen)
-    Volatile(inner) -> holds_pointer_within(*inner, seen)
-    Array(_, elem, _) -> holds_pointer_within(*elem, seen)
-    Slice(elem, _) -> holds_pointer_within(*elem, seen)
+    Trait(name, _, _) -> !cx.an.closed || fn_is_call(name) || (first_visit(t, seen) && object_holds(cx, t, seen))
+    Ref(inner, _) -> holds_pointer_within(cx, *inner, seen)
+    Weak(inner) -> holds_pointer_within(cx, *inner, seen)
+    Volatile(inner) -> holds_pointer_within(cx, *inner, seen)
+    Array(_, elem, _) -> holds_pointer_within(cx, *elem, seen)
+    Slice(elem, _) -> holds_pointer_within(cx, *elem, seen)
     // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
     // and whether it does is what this analysis is asked to decide -- so its value is followed
     // wherever it goes, whatever its fields say before the decision.
     Struct(d) -> frozen_element(t) match
-        Some(elem) -> holds_pointer_within(elem, seen)
+        Some(elem) -> holds_pointer_within(cx, elem, seen)
         None -> (is_closure_literal(t) && !d.fields.is_empty()) ||
-            (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
-    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
+            (first_visit(t, seen) && fields_hold_pointer(cx, d.fields, seen))
+    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(cx, d.variants, seen)
     _ -> false
+
+// **Whether an object of the trait type `tr` may hold a raw pointer, in a build that sees every
+// table**: an object holds what the value it was made from holds, and every such value's type has a
+// table of the trait in the program (`trait_tables` -- those at the trait's own arguments, or every
+// table of the trait where its arguments name none). A trait no table is built for has no object.
+private object_holds(cx: &KeepsCx, tr: Type, seen: *Buf[string]) -> bool
+    for vt in trait_tables(cx.tables, tr)
+        if holds_pointer_within(cx, vt.for_type, seen) then return true
+
+    false
+end object_holds
 
 private is_opaque_struct(t: Type) -> bool = t match
     Struct(d) -> d.opaque
@@ -4419,16 +4512,16 @@ private first_visit(t: Type, seen: *Buf[string]) -> bool
     true
 end first_visit
 
-private fields_hold_pointer(fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
+private fields_hold_pointer(cx: &KeepsCx, fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
     for item in fields
-        if holds_pointer_within(item.1, seen) then return true
+        if holds_pointer_within(cx, item.1, seen) then return true
 
     false
 end fields_hold_pointer
 
-private variants_hold_pointer(vs: Buf[EnumVariant], seen: *Buf[string]) -> bool
+private variants_hold_pointer(cx: &KeepsCx, vs: Buf[EnumVariant], seen: *Buf[string]) -> bool
     for v in vs
-        if fields_hold_pointer(v.fields, seen) then return true
+        if fields_hold_pointer(cx, v.fields, seen) then return true
 
     false
 end variants_hold_pointer
