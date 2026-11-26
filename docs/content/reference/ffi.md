@@ -499,7 +499,38 @@ error: 't' of the 'extern' 'send' is Tagged, whose field 'mark' is Empty: an emp
 
 and built for any other target it compiles. Give the empty struct a field, or leave it out of the struct C sees. A pointer to such a struct is
 not refused: the pointer is one register on both sides, and what C reads through it is the
-programmer's business, as above.
+programmer's business, as above. A pointer to an empty struct itself is another matter where an
+`@export` hands it to C, since the header then declares the empty struct
+(*A struct's layout in the header*, below).
+
+**A [function pointer](#a-function-s-address-extern-a-b-r) whose signature carries such a struct by
+value is refused on the same target, for the same reason**: a call through a `*extern(A) -> R` is an
+`extern` call, and C calls through one it was handed under its own layout of `A`. The type itself is
+refused, wherever the program mentions it — an `extern`'s parameter, a struct's field, module
+storage, a local, another function pointer's signature — whether or not sysl ever calls through it,
+and once per type. Built for `x86_64-windows`, this
+
+```sysl
+struct Empty
+end Empty
+
+struct Tagged
+    id: i32
+    mark: Empty
+    len: i32
+
+extern on_send(f: *extern(Tagged) -> unit)
+
+on_send(null)
+```
+
+is refused with
+
+```text
+error: parameter 1 of the function pointer type '*extern(Tagged) -> unit' is Tagged, whose field 'mark' is Empty: an empty struct occupies no bytes in sysl and four in Microsoft's C on 'x86_64-windows', so Tagged is laid out differently on the two sides of the call. Give the empty struct a field, or take 'mark' out of Tagged
+```
+
+and built for any other target it compiles. A `*extern(*Tagged) -> unit` is not refused.
 
 **A [vector](/reference/vectors/) is the one shape that does not cross, in either direction.** Which
 register a `<4>f32` arrives in differs by target *and* by which instruction-set extensions the other
@@ -2005,7 +2036,7 @@ The three macros are defined once at the top of a header that needs them: clang 
 `#pragma pack(push, 1)` / `pop` around the definition and `__declspec(align(n))`. A struct holding one
 of these as a field, or an array of them, needs nothing more — its layout follows from the member's.
 
-Three cases need a word each:
+Four cases need a word each:
 
 - **A bitfield struct is the one integer it is stored as**, a `uint8_t` array where that width has no
   C name, under a comment per field saying which bits it holds (`/* b: bits 3..7 */`). It is never a
@@ -2020,6 +2051,21 @@ Three cases need a word each:
   pack that field to one byte, as sysl does; MSVC's layout — clang-cl's included — keeps its
   alignment. The header carries an `#error` for that struct under `_MSC_VER`, so the mismatch stops
   the C build rather than corrupting memory across the boundary.
+- **On Windows x64, the header declares no empty struct C could store.** A field that occupies
+  nothing is left out of its struct's declaration, so a struct holding an empty struct is laid out
+  alike on both sides (`a: i32, e: Empty, b: i32` is `{ int32_t a; int32_t b; }`). But the empty
+  struct's own `typedef struct { } Empty;` is four bytes to Microsoft's C and none to sysl, so C
+  storing one writes over whatever sysl placed after it. Built for `x86_64-windows`, an export taking
+  or answering a pointer that reaches an empty struct — directly, through a field, through a function
+  pointer's parameter, or to an array or union made only of empty structs — and exported storage
+  of one, are refused — `@export("mark") var mark = Empty()` with
+
+  ```text
+  error: the exported storage 'mark' is Empty, which occupies no bytes in sysl and 4 in Microsoft's C on 'x86_64-windows': the header's declaration of Empty gives it a size sysl does not, so C storing one writes over what sysl placed after it. Give the empty struct a field, or keep Empty out of what the header declares
+  ```
+
+  An empty struct by value in an exported signature still crosses in its C slot, a private export is
+  declared in no header, and every other target's C gives an empty struct no bytes either.
 
 ### Naming a type in the header
 

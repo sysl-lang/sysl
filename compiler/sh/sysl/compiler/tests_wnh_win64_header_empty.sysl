@@ -1,0 +1,225 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// **An empty struct the C header declares, other than by value in a signature, is refused on Windows
+// x64**, because Microsoft's C gives the header's `typedef struct { } E;` four bytes and sysl gives E
+// none. Each size below is clang 21's, `clang --target=x86_64-pc-windows-msvc -fsyntax-only` over the
+// header `sysl emit-header --target x86_64-windows` writes, with `_Static_assert`:
+//
+//     typedef struct { } E;   extern E g;      sizeof(E) == 4    (sysl: @g = global %struct.E {  })
+//     g = e;                                   store i32 0, ptr @g   -- four bytes over a zero-byte global
+//
+// A struct HOLDING an empty struct is declared without that field, so it agrees with sysl's layout and
+// is not refused (`struct O { a: i32, e: E, b: i32 }` -> `{ int32_t a; int32_t b; }`, 8 with b at 4
+// on both sides). By value at the top of a signature E crosses in its C slot (`tests_wne_…`).
+
+// Every error a program earns through the checks that run before lowering, on a named machine.
+private wnh_said(text: string, target_name: string) -> string
+    val done = typed_of_target(text, target_named(target_name).unwrap())
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), buf())
+
+    val errors = errors_of(done.an.diagnostics())
+
+    if errors.is_empty() then "" else analysis_report(errors)
+end wnh_said
+
+// `sysl emit-header --target <target>` over a file of only declarations, as the command line answers
+// it: the status, and the header or everything it said. Exported storage is asked this way, since
+// module storage needs a file with no body of its own to be the module's.
+private wnh_emit(text: string, target_name: string) -> (int, string)
+    val root = make_temp_dir("sysl-wnh").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [5]string = ["sysl", "emit-header", "--target", target_name, s"$root/main.sysl"]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var out = ""
+
+    for item in said
+        out = out + item + "\n"
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    (code, out)
+end wnh_emit
+
+// What `wnh_emit` says on Windows x64, which must refuse.
+private wnh_emit_refused(text: string) -> string
+    val got = wnh_emit(text, wnh_win())
+
+    assert(got.0 != 0, got.1)
+    got.1
+end wnh_emit_refused
+
+// The header `wnh_emit` writes, which must be written, on each machine named.
+private wnh_emit_header(text: string, target_name: string) -> string
+    val got = wnh_emit(text, target_name)
+
+    assert_eq(got.0, 0, got.1)
+    got.1
+end wnh_emit_header
+
+private wnh_emit_elsewhere(text: string)
+    for target in ["x86_64-linux", "aarch64-macos", "x86_64-macos"]
+        wnh_emit_header(text, target)
+end wnh_emit_elsewhere
+
+private wnh_has(said: string, part: string) = assert(said.contains(part), said)
+
+private wnh_win() -> string = "x86_64-windows"
+
+private wnh_empty() -> string = "struct E\nend E\n"
+
+// The tail every refusal ends with: `lead` up to the empty aggregate's sizes, then the rest.
+private wnh_reason(lead: string, empty: string, size: int) -> string =
+    s"$lead occupies no bytes in sysl and $size in Microsoft's C on 'x86_64-windows': the header's " +
+    s"declaration of $empty gives it a size sysl does not, so C storing one writes over what sysl " +
+    s"placed after it. Give the empty struct a field, or keep $empty out of what the header declares"
+
+// The same programs on every other convention: an empty struct is no bytes in their C as well.
+private wnh_elsewhere(text: string)
+    for target in ["x86_64-linux", "aarch64-macos", "aarch64-linux", "riscv64-linux", "x86_64-macos"]
+        assert_eq(wnh_said(text, target), "")
+end wnh_elsewhere
+
+@test("an export taking a pointer to an empty struct is refused on Windows x64")
+wnh_pointer_param_refused()
+    val text = s"${wnh_empty()}@export(\"poke\")\npoke(p: *E) -> i32 = 0\n"
+
+    wnh_has(wnh_said(text, wnh_win()),
+            s"'p' of the exported 'poke' is ${wnh_reason("*E, which reaches E, which", "E", 4)}")
+    wnh_elsewhere(text)
+
+@test("an export answering a pointer to an empty struct is refused on Windows x64")
+wnh_pointer_result_refused()
+    val text = s"${wnh_empty()}@export(\"back\")\nback(p: *E) -> *E = p\n"
+    val said = wnh_said(text, wnh_win())
+
+    wnh_has(said, s"the exported 'back' returns ${wnh_reason("*E, which reaches E, which", "E", 4)}")
+    wnh_has(said, s"'p' of the exported 'back' is ")
+    wnh_elsewhere(text)
+
+// The proof in the header comment: `extern E g;` is four bytes to C over a zero-byte global.
+@test("exported storage of an empty struct, or an array of them, is refused on Windows x64")
+wnh_storage_refused()
+    if !std_root().is_ok() then return
+
+    val text = s"${wnh_empty()}@export(\"g_e\")\nvar g_e = E()\n" +
+               "@export(\"g_es\")\nvar g_es: [2]E = [E(), E()]\n" +
+               "@export(\"g_pe\")\nvar g_pe: *E = null\n"
+    val said = wnh_emit_refused(text)
+
+    wnh_has(said, s"the exported storage 'g_e' is ${wnh_reason("E, which", "E", 4)}")
+    wnh_has(said, s"the exported storage 'g_es' is ${wnh_reason("[2]E, which", "[2]E", 8)}")
+    wnh_has(said, s"the exported storage 'g_pe' is ${wnh_reason("*E, which reaches E, which", "E", 4)}")
+    wnh_emit_elsewhere(text)
+
+@test("a pointer to an empty struct inside a struct C reaches is refused, named by its path")
+wnh_nested_pointer_refused()
+    val text = s"${wnh_empty()}struct Inner\n    a: i32\n    p: *E\nstruct Out\n    x: i32\n    inner: Inner\n" +
+               "@export(\"one\")\none(v: *Inner) -> i32 = 0\n@export(\"two\")\ntwo(v: *Out) -> i32 = 0\n" +
+               "@export(\"three\")\nthree(v: Inner) -> i32 = v.a\n"
+    val said = wnh_said(text, wnh_win())
+
+    wnh_has(said, s"'v' of the exported 'one' is " +
+                  wnh_reason("*Inner, whose field 'p' reaches E, which", "E", 4))
+    wnh_has(said, s"'v' of the exported 'two' is " +
+                  wnh_reason("*Out, whose field 'inner.p' reaches E, which", "E", 4))
+    wnh_has(said, s"'v' of the exported 'three' is " +
+                  wnh_reason("Inner, whose field 'p' reaches E, which", "E", 4))
+    wnh_elsewhere(text)
+
+// `struct H { struct E x, y; }` is 8 to MSVC; a union of empty structs is 4.
+@test("a pointer to an array of empty structs, a struct of them, or a union of them is refused")
+wnh_hollow_aggregates_refused()
+    val text = s"${wnh_empty()}struct H\n    x: E\n    y: E\nunion UE\n    a: E\n    b: E\n" +
+               "@export(\"arr\")\narr(p: *[2]E) -> i32 = 0\n@export(\"pair\")\npair(p: *H) -> i32 = 0\n" +
+               "@export(\"uni\")\nuni(p: *UE) -> i32 = 0\n"
+    val said = wnh_said(text, wnh_win())
+
+    wnh_has(said, s"'p' of the exported 'arr' is ${wnh_reason("*[2]E, which reaches [2]E, which", "[2]E", 8)}")
+    wnh_has(said, s"'p' of the exported 'pair' is ${wnh_reason("*H, which reaches H, which", "H", 8)}")
+    wnh_has(said, s"'p' of the exported 'uni' is ${wnh_reason("*UE, which reaches UE, which", "UE", 4)}")
+    wnh_elsewhere(text)
+
+@test("a function pointer taking a pointer to an empty struct is refused; one taking it by value is not")
+wnh_function_pointer()
+    val text = s"${wnh_empty()}@export(\"hook\")\nhook(cb: *extern(*E) -> i32) -> i32 = 0\n"
+
+    wnh_has(wnh_said(text, wnh_win()),
+            s"'cb' of the exported 'hook' is " +
+            wnh_reason("*extern(*E) -> int, which reaches E, which", "E", 4))
+    wnh_elsewhere(text)
+    assert_eq(wnh_said(s"${wnh_empty()}@export(\"hook\")\nhook(cb: *extern(E) -> i32) -> i32 = 0\n", wnh_win()), "")
+
+// The header leaves a field that occupies nothing out of the struct, so C lays out the rest as sysl
+// does: `{ int32_t a; int32_t b; }` is 8 with b at 4 to clang's MSVC target, as `O` is to sysl.
+@test("a struct, union or array field holding an empty struct, behind a pointer or as storage, is not refused")
+wnh_holder_accepted()
+    val text = s"${wnh_empty()}struct O\n    a: i32\n    e: E\n    b: i32\nstruct A\n    a: i32\n    es: [2]E\n" +
+               "    b: i32\nunion U\n    e: E\n    i: i32\nstruct Z\n    a: i32\n    z: [0]E\n    b: i32\n" +
+               "@export(\"o\")\no(p: *O) -> *O = p\n@export(\"a\")\na(p: *A) -> i32 = 0\n" +
+               "@export(\"u\")\nu(p: *U) -> i32 = 0\n@export(\"z\")\nz(p: *Z) -> i32 = 0\n" +
+               "@export(\"g_o\")\nvar g_o = O(1, E(), 2)\n"
+
+    if !std_root().is_ok() then return
+
+    val header = wnh_emit_header(text, wnh_win())
+
+    wnh_has(header, "typedef struct {\n\tint32_t a;\n\tint32_t b;\n} O;\n")
+    wnh_has(header, "typedef struct {\n\tint32_t a;\n\tint32_t b;\n} A;\n")
+    wnh_has(header, "typedef union {\n\tint32_t i;\n} U;\n")
+    wnh_has(header, "typedef struct {\n\tint32_t a;\n\tint32_t b;\n} Z;\n")
+    assert(!header.contains("} E;"), header)
+    wnh_has(header, "extern O g_o;\n")
+
+// `struct E z[0]` is no bytes in either C, and a `[0]E` occupies none in sysl.
+@test("a pointer to, or storage of, no empty structs at all is not refused")
+wnh_zero_length_accepted()
+    assert_eq(wnh_said(s"${wnh_empty()}@export(\"none\")\nnone(p: *[0]E) -> i32 = 0\n", wnh_win()), "")
+
+    if !std_root().is_ok() then return
+
+    wnh_has(wnh_emit_header(s"${wnh_empty()}@export(\"g_z\")\nvar g_z: [0]E = []\n", wnh_win()),
+            "extern E g_z[0];\n")
+
+@test("an empty struct by value in an exported signature still crosses on Windows x64")
+wnh_by_value_accepted()
+    assert_eq(wnh_said(s"${wnh_empty()}@export(\"made\")\nmade(v: E) -> E = v\n", wnh_win()), "")
+
+// A private export is declared in no header; an opaque struct is an incomplete type in one.
+@test("a private export, or an opaque empty struct, is not refused")
+wnh_not_declared_accepted()
+    assert_eq(wnh_said(s"${wnh_empty()}@export(\"poke\")\nprivate poke(p: *E) -> i32 = 0\n", wnh_win()), "")
+    assert_eq(wnh_said("opaque struct V\nend V\n@export(\"poke\")\npoke(p: *V) -> i32 = 0\n", wnh_win()), "")
+
+// A struct reaching itself through a pointer is walked once.
+@test("a struct that reaches itself through a pointer is walked once, and refused by what else it holds")
+wnh_cycle()
+    val text = s"${wnh_empty()}struct L\n    next: *L\n    v: i32\nstruct M\n    next: *M\n    e: *E\n" +
+               "@export(\"l\")\nl(p: *L) -> i32 = 0\n@export(\"m\")\nm(p: *M) -> i32 = 0\n"
+    val said = wnh_said(text, wnh_win())
+
+    assert(!said.contains("exported 'l'"), said)
+    wnh_has(said, s"'p' of the exported 'm' is ${wnh_reason("*M, whose field 'e' reaches E, which", "E", 4)}")
+
+// `reference/ffi.md § A struct's layout in the header` quotes this refusal in a `text` block, since its
+// docs sweep cannot build a Windows program's standard module on this machine; this pins the quote.
+@test("the ffi page's header example is refused in the words the page quotes")
+wnh_ffi_page_example()
+    if !std_root().is_ok() then return
+
+    val text = "struct Empty\nend Empty\n@export(\"mark\")\nvar mark = Empty()\n"
+
+    wnh_has(wnh_emit_refused(text),
+            "the exported storage 'mark' is Empty, which occupies no bytes in sysl and 4 in Microsoft's " +
+            "C on 'x86_64-windows': the header's declaration of Empty gives it a size sysl does not, so C " +
+            "storing one writes over what sysl placed after it. Give the empty struct a field, or keep " +
+            "Empty out of what the header declares")
+    wnh_emit_elsewhere(text)

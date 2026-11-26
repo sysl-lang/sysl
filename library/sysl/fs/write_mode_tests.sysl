@@ -1,0 +1,331 @@
+module sysl.fs
+@requires(os)
+@tests
+
+// The `mode` a whole-file writer, an append and a `Dir`'s opens give a file they make.
+//
+// **The umask is read, not set**: it is process-wide, and these tests run beside others that create
+// files. A file created with `0o777` has exactly the bits the umask lets through, so every expected
+// mode here is `mode & fsw_allowed(dir)`. The modes asked for are chosen so that a mode that was
+// ignored would show: `0o400` survives any umask that leaves the owner able to read, and is never
+// what the default `0o666` becomes.
+//
+// Each test makes its own directory with `make_temp_dir`.
+
+private fsw_ignore(r: Result[unit, IoError]) = ()
+
+private fsw_done(dir: string) = fsw_ignore(remove_dir_all(dir))
+
+// The permission bits the umask lets a new file in `dir` have.
+private fsw_allowed(dir: string) -> u32
+    val probe = s"$dir/.umask-probe"
+    var f = create(probe, 0o777).unwrap()
+
+    f.close().unwrap()
+
+    val got = metadata(probe).unwrap().permissions()
+
+    remove_file(probe).unwrap()
+    got
+end fsw_allowed
+
+private fsw_mode(path: string) -> u32 = metadata(path).unwrap().permissions()
+
+private fsw_err(r: Result[unit, IoError]) -> IoError = r.unwrap_err()
+
+private fsw_open_err(r: Result[File, IoError]) -> IoError = r.unwrap_err()
+
+private fsw_shut(r: Result[File, IoError])
+    var f = r.unwrap()
+
+    f.close().unwrap()
+end fsw_shut
+
+// -- a new file is born with the mode asked for ---------------------------------------------------
+
+@test("fsw_ write_bytes and write_text with a mode make the file with mode & ~umask")
+fsw_write_new_file()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+
+    write_bytes(s"$dir/b", "bytes".bytes, 0o640).unwrap()
+    write_text(s"$dir/t", "text", 0o400).unwrap()
+
+    assert_eq(fsw_mode(s"$dir/b"), 0o640 & allowed)
+    assert_eq(fsw_mode(s"$dir/t"), 0o400)
+    assert_eq(read_text(s"$dir/b").unwrap(), "bytes")
+    assert_eq(read_text(s"$dir/t").unwrap(), "text")
+    fsw_done(dir)
+end fsw_write_new_file
+
+@test("fsw_ append_bytes, append_text and append with a mode make the file with mode & ~umask")
+fsw_append_new_file()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+
+    append_bytes(s"$dir/b", "bytes".bytes, 0o640).unwrap()
+    append_text(s"$dir/t", "text", 0o400).unwrap()
+    fsw_shut(append(s"$dir/o", 0o604))
+
+    assert_eq(fsw_mode(s"$dir/b"), 0o640 & allowed)
+    assert_eq(fsw_mode(s"$dir/t"), 0o400)
+    assert_eq(fsw_mode(s"$dir/o"), 0o604 & allowed)
+    assert_eq(read_text(s"$dir/b").unwrap(), "bytes")
+    assert_eq(read_text(s"$dir/t").unwrap(), "text")
+    fsw_done(dir)
+end fsw_append_new_file
+
+@test("fsw_ write_bytes_atomic and write_text_atomic with a mode make the file with mode & ~umask")
+fsw_atomic_new_file()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+
+    write_bytes_atomic(s"$dir/b", "bytes".bytes, 0o640).unwrap()
+    write_text_atomic(s"$dir/t", "text", 0o400).unwrap()
+
+    assert_eq(fsw_mode(s"$dir/b"), 0o640 & allowed)
+    assert_eq(fsw_mode(s"$dir/t"), 0o400)
+    assert_eq(read_text(s"$dir/t").unwrap(), "text")
+    assert_eq(entries(dir).unwrap().len(), 2)
+    fsw_done(dir)
+end fsw_atomic_new_file
+
+@test("fsw_ bits above the twelve permission bits are dropped by every writer")
+fsw_high_bits_dropped()
+    val dir = make_temp_dir("fsw-").unwrap()
+
+    write_text(s"$dir/w", "x", 0o100400).unwrap()
+    append_text(s"$dir/a", "x", 0o170400).unwrap()
+    write_text_atomic(s"$dir/t", "x", 0o100400).unwrap()
+
+    assert_eq(fsw_mode(s"$dir/w"), 0o400)
+    assert_eq(fsw_mode(s"$dir/a"), 0o400)
+    assert_eq(fsw_mode(s"$dir/t"), 0o400)
+    fsw_done(dir)
+end fsw_high_bits_dropped
+
+// -- the default is what it was -------------------------------------------------------------------
+
+@test("fsw_ with no mode every writer makes the file create's default makes")
+fsw_default_unchanged()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+
+    fsw_shut(create(s"$dir/c"))
+
+    val plain = fsw_mode(s"$dir/c")
+
+    write_bytes(s"$dir/wb", "x".bytes).unwrap()
+    write_text(s"$dir/wt", "x").unwrap()
+    append_bytes(s"$dir/ab", "x".bytes).unwrap()
+    append_text(s"$dir/at", "x").unwrap()
+    write_bytes_atomic(s"$dir/xb", "x".bytes).unwrap()
+    write_text_atomic(s"$dir/xt", "x").unwrap()
+    fsw_shut(append(s"$dir/ao"))
+
+    assert_eq(plain, 0o666 & allowed)
+
+    for name in ["wb", "wt", "ab", "at", "xb", "xt", "ao"]
+        assert_eq(fsw_mode(s"$dir/$name"), plain)
+
+    fsw_done(dir)
+end fsw_default_unchanged
+
+// -- a file that is already there keeps its mode ----------------------------------------------------
+
+@test("fsw_ write_bytes and write_text over an existing file keep its mode and replace its contents")
+fsw_write_existing_keeps_mode()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val path = s"$dir/f"
+
+    write_text(path, "a much longer original").unwrap()
+    set_permissions(path, 0o604).unwrap()
+    write_text(path, "short", 0o400).unwrap()
+
+    assert_eq(fsw_mode(path), 0o604)
+    assert_eq(read_text(path).unwrap(), "short")
+
+    write_bytes(path, "bytes".bytes, 0o400).unwrap()
+
+    assert_eq(fsw_mode(path), 0o604)
+    assert_eq(read_text(path).unwrap(), "bytes")
+    fsw_done(dir)
+end fsw_write_existing_keeps_mode
+
+@test("fsw_ append_bytes, append_text and append onto an existing file keep its mode and add to it")
+fsw_append_existing_keeps_mode()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val path = s"$dir/f"
+
+    write_text(path, "one").unwrap()
+    set_permissions(path, 0o604).unwrap()
+    append_text(path, "two", 0o400).unwrap()
+    append_bytes(path, "three".bytes, 0o400).unwrap()
+    fsw_shut(append(path, 0o400))
+
+    assert_eq(fsw_mode(path), 0o604)
+    assert_eq(read_text(path).unwrap(), "onetwothree")
+    fsw_done(dir)
+end fsw_append_existing_keeps_mode
+
+@test("fsw_ an atomic write over an existing file replaces it with one of the mode asked for")
+fsw_atomic_existing_takes_mode()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+    val path = s"$dir/f"
+
+    write_text(path, "old").unwrap()
+    set_permissions(path, 0o604).unwrap()
+    write_text_atomic(path, "new", 0o400).unwrap()
+
+    assert_eq(fsw_mode(path), 0o400)
+    assert_eq(read_text(path).unwrap(), "new")
+
+    write_bytes_atomic(path, "newer".bytes).unwrap()
+
+    assert_eq(fsw_mode(path), 0o666 & allowed)
+    assert_eq(read_text(path).unwrap(), "newer")
+    fsw_done(dir)
+end fsw_atomic_existing_takes_mode
+
+// -- a failure answers what it answered before -------------------------------------------------------
+
+@test("fsw_ every writer into a read-only directory answers PermissionDenied, with a mode and without")
+fsw_read_only_dir_error()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val locked = s"$dir/ro"
+
+    make_dir(locked).unwrap()
+    set_permissions(locked, 0o555).unwrap()
+
+    val plain = [
+        fsw_err(write_bytes(s"$locked/f", "x".bytes)),
+        fsw_err(write_text(s"$locked/f", "x")),
+        fsw_err(append_bytes(s"$locked/f", "x".bytes)),
+        fsw_err(append_text(s"$locked/f", "x")),
+        fsw_err(write_bytes_atomic(s"$locked/f", "x".bytes)),
+        fsw_err(write_text_atomic(s"$locked/f", "x")),
+        fsw_open_err(append(s"$locked/f"))
+    ]
+    val moded = [
+        fsw_err(write_bytes(s"$locked/f", "x".bytes, 0o600)),
+        fsw_err(write_text(s"$locked/f", "x", 0o600)),
+        fsw_err(append_bytes(s"$locked/f", "x".bytes, 0o600)),
+        fsw_err(append_text(s"$locked/f", "x", 0o600)),
+        fsw_err(write_bytes_atomic(s"$locked/f", "x".bytes, 0o600)),
+        fsw_err(write_text_atomic(s"$locked/f", "x", 0o600)),
+        fsw_open_err(append(s"$locked/f", 0o600))
+    ]
+    val left = entries(locked).unwrap().len()
+
+    set_permissions(locked, 0o755).unwrap()
+
+    for i in 0..<plain.len
+        assert(plain[i] == PermissionDenied)
+        assert(moded[i] == plain[i])
+
+    assert_eq(left, 0)
+    fsw_done(dir)
+end fsw_read_only_dir_error
+
+@test("fsw_ every writer into a missing directory answers NotFound, with a mode")
+fsw_missing_dir_error()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val gone = s"$dir/absent/f"
+
+    assert(fsw_err(write_bytes(gone, "x".bytes, 0o600)) == NotFound)
+    assert(fsw_err(write_text(gone, "x", 0o600)) == NotFound)
+    assert(fsw_err(append_bytes(gone, "x".bytes, 0o600)) == NotFound)
+    assert(fsw_err(append_text(gone, "x", 0o600)) == NotFound)
+    assert(fsw_err(write_bytes_atomic(gone, "x".bytes, 0o600)) == NotFound)
+    assert(fsw_err(write_text_atomic(gone, "x", 0o600)) == NotFound)
+    assert(fsw_open_err(append(gone, 0o600)) == NotFound)
+    assert_eq(entries(dir).unwrap().len(), 0)
+    fsw_done(dir)
+end fsw_missing_dir_error
+
+@test("fsw_ a write that fails after the open answers the device's reason, with a mode")
+fsw_write_failure_after_open()
+    // `sysl.testing.skip` is out of reach: `sysl.testing` depends on `sysl.fs`. A host with no
+    // `/dev/full` (macOS) has nothing to check here.
+    if !exists("/dev/full") then return
+
+    assert(fsw_err(write_text("/dev/full", "x", 0o600)) == NoSpaceLeft)
+    assert(fsw_err(write_text("/dev/full", "x")) == NoSpaceLeft)
+    assert(fsw_err(append_bytes("/dev/full", "x".bytes, 0o600)) == NoSpaceLeft)
+
+// -- beneath a directory -------------------------------------------------------------------------------
+
+@test("fsw_ a Dir's create, append, create_update, write_bytes and write_text take a mode")
+fsw_dir_new_file()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+    val d = open_dir(dir).unwrap()
+
+    fsw_shut(d.create("c", 0o640))
+    fsw_shut(d.append("a", 0o400))
+    fsw_shut(d.create_update("u", 0o604))
+    d.write_bytes("b", "bytes".bytes, 0o400).unwrap()
+    d.write_text("t", "text", 0o640).unwrap()
+    d.write_text("h", "high", 0o100400).unwrap()
+
+    assert_eq(fsw_mode(s"$dir/c"), 0o640 & allowed)
+    assert_eq(fsw_mode(s"$dir/a"), 0o400)
+    assert_eq(fsw_mode(s"$dir/u"), 0o604 & allowed)
+    assert_eq(fsw_mode(s"$dir/b"), 0o400)
+    assert_eq(fsw_mode(s"$dir/t"), 0o640 & allowed)
+    assert_eq(fsw_mode(s"$dir/h"), 0o400)
+    assert_eq(d.read_text("t").unwrap(), "text")
+    fsw_done(dir)
+end fsw_dir_new_file
+
+@test("fsw_ a Dir's writers default to create's mode and leave an existing file's mode alone")
+fsw_dir_default_and_existing()
+    val dir = make_temp_dir("fsw-").unwrap()
+    val allowed = fsw_allowed(dir)
+    val d = open_dir(dir).unwrap()
+
+    d.write_text("t", "x").unwrap()
+    fsw_shut(d.create("c"))
+    fsw_shut(d.append("a"))
+
+    assert_eq(fsw_mode(s"$dir/t"), 0o666 & allowed)
+    assert_eq(fsw_mode(s"$dir/c"), 0o666 & allowed)
+    assert_eq(fsw_mode(s"$dir/a"), 0o666 & allowed)
+
+    set_permissions(s"$dir/t", 0o604).unwrap()
+    d.write_text("t", "again", 0o400).unwrap()
+    fsw_shut(d.append("t", 0o400))
+    fsw_shut(d.create_update("t", 0o400))
+
+    assert_eq(fsw_mode(s"$dir/t"), 0o604)
+    fsw_done(dir)
+end fsw_dir_default_and_existing
+
+@test("fsw_ a Dir's writers with a mode still refuse an escape and report a read-only directory")
+fsw_dir_errors()
+    val dir = make_temp_dir("fsw-").unwrap()
+
+    make_dir(s"$dir/inside").unwrap()
+    make_dir(s"$dir/inside/ro").unwrap()
+
+    val d = open_dir(s"$dir/inside").unwrap()
+    val locked = open_dir(s"$dir/inside/ro").unwrap()
+
+    assert(fsw_err(d.write_text("../out", "x", 0o600)).escaped())
+    assert(fsw_open_err(d.append("../out", 0o600)).escaped())
+    assert(!exists(s"$dir/out"))
+
+    set_permissions(s"$dir/inside/ro", 0o555).unwrap()
+
+    val moded = fsw_err(locked.write_bytes("f", "x".bytes, 0o600))
+    val plain = fsw_err(locked.write_bytes("f", "x".bytes))
+    val appended = fsw_open_err(locked.append("f", 0o600))
+
+    set_permissions(s"$dir/inside/ro", 0o755).unwrap()
+
+    assert(plain == PermissionDenied)
+    assert(moded == plain)
+    assert(appended == PermissionDenied)
+    fsw_done(dir)
+end fsw_dir_errors

@@ -85,19 +85,26 @@ publish_dir(pending: string, target: string) -> Result[unit, IoError] = rename(p
  * On any failure -- the write, the close or the rename -- the pending file is removed and the first
  * error is the answer, so `path` is exactly what it was before the call. A directory that is not
  * there answers `NotFound` and leaves nothing anywhere.
+ *
+ * **`mode` is the permission bits the new file is born with**, as `write_bytes` takes them (`0o666`
+ * by default, narrowed by the umask). The pending file is created with them, so the file is never
+ * readable more widely than asked, not even under its pending name. **Unlike `write_bytes`, a file
+ * already at `path` does not keep its mode**: it is replaced by a new file, which has the mode asked
+ * for here.
  */
-write_bytes_atomic(path: string, bytes: []const u8) -> Result[unit, IoError]
+write_bytes_atomic(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
     val pending = pending_name(path)
 
-    write_bytes(pending, bytes) match
+    write_bytes(pending, bytes, mode) match
         Ok(_) -> publish_file(pending, path)
         Err(e) ->
             remove_file(pending).unwrap_or(())
             Err(e)
 end write_bytes_atomic
 
-/** `write_bytes_atomic` for text. */
-write_text_atomic(path: string, text: string) -> Result[unit, IoError] = write_bytes_atomic(path, text.bytes)
+/** `write_bytes_atomic` for text, with the same `mode`. */
+write_text_atomic(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError] =
+    write_bytes_atomic(path, text.bytes, mode)
 
 /** This process's token, drawn the first time it is asked for.
  *

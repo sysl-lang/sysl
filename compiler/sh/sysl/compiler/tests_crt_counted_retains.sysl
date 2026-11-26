@@ -1,0 +1,751 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{Status, capture}
+import sysl.text.{cstring, join, Search}
+
+// The counted references (`retain_count.sysl`): a program built with `SYSL_COUNT_RETAINS=1` says at
+// exit how many shares the runtime took and gave back. Every count here is of a real program built
+// and run, because the count only exists in one.
+//
+// The axes and their cells: what is shared (a `&T`, a `&sync T`, a string, a `&Trait`, a `&Fn`, an
+// `Option[&T]`, a `weak T`'s `get`), where (a `Buf`, a closure, another thread, module storage, a
+// generic twin, the standard module's own code), how the program ends (returning, `exit`, a panic),
+// how it is built (debug, `-O0`, `-O2`, four codegen units, a non-POSIX target, with the counted heap
+// beside it, off), and the run cache (`tests_ckg_cache_key.sysl`'s `ckg_count_retains`). Skipped: a
+// C host linking a `build-c` archive, which has no entry and so no report (the counters are a weak
+// global it links; probed by hand), and a 32-bit POSIX host, which no target here can build.
+
+private struct CrtRun
+    ok: bool
+    status: int
+    out: string
+    err: string
+
+private crt_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end crt_ready
+
+// The program built -- counted or not, at `level` -- and run; a build that failed answers `ok` false
+// with the reason in `out`.
+private crt_run(text: string, counted: bool, level: string = DefaultOptimization, allocs: bool = false) -> CrtRun
+    val root = make_temp_dir("sysl-crt").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    force_retain_counting(counted)
+    force_alloc_counting(allocs)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, level, Some(s"$root/built"))
+
+    force_retain_counting(false)
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return CrtRun(false, -1, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> CrtRun(false, -1, "could not be started", "")
+        Ok(o) -> CrtRun(o.status.ok(), crt_code(o.status), o.text, o.err.unwrap_or(""))
+end crt_run
+
+// The status a program exited with, or -1 where it did not exit.
+private crt_code(s: Status) -> int = s match
+    Exited(c) -> c
+    _ -> -1
+
+// The counts a counted run reported, failing the test where it reported none.
+private crt_counts(run: CrtRun) -> RetainCounts
+    assert(run.ok, run.out)
+
+    retain_count_reported(run.err) match
+        Some(c) -> c
+        None -> panic(s"no count was reported: '${run.err}'")
+end crt_counts
+
+// The six counts as the report says them, for an exact comparison.
+private crt_said(c: RetainCounts) -> string =
+    s"${c.retains}/${c.releases} atomic ${c.atomic_retains}/${c.atomic_releases} views ${c.view_retains}/${c.view_releases}"
+
+// A `&Node` handed to a buffer `k` times, the buffer and the node let go of as `main` returns.
+private crt_shares(k: int) -> string = s"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        v: int
+
+    main()
+        val a: &Node = Node(7)
+        var xs: Buf[&Node] = buf()
+
+        for i in 0..<$k
+            xs.push(a)
+
+        print(xs.len())
+    """
+
+@test("a reference copied k times into a buffer is k retains, and k releases beside the node's, the buffer's and its storage's")
+crt_k_shares_are_k_retains()
+    if !crt_ready() then return
+
+    for k in [1, 2, 5]
+        val run = crt_run(crt_shares(k), true)
+        val c = crt_counts(run)
+
+        assert_eq(run.out, s"$k\n")
+        assert_eq(c.retains, long(k))
+        assert_eq(c.releases, long(k) + 3)
+
+    // Exactly, with the one view among them: the buffer's element storage.
+    assert_eq(crt_said(crt_counts(crt_run(crt_shares(5), true))), "5/8 atomic 0/0 views 0/1")
+end crt_k_shares_are_k_retains
+
+@test("the report is one line on standard error, and the program's output is what it always was")
+crt_the_report_is_one_line()
+    if !crt_ready() then return
+
+    val run = crt_run(crt_shares(5), true)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "5\n")
+    assert_eq(run.err, "sysl: 5 retains, 8 releases (atomic 0/0, views 0/1)\n")
+end crt_the_report_is_one_line
+
+@test("a reference passed to a call that only reads it takes no share: +0 calls report zero")
+crt_plus0_calls_take_nothing()
+    if !crt_ready() then return
+
+    // The node never leaves the frame, so it is laid there: no share and no release at all.
+    val framed = crt_run("""
+        struct Node
+            v: int
+
+        look(n: &Node) -> int = n.v
+
+        main()
+            val a: &Node = Node(7)
+            var t = 0
+
+            for i in 0..<5
+                t += look(a)
+
+            print(t)
+        """, true)
+
+    assert_eq(framed.out, "35\n")
+    assert_eq(crt_said(crt_counts(framed)), "0/0 atomic 0/0 views 0/0")
+
+    // On the heap -- it is also kept in a buffer -- the five reads still take nothing; the one share
+    // is the buffer's.
+    val heaped = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        look(n: &Node) -> int = n.v
+
+        main()
+            val a: &Node = Node(7)
+            var xs: Buf[&Node] = buf()
+            var t = 0
+
+            xs.push(a)
+
+            for i in 0..<5
+                t += look(a)
+
+            print(t + int(xs.len()))
+        """, true)
+
+    assert_eq(heaped.out, "36\n")
+    assert_eq(crt_counts(heaped).retains, 1)
+end crt_plus0_calls_take_nothing
+
+@test("a closure's capture is a share, counted on its way in and out")
+crt_a_closure_capture_is_counted()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        struct Node
+            v: int
+
+        make(a: &Node) -> &Fn() -> int = () -> a.v
+
+        main()
+            val a: &Node = Node(7)
+            val f = make(a)
+            val g = make(a)
+
+            print(f() + g() + a.v)
+        """, true)
+
+    assert_eq(run.out, "21\n")
+    assert_eq(crt_said(crt_counts(run)), "4/7 atomic 0/0 views 0/0")
+end crt_a_closure_capture_is_counted
+
+// A `&Fn` in a buffer, made and called `k` times.
+private crt_closures(k: int) -> string = s"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        v: int
+
+    main()
+        val a: &Node = Node(7)
+        var fs: Buf[&Fn() -> int] = buf()
+
+        for i in 0..<$k
+            fs.push(() -> a.v)
+
+        var t = 0
+
+        for f in fs
+            t += f()
+
+        print(t)
+    """
+
+// Each closure pushed costs five shares: the capture, the loop's share of the element, and a share
+// taken and given back at each of the three layers of the push -- a `&Fn` may run code when it is let
+// go of, so a local of one is not handed over to an owned parameter (`emit_moves.sysl`'s `local_at`).
+// A `&Node` pushed costs one. The count is what tells the two apart.
+@test("each closure pushed and called is the same number of shares more: the count is linear and exact")
+crt_closures_in_a_buffer_are_counted_exactly()
+    if !crt_ready() then return
+
+    val one = crt_counts(crt_run(crt_closures(1), true))
+    val two = crt_counts(crt_run(crt_closures(2), true))
+    val six = crt_counts(crt_run(crt_closures(6), true))
+
+    assert_eq(two.retains - one.retains, 5)
+    assert_eq(two.releases - one.releases, 6)
+    assert_eq(six.retains - one.retains, 25)
+    assert_eq(six.releases - one.releases, 30)
+end crt_closures_in_a_buffer_are_counted_exactly
+
+@test("a string shared into a buffer is a view's share, counted among the views")
+crt_a_string_share_is_a_view()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            val s = "word" + "s"
+            var xs: Buf[string] = buf()
+
+            for i in 0..<3
+                xs.push(s)
+
+            print(xs.len())
+        """, true)
+
+    assert_eq(run.out, "3\n")
+    assert_eq(crt_said(crt_counts(run)), "3/6 atomic 0/0 views 3/5")
+end crt_a_string_share_is_a_view
+
+@test("a literal string is static and takes no share at all")
+crt_a_literal_string_takes_nothing()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        main()
+            var xs: Buf[string] = buf()
+
+            for i in 0..<3
+                xs.push("static")
+
+            print(xs.len())
+        """, true)
+
+    assert_eq(run.out, "3\n")
+    assert_eq(crt_counts(run).view_retains, 0)
+end crt_a_literal_string_takes_nothing
+
+@test("a &sync share is atomic, and counted apart from the plain ones")
+crt_a_sync_share_is_atomic()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        main()
+            val a: &sync Node = Node(7)
+            var xs: Buf[&sync Node] = buf()
+
+            for i in 0..<4
+                xs.push(a)
+
+            print(xs.len())
+        """, true)
+
+    assert_eq(run.out, "4\n")
+    assert_eq(crt_said(crt_counts(run)), "4/7 atomic 4/5 views 0/1")
+end crt_a_sync_share_is_atomic
+
+// Two threads each sharing one `&sync Node` `n` times into a buffer of their own.
+private crt_threads(n: int) -> string = s"""
+    import sysl.buf.{Buf, buf}
+    import sysl.threads.scope
+
+    struct Node
+        v: int
+
+    main()
+        val a: &sync Node = Node(7)
+
+        val total = scope((s) ->
+            val x = s.spawn(() -> held(a))
+            val y = s.spawn(() -> held(a))
+            x.join() + y.join())
+
+        print(total)
+
+    held(a: &sync Node) -> int
+        var xs: Buf[&sync Node] = buf()
+
+        for i in 0..<$n
+            xs.push(a)
+
+        int(xs.len()) * a.v
+    """
+
+@test("shares taken on two threads at once are all counted: no increment is lost")
+crt_threads_lose_no_count()
+    if !crt_ready() then return
+
+    val small = crt_run(crt_threads(500), true)
+    val large = crt_run(crt_threads(1000), true)
+    val again = crt_run(crt_threads(1000), true)
+
+    assert_eq(small.out, "7000\n")
+    assert_eq(large.out, "14000\n")
+    // Every one of the thousand more is an atomic share; the buffers also grow once more each, and a
+    // growth's own shares are of the element storage -- views, not atomic ones.
+    assert_eq(crt_counts(large).atomic_retains - crt_counts(small).atomic_retains, 1000)
+    assert_eq(crt_counts(large).retains - crt_counts(small).retains,
+              1000 + crt_counts(large).view_retains - crt_counts(small).view_retains)
+    assert_eq(crt_said(crt_counts(again)), crt_said(crt_counts(large)))
+end crt_threads_lose_no_count
+
+@test("a trait object's share is counted, three to a push: the same cost a closure's has")
+crt_a_trait_object_is_counted()
+    if !crt_ready() then return
+
+    var counts: Buf[RetainCounts] = buf()
+
+    for k in [1, 2, 3]
+        counts.push(crt_counts(crt_run(s"""
+            import sysl.buf.{Buf, buf}
+
+            trait Shape
+                area(self) -> int
+
+            struct Sq
+                s: int
+
+            impl Shape for Sq
+                area(self) -> int = self.s * self.s
+
+            main()
+                val a: &Shape = Sq(3)
+                var xs: Buf[&Shape] = buf()
+
+                for i in 0..<$k
+                    xs.push(a)
+
+                print(int(xs.len()) * a.area())
+            """, true)))
+
+    assert_eq(crt_said(counts[0]), "4/7 atomic 0/0 views 0/1")
+    assert_eq(counts[1].retains - counts[0].retains, 3)
+    assert_eq(counts[2].retains - counts[1].retains, 3)
+end crt_a_trait_object_is_counted
+
+@test("an Option of a reference is the reference's share")
+crt_an_option_is_its_reference()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        main()
+            val a: &Node = Node(7)
+            var xs: Buf[Option[&Node]] = buf()
+
+            for i in 0..<4
+                xs.push(Some(a))
+
+            print(xs.len())
+        """, true)
+
+    assert_eq(run.out, "4\n")
+    assert_eq(crt_said(crt_counts(run)), "4/7 atomic 0/0 views 0/1")
+end crt_an_option_is_its_reference
+
+@test("a generic function instantiated twice counts each instance's shares")
+crt_a_generic_twin_is_counted()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        keep[T](xs: *Buf[T], x: T)
+            xs.push(x)
+
+        main()
+            val a: &Node = Node(7)
+            val s = "wor" + "d"
+            var xs: Buf[&Node] = buf()
+            var ys: Buf[string] = buf()
+
+            for i in 0..<4
+                keep(&xs, a)
+                keep(&ys, s)
+
+            print(xs.len() + ys.len())
+        """, true)
+
+    assert_eq(run.out, "8\n")
+    assert_eq(crt_said(crt_counts(run)), "8/14 atomic 0/0 views 4/7")
+end crt_a_generic_twin_is_counted
+
+@test("a weak reference's own count is not a share, and the share its get takes is")
+crt_a_weak_get_is_a_share()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        struct Node
+            v: int
+
+        main()
+            val a: &Node = Node(7)
+            val w: weak Node = a
+
+            w.get() match
+                Some(n) -> print(n.v)
+                None -> print(0)
+        """, true)
+
+    assert_eq(run.out, "7\n")
+    assert_eq(crt_said(crt_counts(run)), "2/3 atomic 0/0 views 0/0")
+end crt_a_weak_get_is_a_share
+
+@test("the standard module's own code is counted too: its artifact carries the counting runtime")
+crt_the_standard_module_is_counted()
+    if !crt_ready() then return
+
+    // The program's own code hands the string to `split` and lets the parts go; every part is a view
+    // of it that `split`, in the standard module, made.
+    val run = crt_run("""
+        import sysl.text.split
+
+        main()
+            val s = "a,b,c,d" + ","
+            val parts = split(s, ",")
+
+            print(parts.len)
+        """, true)
+
+    assert_eq(run.out, "5\n")
+    assert(crt_counts(run).view_retains >= 5, run.err)
+end crt_the_standard_module_is_counted
+
+@test("module storage's shares are taken before the count starts, and never given back")
+crt_module_storage_is_not_counted()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        val kept: &Node = Node(7, Some(Node(8, None)))
+        val again: &Node = kept
+
+        main()
+            print(kept.v + again.v)
+        """, true)
+
+    assert_eq(run.out, "14\n")
+    assert_eq(crt_said(crt_counts(run)), "0/0 atomic 0/0 views 0/0")
+end crt_module_storage_is_not_counted
+
+@test("a program that calls exit still reports, holding what it held")
+crt_exit_still_reports()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        @needs(os) extern exit(code: i32) -> unit
+
+        struct Node
+            v: int
+
+        main()
+            val a: &Node = Node(7)
+            var xs: Buf[&Node] = buf()
+
+            for i in 0..<5
+                xs.push(a)
+
+            print(xs.len())
+            exit(3)
+        """, true)
+
+    assert_eq(run.status, 3)
+    assert_eq(run.out, "5\n")
+    assert_eq(run.err, "sysl: 5 retains, 0 releases (atomic 0/0, views 0/0)\n")
+end crt_exit_still_reports
+
+@test("a panic aborts, and an abort runs no atexit: a counted program that panics reports nothing")
+crt_a_panic_reports_nothing()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        main()
+            val a: &Node = Node(7)
+            var xs: Buf[&Node] = buf()
+
+            xs.push(a)
+            panic("stop")
+        """, true)
+
+    assert(!run.ok)
+    assert(run.err.contains("panic: stop"), run.err)
+    assert(retain_count_reported(run.err).is_none(), run.err)
+end crt_a_panic_reports_nothing
+
+@test("counting is off unless asked: no line, and no counter in the module")
+crt_counting_is_off_by_default()
+    if !crt_ready() then return
+
+    val run = crt_run(crt_shares(5), false)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "5\n")
+    assert_eq(run.err, "")
+
+    val off = crt_ir(crt_shares(5), false, None)
+    val on = crt_ir(crt_shares(5), true, None)
+
+    assert(!off.contains(retain_counts_symbol()), "the uncounted module names the counters")
+    assert(!off.contains("sysl.retains"), "the uncounted module carries the report")
+    assert(!off.contains("%counted."), "the uncounted runtime counts")
+    assert(on.contains(s"@${retain_counts_symbol()} = weak global [6 x i64] zeroinitializer"), on)
+    assert(on.contains("call void @sysl.retains.mark()"), "the counted entry never marks")
+    assert(on.contains("%counted.0 = atomicrmw add"), "the counted retain does not count")
+end crt_counting_is_off_by_default
+
+// The module text of `text`, counted or not, for `target`.
+private crt_ir(text: string, counted: bool, target: Option[string]) -> string
+    val root = make_temp_dir("sysl-crt-ir").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_retain_counting(counted)
+
+    val out = emit_llvm_text(s"$root/main.sysl", target) match
+        Err(why) -> s"did not compile: ${why.message}"
+        Ok(made) ->
+            if !made.report.is_empty() then s"did not compile: ${analysis_report(made.report)}"
+            else made.text
+
+    force_retain_counting(false)
+    remove_dir_all(root).unwrap_or(())
+    out
+end crt_ir
+
+@test("a target with no POSIX host has no report to make, and asking counts nothing there")
+crt_a_bare_target_is_never_counted()
+    if !crt_ready() then return
+
+    val bare = crt_ir(crt_shares(5), true, Some("thumb-freestanding-softfp"))
+
+    assert(!bare.starts_with("did not compile"), bare)
+    assert(!bare.contains(retain_counts_symbol()), "a bare-metal module names the counters")
+    assert(!bare.contains("%counted."), "a bare-metal runtime counts")
+end crt_a_bare_target_is_never_counted
+
+@test("beside the counted heap the heap's line comes first, and each still reads back alone")
+crt_beside_the_counted_heap()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        struct Node
+            v: int
+            next: Option[&Node]
+
+        main()
+            val a: &Node = Node(1, None)
+            val b: &Node = Node(2, Some(a))
+
+            a.next = Some(b)
+            print(a.v + b.v)
+        """, true, DefaultOptimization, true)
+
+    assert(run.ok, run.out)
+    assert_eq(run.out, "3\n")
+    assert_eq(run.err, s"sysl: 2 ${alloc_count_said()}\nsysl: 2 retains, 2 releases (atomic 0/0, views 0/0)\n")
+    assert_eq(alloc_count_reported(run.err), 2)
+    assert_eq(crt_counts(run).retains, 2)
+
+    // And a clean program beside the heap says only the count of shares.
+    val clean = crt_run(crt_shares(5), true, DefaultOptimization, true)
+
+    assert_eq(clean.err, "sysl: 5 retains, 8 releases (atomic 0/0, views 0/1)\n")
+end crt_beside_the_counted_heap
+
+@test("the count is the same at every level: what is counted is what the compiler wrote")
+crt_every_level_counts_the_same()
+    if !crt_ready() then return
+
+    for level in ["0", "1", "2", "3"]
+        assert_eq(crt_said(crt_counts(crt_run(crt_shares(5), true, level))), "5/8 atomic 0/0 views 0/1")
+end crt_every_level_counts_the_same
+
+private extern "setenv" crt_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" crt_c_unsetenv(name: *u8) -> int
+
+@test("a program cut into four codegen units shares one set of counters")
+crt_codegen_units_share_the_counters()
+    if !crt_ready() then return
+
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring("4")
+
+    // A cache of C objects of its own, so the units are compiled here rather than found compiled.
+    val cache = make_temp_dir("sysl-crt-cache").unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    clear_unit_object_counts()
+    crt_c_setenv(k.ptr, v.ptr, 1)
+
+    val run = crt_run(crt_threads(1000), true)
+
+    crt_c_unsetenv(k.ptr)
+    use_c_object_cache_dir(None)
+    remove_dir_all(cache).unwrap_or(())
+
+    assert(unit_object_counts().1 >= 2, s"units compiled: ${unit_object_counts().1}")
+    assert_eq(run.out, "14000\n")
+    assert_eq(crt_said(crt_counts(run)), crt_said(crt_counts(crt_run(crt_threads(1000), true))))
+end crt_codegen_units_share_the_counters
+
+@test("the report is read back as its six numbers, and as nothing where there is none")
+crt_the_report_reads_back()
+    assert(retain_count_reported("").is_none())
+    assert(retain_count_reported("something else\n").is_none())
+    assert(retain_count_reported(s"sysl: 3 ${alloc_count_said()}\n").is_none())
+
+    val one = retain_count_reported("sysl: 5 retains, 8 releases (atomic 1/2, views 3/4)\n").unwrap()
+
+    assert_eq(crt_said(one), "5/8 atomic 1/2 views 3/4")
+
+    val among = retain_count_reported(
+        s"noise\nsysl: 2 ${alloc_count_said()}\nsysl: 120 retains, 1234 releases (atomic 0/0, views 99/100)\n")
+
+    assert_eq(crt_said(among.unwrap()), "120/1234 atomic 0/0 views 99/100")
+
+    // A line cut short is not a report.
+    assert(retain_count_reported("sysl: 5 retains, 8 releases (atomic 1/2").is_none())
+end crt_the_report_reads_back
+
+@test("a package's tests build and pass under counting: the runner's entry carries the mark")
+crt_a_test_run_is_counted()
+    if !crt_ready() then return
+
+    val root = make_temp_dir("sysl-crt-test").unwrap()
+
+    write_text(s"$root/sysl.hocon", "package {\n  name = \"crtpkg\"\n  version = \"0.1.0\"\n}\n").unwrap()
+    write_text(s"$root/tests.sysl", """
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        @test("five shares")
+        five()
+            val a: &Node = Node(7)
+            var xs: Buf[&Node] = buf()
+
+            for i in 0..<5
+                xs.push(a)
+
+            assert_eq(xs.len(), 5)
+        """).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+
+    force_retain_counting(true)
+
+    val code = run_cli(["sysl", "test", root], piece -> sink.push(piece))
+
+    force_retain_counting(false)
+    remove_dir_all(root).unwrap_or(())
+
+    // The runner writes its report itself; what the command answers is whether every test passed.
+    assert_eq(code, 0, join(said.view(), "\n"))
+end crt_a_test_run_is_counted
+
+// The example `getting-started/cli.md § Counting what a program does` shows, with the line it says.
+@test("the reference page's example reports what the page says it reports")
+crt_the_page_example()
+    if !crt_ready() then return
+
+    val run = crt_run("""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        look(n: &Node) -> int = n.v
+
+        main()
+            val a: &Node = Node(7)
+            var xs: Buf[&Node] = buf()
+            var t = 0
+
+            for i in 0..<5
+                xs.push(a)
+                t += look(a)
+
+            print(t)
+        """, true)
+
+    assert_eq(run.out, "35\n")
+    assert_eq(run.err, "sysl: 5 retains, 8 releases (atomic 0/0, views 0/1)\n")
+end crt_the_page_example

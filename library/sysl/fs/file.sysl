@@ -29,9 +29,10 @@ import sysl.slices.{as_ptr, copy}
 private const buffer_bytes: usize = 8192
 
 /** The permission bits a created file asks for -- `0o666`, which the process umask narrows to
- * whatever the environment has decided new files should be, exactly as C's `fopen` asks.
+ * whatever the environment has decided new files should be, exactly as C's `fopen` asks. Every call in
+ * the module that can make a file defaults its `mode` to this.
  */
-private const file_mode: u32 = 0o666
+private[fs] const file_mode: u32 = 0o666
 
 /** `EIO`: what a descriptor that took nothing and reported nothing wrong is answered with, since a
  * write that makes no progress would otherwise be retried for ever.
@@ -642,20 +643,20 @@ end File
  * becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
  * `append` writes at the end of whatever is there, making the file if it is not.
  *
- * **`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
- * default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
- * asks `0o600` here and is owner-only from the moment it exists, with no window between creating
- * and `set_permissions`. The mode applies only when the file is created: one that already exists
- * keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
- * A target with no permission bits ignores the mode.
+ * **`create`, `append` and `create_update` take the permission bits a NEW file is born with**,
+ * `0o666` by default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A
+ * secret file asks `0o600` here and is owner-only from the moment it exists, with no window between
+ * creating and `set_permissions`. The mode applies only when the file is created: one that already
+ * exists keeps the mode it has. Bits above the twelve permission bits are dropped, as in
+ * `set_permissions`. A target with no permission bits ignores the mode.
  */
 open(path: string) -> Result[File, IoError] = opened(path, fsys.open_read)
 
 create(path: string, mode: u32 = file_mode) -> Result[File, IoError] =
     opened(path, fsys.open_write | fsys.open_create | fsys.open_truncate, mode)
 
-append(path: string) -> Result[File, IoError] =
-    opened(path, fsys.open_write | fsys.open_create | fsys.open_append)
+append(path: string, mode: u32 = file_mode) -> Result[File, IoError] =
+    opened(path, fsys.open_write | fsys.open_create | fsys.open_append, mode)
 
 /** A file opened for reading **and** writing, which the three above cannot express between them: each
  * update mode is a different answer to "and what about what is already there", and naming them apart

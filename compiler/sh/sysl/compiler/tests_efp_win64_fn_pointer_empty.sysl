@@ -1,0 +1,210 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.split
+
+// **A C function pointer type whose signature carries, by value, a struct holding an empty struct is
+// refused on Windows x64**, as an `extern` of that signature is (`tests_wne_win64_nested_empty.sysl`):
+// a call through one is lowered as an `extern` call is, and MSVC's C gives the empty struct four
+// bytes where sysl gives it none. clang 21, `--target=x86_64-pc-windows-msvc -x c -S -emit-llvm`:
+//
+//     struct E {};  struct O { int a; struct E e; int b; };  typedef int (*fp)(struct O);
+//       get_fp()(o)  ->  call i32 %2(ptr noundef nonnull %1)    (a 12-byte copy, by address)
+//
+// where sysl 0.13.5 called the same pointer with `call i32 %t2(i64 %t7)`: eight bytes in a register,
+// `b` at offset 4.
+
+// Every error a program earns through the checks that run before lowering, on a named machine.
+private efp_said(text: string, target_name: string) -> string
+    val done = typed_of_target(text, target_named(target_name).unwrap())
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), buf())
+
+    val errors = errors_of(done.an.diagnostics())
+
+    if errors.is_empty() then "" else analysis_report(errors)
+end efp_said
+
+private efp_has(said: string, part: string) = assert(said.contains(part), said)
+
+private efp_win() -> string = "x86_64-windows"
+
+private efp_shapes() -> string = "struct E\nend E\nstruct O\n    a: i32\n    e: E\n    b: i32\n"
+
+// The tail every refusal ends with, for a struct `shown` whose field `field` is the empty `empty`.
+private efp_reason(shown: string, field: string, empty: string) -> string =
+    s"$shown, whose field '$field' is $empty: an empty struct occupies no bytes in sysl and four in " +
+    s"Microsoft's C on 'x86_64-windows', so $shown is laid out differently on the two sides of the " +
+    s"call. Give the empty struct a field, or take '$field' out of $shown"
+
+// The refusal of parameter `n` of the function pointer type `shown` (which spells `i32` as `int`).
+private efp_param(n: int, shown: string, reason: string) -> string =
+    s"parameter $n of the function pointer type '$shown' is $reason"
+
+// How many times `part` occurs in `said`.
+private efp_count(said: string, part: string) -> usize = split(said, part).len - 1
+
+// The same programs on every other convention: an empty struct is no bytes in their C as well.
+private efp_elsewhere(text: string)
+    for target in ["x86_64-linux", "aarch64-macos", "aarch64-linux", "riscv64-linux", "wasm32-freestanding"]
+        assert_eq(efp_said(text, target), "")
+end efp_elsewhere
+
+@test("a call through a function pointer taking a struct with an empty struct field is refused")
+efp_call_param_refused()
+    val text = s"${efp_shapes()}extern get_fp() -> *extern(O) -> i32\nextern keep(a: i32)\n" +
+               "val f = get_fp()\nkeep(f(O(1, E(), 2)))\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("a function pointer answering a struct with an empty struct field is refused")
+efp_call_result_refused()
+    val text = s"${efp_shapes()}extern get_fp() -> *extern() -> O\nextern keep(a: i32)\n" +
+               "val f = get_fp()\nkeep(f().a)\n"
+    val said = efp_said(text, efp_win())
+
+    efp_has(said, s"the function pointer type '*extern() -> O' returns ${efp_reason("O", "e", "E")}")
+    assert(!said.contains("parameter 1 of the function pointer type"), said)
+    efp_elsewhere(text)
+
+@test("a later parameter is named by its position, and every refused one is said")
+efp_later_params_refused()
+    val text = s"${efp_shapes()}extern get_fp() -> *extern(i32, O, O) -> i32\nextern keep(a: i32)\n" +
+               "keep(get_fp()(1, O(1, E(), 2), O(3, E(), 4)))\n"
+    val said = efp_said(text, efp_win())
+
+    efp_has(said, efp_param(2, "*extern(int, O, O) -> int", efp_reason("O", "e", "E")))
+    efp_has(said, efp_param(3, "*extern(int, O, O) -> int", efp_reason("O", "e", "E")))
+    assert(!said.contains("parameter 1 of"), said)
+    efp_elsewhere(text)
+
+@test("an empty struct two structs down in a function pointer's parameter is refused, named by its path")
+efp_nested_field_refused()
+    val text = s"${efp_shapes()}struct W\n    o: O\n    c: i32\n" +
+               "extern get_fp() -> *extern(W) -> i32\nextern keep(a: i32)\n" +
+               "keep(get_fp()(W(O(1, E(), 2), 3)))\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(W) -> int", efp_reason("W", "o.e", "E")))
+    efp_elsewhere(text)
+
+@test("an array of empty structs as a field of a function pointer's parameter is refused")
+efp_array_field_refused()
+    val text = "struct E\nend E\nstruct A\n    a: i32\n    arr: [2]E\n    b: i32\n" +
+               "extern get_fp() -> *extern(A) -> i32\nextern keep(a: i32)\n" +
+               "keep(get_fp()(A(1, [E(), E()], 2)))\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(A) -> int", efp_reason("A", "arr", "[2]E")))
+    efp_elsewhere(text)
+
+@test("a union with an empty struct member as a function pointer's parameter is refused")
+efp_union_member_refused()
+    val text = "struct E\nend E\nunion U\n    c: u8\n    e: E\n" +
+               "extern get_fp() -> *extern(U) -> i32\nextern keep(a: i32)\nkeep(get_fp()(U(c = 1)))\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(U) -> int", efp_reason("U", "e", "E")))
+    efp_elsewhere(text)
+
+// C calls through a pointer it was handed under its own layout, whether or not sysl ever calls it.
+@test("such a function pointer as an extern's parameter is refused though sysl never calls it")
+efp_extern_param_refused()
+    val text = s"${efp_shapes()}extern install(f: *extern(O) -> i32)\ninstall(null)\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("such a function pointer as a struct's field is refused")
+efp_struct_field_refused()
+    val text = s"${efp_shapes()}struct Ops\n    run: *extern(O) -> i32\n    n: i32\n" +
+               "extern install(o: *Ops)\nextern made() -> *Ops\ninstall(made())\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("such a function pointer as module storage is refused")
+efp_global_refused()
+    val text = s"${efp_shapes()}var hook: *extern(O) -> i32 = null\nextern note(x: bool)\nnote(hook == null)\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("such a function pointer held in a local array is refused")
+efp_local_array_refused()
+    val text = s"${efp_shapes()}extern note(x: bool)\n" +
+               "check() -> bool\n    var table: [2]*extern(O) -> i32 = [null, null]\n    table[0] == null\n" +
+               "note(check())\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("such a function pointer as another function pointer's parameter is refused")
+efp_inside_fn_pointer_refused()
+    val text = s"${efp_shapes()}extern each(visit: *extern(*extern(O) -> i32) -> unit)\neach(null)\n"
+    val said = efp_said(text, efp_win())
+
+    efp_has(said, efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    // The outer pointer takes a pointer, which is one register on both sides.
+    assert(!said.contains("'*extern(*extern(O) -> int) -> unit' is"), said)
+    efp_elsewhere(text)
+
+// The callback's own `@export` is refused as before (`wne_export_refused`); the pointer type it is
+// handed over as is refused as well, since C calls through it under that type's layout.
+@test("an exported callback handed to C as such a function pointer is refused, both ways")
+efp_callback_refused()
+    val text = s"${efp_shapes()}@export(\"cb\")\ncb(o: O) -> i32 = o.a\n" +
+               "extern install(f: *extern(O) -> i32)\ninstall(&cb)\n"
+    val said = efp_said(text, efp_win())
+
+    efp_has(said, s"'o' of the exported 'cb' is ${efp_reason("O", "e", "E")}")
+    efp_has(said, efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("a named alias and named parameters are the same type, and refused the same")
+efp_alias_and_names_refused()
+    val text = s"${efp_shapes()}type Cb = *extern(o: O) -> i32\nextern install(f: Cb)\ninstall(null)\n"
+
+    efp_has(efp_said(text, efp_win()), efp_param(1, "*extern(O) -> int", efp_reason("O", "e", "E")))
+    efp_elsewhere(text)
+
+@test("a function pointer type met in many places is refused once")
+efp_refused_once()
+    val text = s"${efp_shapes()}extern install(f: *extern(O) -> i32)\nextern get_fp() -> *extern(O) -> i32\n" +
+               "var hook: *extern(O) -> i32 = null\nextern keep(a: i32)\n" +
+               "install(get_fp())\nhook = get_fp()\nkeep(hook(O(1, E(), 2)))\n"
+
+    assert_eq(efp_count(efp_said(text, efp_win()), "of the function pointer type"), 1)
+
+// What `wne_top_level_empty_accepted` and its neighbours accept for an `extern` stays accepted here.
+@test("a lone empty struct, a [0]E field, a pointer and a plain struct still cross through a pointer")
+efp_accepted()
+    val e = "struct E\nend E\nextern keep(a: i32)\n"
+
+    assert_eq(efp_said(s"${e}extern get_fp() -> *extern(E) -> E\nval f = get_fp()\nf(f(E()))\n", efp_win()), "")
+    assert_eq(efp_said(s"${e}struct H\n    x: E\n    y: E\nextern get_fp() -> *extern(H) -> H\n" +
+                       "val f = get_fp()\nf(f(H(E(), E())))\n", efp_win()), "")
+    assert_eq(efp_said(s"${e}struct Z\n    a: i32\n    z: [0]E\nextern get_fp() -> *extern(Z) -> i32\n" +
+                       "keep(get_fp()(Z(1, [])))\n", efp_win()), "")
+    assert_eq(efp_said(s"${efp_shapes()}extern keep(a: i32)\nextern get_fp() -> *extern(*O) -> *O\n" +
+                       "extern made() -> *O\nkeep(get_fp()(made()).a)\n", efp_win()), "")
+    assert_eq(efp_said("struct P\n    a: i32\n    b: i32\nextern keep(a: i32)\n" +
+                       "extern get_fp() -> *extern(P) -> P\nkeep(get_fp()(P(1, 2)).a)\n", efp_win()), "")
+
+// `reference/ffi.md § What crosses the boundary` quotes this refusal in a `text` block; this pins it.
+@test("the ffi page's function pointer example is refused in the words the page quotes")
+efp_ffi_page_example()
+    val text = "struct Empty\nend Empty\n\nstruct Tagged\n    id: i32\n    mark: Empty\n    len: i32\n\n" +
+               "extern on_send(f: *extern(Tagged) -> unit)\n\non_send(null)\n"
+
+    efp_has(efp_said(text, efp_win()),
+            "parameter 1 of the function pointer type '*extern(Tagged) -> unit' is Tagged, whose field " +
+            "'mark' is Empty: an empty struct occupies no bytes in sysl and four in Microsoft's C on " +
+            "'x86_64-windows', so Tagged is laid out differently on the two sides of the call. Give the " +
+            "empty struct a field, or take 'mark' out of Tagged")
+    efp_elsewhere(text)
+
+// As `wne_unreached_extern_accepted`: what the build never emits is never asked.
+@test("such a function pointer type nothing reached mentions is not refused")
+efp_unreached_accepted()
+    assert_eq(efp_said(s"${efp_shapes()}type Cb = *extern(O) -> i32\nextern install(f: *extern(O) -> i32)\n" +
+                       "extern give() -> Cb\n", efp_win()), "")

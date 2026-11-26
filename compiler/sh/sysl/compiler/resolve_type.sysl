@@ -220,8 +220,10 @@ private storage_aggregate(t: Type, inner: TypeRef, written: string) -> string = 
 
 // On AArch64 a volatile access is one plain `ldr` or `str`, which moves at most eight bytes: a wider
 // scalar has no one instruction (LLVM would pair two registers), so it is refused there. Every other
-// processor keeps the access it has.
+// processor keeps the access it has, 32-bit ARM's below.
 private a64_wide_ok(a: &Analysis, scope: Scope, span: Span, shown: string, bits: int) -> bool
+    if a.tables.target.cpu == Thumb then return arm_wide_ok(a, scope, span, shown, bits)
+
     if a.tables.target.cpu != Aarch64 || bits <= 64 then return true
 
     a.fault(scope, span, s"'volatile $shown' is not a type on ${a.tables.target.name}: it is $bits bits " +
@@ -229,6 +231,19 @@ private a64_wide_ok(a: &Analysis, scope: Scope, span: Span, shown: string, bits:
             "Make two 64-bit volatile accesses instead, as two 'volatile u64' fields or elements")
     false
 end a64_wide_ok
+
+// On 32-bit ARM a volatile wider than a word is made as one plain `ldr` or `str` per 32-bit word, lowest
+// address first (`emit.sysl`'s `emit_arm_words`), so a scalar wider than 32 bits must be whole words: a
+// `u48` or a `u40` has a tail no word access moves, and is refused.
+private arm_wide_ok(a: &Analysis, scope: Scope, span: Span, shown: string, bits: int) -> bool
+    if bits <= 32 || bits % 32 == 0 then return true
+
+    a.fault(scope, span, s"'volatile $shown' is not a type on ${a.tables.target.name}: it is $bits bits " +
+            "wide, and a 32-bit ARM volatile wider than 32 bits is made as whole 32-bit words, one 'ldr' or " +
+            s"'str' each, which $bits bits is not. Widen it to a multiple of 32 bits, as 'volatile u64', or " +
+            "split it into volatile fields of 32 bits or fewer")
+    false
+end arm_wide_ok
 
 // Whether a `volatile` may qualify this type. The qualifier promises exactly the one load or the one
 // store the source wrote, so it means something only where an access is one instruction; a register
