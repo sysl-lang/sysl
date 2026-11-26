@@ -4313,18 +4313,23 @@ private loop_carries(t: &Track, body: Buf[TStmt], else_block: Option[TBlock]) ->
 end loop_carries
 
 // Whether a value of this type can hold a raw pointer, through a box as well as in place: a box of a
-// struct that holds one holds it too, and an object behind a trait -- a closure behind a `&Fn` among
-// them -- may hold anything, its type saying nothing of what it captured.
+// struct that holds one holds it too. **An object behind a trait holds one where some type the
+// program erases to that trait does** (`object_holds`): a whole program's build sees every table
+// (`Analysis.closed`), so every value an object can stand for is the type of one of them, and an
+// object whose every implementation holds only counted references and numbers is as plain as a `&T`
+// of one of them. A closure behind a `&Fn` may hold anything, its type saying nothing of what it
+// captured, and so may any object in a build that does not see every table -- a library, or C's
+// half of a program, which may be handed an object made where it cannot look.
 //
-// Asked of nearly every value a body passes around, so a struct's or an enum's answer is worked out
-// once per compilation.
+// Asked of nearly every value a body passes around, so a struct's, an enum's or a trait's answer is
+// worked out once per compilation.
 //
 // **A pointer to an `opaque struct` is a handle, never an address of anybody's frame**: a type with
 // no layout cannot be a local, a field or an element, so the storage it points at is C's. Making one
 // out of a local's address takes a `ptr_cast`, which is unchecked.
 may_hold_pointer(cx: &KeepsCx, t: Type) -> bool = t match
     Ptr(inner, _) -> !is_opaque_struct(*inner)
-    Trait(_, _, _) -> true
+    Trait(name, _, _) -> !cx.an.closed || fn_is_call(name) || aggregate_holds(cx, t, s"trait ${type_show(t)}")
     Ref(inner, _) -> may_hold_pointer(cx, *inner)
     Weak(inner) -> may_hold_pointer(cx, *inner)
     Volatile(inner) -> may_hold_pointer(cx, *inner)
@@ -4340,31 +4345,42 @@ private aggregate_holds(cx: &KeepsCx, t: Type, key: string) -> bool
         None -> ()
 
     var seen: Buf[string] = buf()
-    val out = holds_pointer_within(t, &seen)
+    val out = holds_pointer_within(cx, t, &seen)
 
     cx.pointerish.put(key, out)
     out
 end aggregate_holds
 
-// The same, with the structs and enums already being asked about, which a type reaching itself
-// through a box answers nothing new for.
-private holds_pointer_within(t: Type, seen: *Buf[string]) -> bool = t match
+// The same, with the structs, enums and traits already being asked about, which a type reaching
+// itself through a box answers nothing new for.
+private holds_pointer_within(cx: &KeepsCx, t: Type, seen: *Buf[string]) -> bool = t match
     Ptr(inner, _) -> !is_opaque_struct(*inner)
-    Trait(_, _, _) -> true
-    Ref(inner, _) -> holds_pointer_within(*inner, seen)
-    Weak(inner) -> holds_pointer_within(*inner, seen)
-    Volatile(inner) -> holds_pointer_within(*inner, seen)
-    Array(_, elem, _) -> holds_pointer_within(*elem, seen)
-    Slice(elem, _) -> holds_pointer_within(*elem, seen)
+    Trait(name, _, _) -> !cx.an.closed || fn_is_call(name) || (first_visit(t, seen) && object_holds(cx, t, seen))
+    Ref(inner, _) -> holds_pointer_within(cx, *inner, seen)
+    Weak(inner) -> holds_pointer_within(cx, *inner, seen)
+    Volatile(inner) -> holds_pointer_within(cx, *inner, seen)
+    Array(_, elem, _) -> holds_pointer_within(cx, *elem, seen)
+    Slice(elem, _) -> holds_pointer_within(cx, *elem, seen)
     // **A closure literal with captures may hold the address of each `var` it captures** (`closure_mode.sysl`),
     // and whether it does is what this analysis is asked to decide -- so its value is followed
     // wherever it goes, whatever its fields say before the decision.
     Struct(d) -> frozen_element(t) match
-        Some(elem) -> holds_pointer_within(elem, seen)
+        Some(elem) -> holds_pointer_within(cx, elem, seen)
         None -> (is_closure_literal(t) && !d.fields.is_empty()) ||
-            (first_visit(t, seen) && fields_hold_pointer(d.fields, seen))
-    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(d.variants, seen)
+            (first_visit(t, seen) && fields_hold_pointer(cx, d.fields, seen))
+    Enum(d) -> first_visit(t, seen) && variants_hold_pointer(cx, d.variants, seen)
     _ -> false
+
+// **Whether an object of the trait type `tr` may hold a raw pointer, in a build that sees every
+// table**: an object holds what the value it was made from holds, and every such value's type has a
+// table of the trait in the program (`trait_tables` -- those at the trait's own arguments, or every
+// table of the trait where its arguments name none). A trait no table is built for has no object.
+private object_holds(cx: &KeepsCx, tr: Type, seen: *Buf[string]) -> bool
+    for vt in trait_tables(cx.tables, tr)
+        if holds_pointer_within(cx, vt.for_type, seen) then return true
+
+    false
+end object_holds
 
 private is_opaque_struct(t: Type) -> bool = t match
     Struct(d) -> d.opaque
@@ -4419,16 +4435,16 @@ private first_visit(t: Type, seen: *Buf[string]) -> bool
     true
 end first_visit
 
-private fields_hold_pointer(fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
+private fields_hold_pointer(cx: &KeepsCx, fields: Buf[(string, Type)], seen: *Buf[string]) -> bool
     for item in fields
-        if holds_pointer_within(item.1, seen) then return true
+        if holds_pointer_within(cx, item.1, seen) then return true
 
     false
 end fields_hold_pointer
 
-private variants_hold_pointer(vs: Buf[EnumVariant], seen: *Buf[string]) -> bool
+private variants_hold_pointer(cx: &KeepsCx, vs: Buf[EnumVariant], seen: *Buf[string]) -> bool
     for v in vs
-        if fields_hold_pointer(v.fields, seen) then return true
+        if fields_hold_pointer(cx, v.fields, seen) then return true
 
     false
 end variants_hold_pointer

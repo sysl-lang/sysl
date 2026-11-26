@@ -133,6 +133,7 @@ private dvp_not_inert(callee: string)
 
     if n >= 0 then assert_eq(n, 2, callee)
 
+// guards: a callee reaching a releasing never-returning function is lent with a count
 @test("a callee that may reach a never-returning function that releases is lent the place with a count")
 dvp_releasing_die_keeps_the_count()
     dvp_not_inert("peek(t: &Tag) -> int\n    if t.id < 0 then die(t)\n\n    t.id\n")
@@ -168,6 +169,7 @@ dvp_slice_literal_is_inert()
             t.id
         """)
 
+// guards: a print-only diverging function leaves its caller inert
 @test("a user function every path of which diverges after only printing leaves its caller inert")
 dvp_user_never_that_prints()
     dvp_inert("peek(t: &Tag) -> int\n    if t.id < 0 then bail(t)\n\n    t.id\n")
@@ -291,6 +293,7 @@ private dvp_releasing_export() -> string = raw"""
         G = Holder(Tag(3))
     """
 
+// guards: a releasing export makes every foreign call untrusted
 @test("an exported function that releases, which C may call back, makes every foreign call untrusted")
 dvp_releasing_export_untrusts_foreign()
     // `panic` hands `putbytes` a view of its message, so a callback during the write could matter.
@@ -308,6 +311,7 @@ dvp_releasing_export_untrusts_foreign()
         look() -> int = 1
         """)
 
+// guards: a never-returning call with numbers stays trusted beside a releasing export
 @test("a never-returning call handed only numbers stays trusted beside an export that releases")
 dvp_sealed_calls_survive_distrust()
     // `exit` and `trap` answer `never` and take nothing but numbers: a callback during either can free
@@ -347,6 +351,7 @@ dvp_sealed_calls_survive_distrust()
     dvp_not_inert("quit(p: *Holder) -> never\n    G = Holder(Tag(9))\n    print(p.tag.id)\n    exit(1)\n\n" +
                   "peek(t: &Tag) -> int\n    if t.id < 0 then quit(&G)\n\n    t.id\n" + dvp_releasing_export())
 
+// guards: a never-returning call with plain-number aggregates is sealed
 @test("a never-returning call handed structs, arrays and enums made only of numbers is sealed as well")
 dvp_sealed_by_plain_aggregates()
     // A struct of numbers holds no count, address or view, so it lends nothing either.
@@ -415,6 +420,7 @@ private dvp_stop() -> string = raw"""
 
     """
 
+// guards: a library artifact trusts no foreign call, so keeps counts
 @test("a library artifact cannot know what its program exports, so it trusts no foreign call that comes back")
 dvp_library_artifact_trusts_nothing()
     val text = dvp_program("peek(t: &Tag) -> int\n    if t.id < 0 then panic(\"negative\")\n\n    t.id\n")

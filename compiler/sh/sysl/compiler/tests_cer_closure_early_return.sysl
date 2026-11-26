@@ -1,0 +1,150 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.process.capture
+
+// **A value a closure returns early is held to the result its body yields**, as a function's whose
+// result is read off its body is. A closure with no context was read once with its result unknown,
+// so a `return "s"` from a body ending in `5` went unchecked and was lowered as an `int` return of a
+// string -- clang refused the IR ("value doesn't match function result type"). And the value was
+// read against that unknown result as though it were a type, so `return if c then Ok(1) else
+// Err("b")` could not pool its branches as the same `if` ending the body does. Now such a body is
+// read once on trial and again against what it yields (`closure.sysl`'s `closure_body`), and a
+// returned value is read with nothing expected while the result is unknown (`stmt.sysl`'s
+// `returned_value`).
+//
+// The axes: **the value** (the result's own type, a narrower integer that widens, a type that does
+// not fit, an `if` whose branches pool into a `Result`, a heap string) × **the context** (none, a
+// generic `R`, `Option.and_then`, a typed `val`) × **the form** (a closure, a function whose result
+// is read off its body -- the twin that already held) × **the outcome** (output and a heap that
+// nets zero; the refusal, exactly). Skipped, with the reason: a bare `return` (no value, nothing to
+// hold to the result); an early `return None` (its `T` is known to neither form, which both refuse
+// alike -- pinned below).
+
+private cer_counted(text: string) -> (string, string)
+    val prog = lbr_program(text)
+    val out_dir = lbr_temp("sysl-cer-exe")
+
+    force_alloc_counting(true)
+
+    val built = build_native_program(prog, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> (s"refused: ${failure_text(why)}", "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([prog, out_dir])
+    said
+end cer_counted
+
+// Asserts the program prints `want` and its counted heap nets zero.
+private cer_prints(text: string, want: string)
+    if !lbr_ready() then return
+
+    val (out, err) = cer_counted(text)
+
+    assert_eq(out, want)
+    assert(!err.contains("still live"), err)
+
+// Asserts the whole list of diagnostics, one `line:col message` per line.
+private cer_says(text: string, want: string)
+    if !lbr_ready() then return
+
+    assert_eq(isc_diags(text), want)
+
+@test("a value returned early that does not fit the body's result is refused, closure and function alike")
+cer_mismatch_refused()
+    cer_says(raw"""
+        val bad = (c: bool) ->
+            if c then return "s"
+
+            5
+
+        f(c: bool) =
+            if c then return "s"
+
+            5
+
+        print(bad(true), f(true))
+        """, "2:15 return type mismatch: expected int, got string\n" +
+             "7:15 return type mismatch: expected int, got string\n")
+
+@test("a value returned early at a generic R, at and_then and into a typed val is held to the result")
+cer_mismatch_in_context()
+    cer_says(raw"""
+        run[R](f: &Fn() -> R) -> R = f()
+
+        val a = run(() ->
+            if 1 > 0 then return "s"
+
+            5)
+
+        val b = Some(3).and_then(n ->
+            if n > 2 then return Some("s")
+
+            Some(n))
+
+        val c: &Fn(bool) -> int = k ->
+            if k then return "s"
+
+            5
+
+        print(a, b.is_some(), c(true))
+        """, "4:19 return type mismatch: expected int, got string\n" +
+             "9:31 'value' of 'Some' is int, but string was given\n" +
+             "14:15 return type mismatch: expected int, got string\n")
+
+@test("a value returned early of the result's type, or narrower, is taken")
+cer_fitting_values()
+    cer_prints(raw"""
+        val k = (n: int) ->
+            if n > 2 then return 1u8
+
+            5
+
+        g(n: int) =
+            if n > 2 then return 1u8
+
+            5
+
+        val s = (c: bool) ->
+            if c then return s"x$c"
+
+            "y"
+
+        print(k(1), k(3), g(1), g(3), s(true), s(false))
+        """, "5 1 5 1 xtrue y\n")
+
+@test("a returned 'if' pools its branches into a Result, as the 'if' ending the body does")
+cer_pooled_branches()
+    cer_prints(raw"""
+        val f = (c: bool, d: bool) ->
+            if d then return if c then Ok(1) else Err("b")
+
+            if c then Ok(2) else Err("q")
+
+        print(f(true, true).unwrap(), f(false, true).unwrap_err(), f(true, false).unwrap(), f(false, false).unwrap_err())
+        """, "1 b 2 q\n")
+
+@test("an early 'return None' says what it says in a function whose result is read off its body")
+cer_return_none()
+    cer_says(raw"""
+        val f = (n: int) ->
+            if n > 2 then return None
+
+            Some(n)
+
+        g(n: int) =
+            if n > 2 then return None
+
+            Some(n)
+
+        print(f(1).is_some(), g(1).is_some())
+        """, "2:26 cannot infer the type argument 'T' of 'None' here — annotate the expected type\n" +
+             "7:26 cannot infer the type argument 'T' of 'None' here — annotate the expected type\n")
