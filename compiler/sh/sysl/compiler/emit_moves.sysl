@@ -45,6 +45,9 @@ import sysl.container.{Map, map, Set, set}
 // of what the chunk owns; the column holding the chunk is gone at the statement's end, and the chunk
 // must not go with it. Nor is such a local handed into a branch's arms (`hand_in`), which would end
 // it where the arm does. A plain counted value has no such reader, so its last use still ends it.
+// Two exceptions move no destructor, and so are taken: an owned parameter that keeps the value
+// calmly, in a statement nothing observable follows (`calm_keeps.sysl`), and an arm of a branch
+// that is the last thing its scope does (`hand_in`).
 //
 // What a borrowing call is handed is not here: a by-value argument is borrowed (`borrowing.sysl`),
 // so a call takes no count at its edge to be taken over.
@@ -63,9 +66,10 @@ struct Moves
     source: Option[TExpr]
     dying: Set[string]
     drain: Option[Drain]
+    calm: Calm
 end Moves
 
-moves_none() -> Moves = Moves(false, set(), set(), map(), None, set(), None)
+moves_none() -> Moves = Moves(false, set(), set(), map(), None, set(), None, calm_none())
 
 // The names a walk collected.
 private struct Names
@@ -179,7 +183,12 @@ dying_for_stmt(s: TStmt, dying: Set[string]) -> Set[string] = s match
 // `is` term leaves a scope of its own open over the success path (`cond_scopes` of them), and a name
 // it binds is no local of the declaring scope: it exists only on the edge where the pattern held, so
 // handing it into the `else` would give back a slot that path never wrote.
-hand_in(e: *Emit, cond: Buf[TCondTerm], cond_scopes: usize) -> Buf[(Val, Type)]
+//
+// **A local whose release can run a destructor is handed in only where nothing runs after the branch**
+// (`ends_still`): the branch is the last of its scope, which ends with nothing but releases that run
+// no code, and nothing the statement holds runs code when it goes. An arm that does not use it then
+// ends it where the scope would have, with nothing between that could see the difference.
+hand_in(e: *Emit, cond: Buf[TCondTerm], cond_scopes: usize, ty: Type) -> Buf[(Val, Type)]
     var out: Buf[(Val, Type)] = buf()
     val dying = e.moves.dying
 
@@ -187,6 +196,7 @@ hand_in(e: *Emit, cond: Buf[TCondTerm], cond_scopes: usize) -> Buf[(Val, Type)]
 
     if dying.is_empty() || e.owned_marks.len() <= cond_scopes then return out
 
+    val still = cond_scopes == 0 && e.moves.calm.rest_empty && !runs_code(e, ty) && temps_run_no_code(e)
     val declaring = e.owned_marks.len() - 1 - cond_scopes
     val named = names_none()
 
@@ -207,7 +217,8 @@ hand_in(e: *Emit, cond: Buf[TCondTerm], cond_scopes: usize) -> Buf[(Val, Type)]
         for j in e.owned_marks[declaring]..<upto
             val s = e.owned_slots[j]
 
-            if reg_of(s.0) == slot && movable_type(s.1) && !runs_code(e, s.1) then found = Some(j)
+            if reg_of(s.0) == slot && movable_type(s.1) && (!runs_code(e, s.1) || still && later_run_no_code(e, j + 1))
+                found = Some(j)
 
         if found.is_some()
             out.push(e.owned_slots[found.unwrap()])
@@ -424,6 +435,14 @@ private temp_at(e: *Emit, v: Val, ty: Type) -> Option[usize]
     None
 end temp_at
 
+// An erased temporary stays the statement's under the type it now has (`gen_erase`): the object and
+// its count are the same, and it is let go of the same way, so a destination taking the erased value
+// finds the temporary to take.
+retype_temp(e: *Emit, from: Val, from_ty: Type, to: Val, to_ty: Type)
+    temp_at(e, from, from_ty) match
+        Some(j) -> e.temps[j] = (to, to_ty)
+        None -> ()
+
 // Whether a direct call's argument, handed to an owned parameter, would hand over a count this frame
 // holds -- a local at its last use, or a value a call or a construction made for this one -- rather
 // than take one for the callee, asked before the argument is worked out. Anything else (a read out
@@ -449,10 +468,14 @@ end hands_count_over
 
 // Where a local at its last use sits among the slots the innermost scope owns. A destination that
 // is not `lasting` takes no local whose release can run a destructor: that one lives to its scope's
-// end.
+// end -- unless the destination is a parameter that keeps it calmly, in a statement nothing observable
+// follows (`calm_keeps.sysl`, `Calm.handing`), and no slot the scope gives back before it runs code.
 private local_at(e: *Emit, name: string, ty: Type, lasting: bool) -> Option[usize]
     if !e.moves.last_uses.has(name) || !movable_type(ty) || e.owned_marks.is_empty() then return None
-    if !lasting && runs_code(e, ty) then return None
+
+    val runs = !lasting && runs_code(e, ty)
+
+    if runs && !e.moves.calm.handing then return None
     if e.caller_exposed.has(OPAQUE) || e.caller_exposed.has(name) || is_promoted(e, name) then return None
 
     val slot = reg_of(local_slot(e, name))
@@ -460,10 +483,30 @@ private local_at(e: *Emit, name: string, ty: Type, lasting: bool) -> Option[usiz
     for j in e.owned_marks[e.owned_marks.len() - 1]..<e.owned_slots.len()
         val s = e.owned_slots[j]
 
-        if reg_of(s.0) == slot && s.1 == ty then return Some(j)
+        if reg_of(s.0) == slot && s.1 == ty
+            if runs && !later_run_no_code(e, j + 1) then return None
+
+            return Some(j)
 
     None
 end local_at
+
+// Whether every slot from `from` to the end of the innermost scope is let go of without running code
+// -- the ones the scope's end gives back before the slot just below them.
+private later_run_no_code(e: *Emit, from: usize) -> bool
+    for j in from..<e.owned_slots.len()
+        if runs_code(e, e.owned_slots[j].1) then return false
+
+    true
+end later_run_no_code
+
+// Whether nothing the statement being emitted holds runs code when the statement lets it go.
+private temps_run_no_code(e: *Emit) -> bool
+    for t in temps_here(e)
+        if runs_code(e, t.1) then return false
+
+    true
+end temps_run_no_code
 
 // Whether a local of this type may hand its count over: anything but an array held by value, which a
 // view taken earlier may still be standing on.

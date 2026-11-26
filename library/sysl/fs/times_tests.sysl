@@ -1,0 +1,460 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.fs.sys as fsys
+import sysl.text.Search
+import sysl.time.{Instant, now}
+
+// `set_times`, `link_set_times` and `Meta.created`: setting a path's two times, together or one at a
+// time, on what a link names or on the link itself; and reading the time an entry was made.
+//
+// The axes: which call (following, or the link itself); which times are given (both, accessed alone,
+// modified alone, neither); what the path is (a file, a directory, a link to a file, a link to
+// nothing, nothing, something under a file, a sliced string, a path too long for any filesystem);
+// and the time (with sub-millisecond digits, before the epoch, the epoch itself, the clock's now).
+// The birth time is read through each of the three hooks that fill a reading in (`stat`, `lstat`
+// and `Dir`'s `stat_beneath`), and from a reading whose supplier did or did not fill it.
+//
+// Skipped: a filesystem that keeps coarser times than an `Instant` (none is mounted where this
+// runs); a time past 2038 on a 32-bit `time_t` (no such host is a target); `NotPermitted` from
+// setting another user's file (it needs a second account).
+//
+// Each test makes its own temporary directory, so the suite may run them all at once.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+private scratch(name: string) -> string = make_temp_dir("sysl-fs-times-" + name).unwrap()
+
+// Two times with every microsecond digit set, unequal, so a swapped pair or a rounding to the
+// millisecond reads back wrong.
+private val first: Instant = Instant(1500000000123456)
+private val second: Instant = Instant(1400000000654321)
+
+private times(path: string) -> (long, long)
+    val m = metadata(path).unwrap()
+
+    (m.accessed.us, m.modified.us)
+
+private link_times(path: string) -> (long, long)
+    val m = link_metadata(path).unwrap()
+
+    (m.accessed.us, m.modified.us)
+
+// -- both times, and to the microsecond -----------------------------------------------------------
+
+@test("set_times sets a file's access and modification times, each to the microsecond")
+fst_both_on_a_file()
+    val dir = scratch("both")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_times(path, Some(first), Some(second)).unwrap()
+    assert_eq(times(path), (first.us, second.us))
+    ignore(remove_dir_all(dir))
+end fst_both_on_a_file
+
+@test("set_times sets a directory's two times")
+fst_both_on_a_directory()
+    val dir = scratch("dir")
+
+    set_times(dir, Some(second), Some(first)).unwrap()
+    assert_eq(times(dir), (second.us, first.us))
+    ignore(remove_dir_all(dir))
+end fst_both_on_a_directory
+
+@test("a time before the epoch, a microsecond before it, and the epoch itself round trip")
+fst_times_around_the_epoch()
+    val dir = scratch("epoch")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    // Floored to whole seconds with the rest positive, as a `struct timespec` must be: -1234567 is
+    // -2 s and 765433000 ns, and a truncating split would hand the kernel -1 s and a negative rest.
+    for us in [-1234567, -1, 0, 1]
+        set_times(path, Some(Instant(us)), Some(Instant(us))).unwrap()
+        assert_eq(times(path), (us, us))
+
+    ignore(remove_dir_all(dir))
+end fst_times_around_the_epoch
+
+@test("set_times to the clock's now reads back as exactly that now")
+fst_now()
+    val dir = scratch("now")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    val t = now()
+
+    set_times(path, Some(t), Some(t)).unwrap()
+    assert_eq(times(path), (t.us, t.us))
+    ignore(remove_dir_all(dir))
+end fst_now
+
+@test("set_times with the same time twice is set_modified")
+fst_agrees_with_set_modified()
+    val dir = scratch("agree")
+    val a = dir + "/a"
+    val b = dir + "/b"
+
+    write_text(a, "x").unwrap()
+    write_text(b, "x").unwrap()
+    set_times(a, Some(first), Some(first)).unwrap()
+    set_modified(b, first).unwrap()
+    assert_eq(times(a), times(b))
+    ignore(remove_dir_all(dir))
+end fst_agrees_with_set_modified
+
+// -- one time left as it is -----------------------------------------------------------------------
+
+@test("set_times with no access time leaves it as it was and sets the modification time")
+fst_modified_alone()
+    val dir = scratch("modified-alone")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_times(path, Some(first), Some(first)).unwrap()
+    set_times(path, None, Some(second)).unwrap()
+    assert_eq(times(path), (first.us, second.us))
+    ignore(remove_dir_all(dir))
+end fst_modified_alone
+
+@test("set_times with no modification time leaves it as it was and sets the access time")
+fst_accessed_alone()
+    val dir = scratch("accessed-alone")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_times(path, Some(first), Some(first)).unwrap()
+    set_times(path, Some(second), None).unwrap()
+    assert_eq(times(path), (second.us, first.us))
+    ignore(remove_dir_all(dir))
+end fst_accessed_alone
+
+@test("set_times with neither time changes nothing and succeeds")
+fst_neither()
+    val dir = scratch("neither")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    set_times(path, Some(first), Some(second)).unwrap()
+    set_times(path, None, None).unwrap()
+    assert_eq(times(path), (first.us, second.us))
+    link_set_times(path, None, None).unwrap()
+    assert_eq(times(path), (first.us, second.us))
+    ignore(remove_dir_all(dir))
+end fst_neither
+
+// -- the link itself ------------------------------------------------------------------------------
+
+@test("link_set_times sets a link's own times and leaves the file it names untouched")
+fst_link_leaves_the_target()
+    val dir = scratch("link")
+    val target = dir + "/target"
+    val link = dir + "/link"
+
+    write_text(target, "x").unwrap()
+    set_times(target, Some(first), Some(first)).unwrap()
+    symlink(target, link).unwrap()
+    link_set_times(link, Some(second), Some(Instant(1300000000000001))).unwrap()
+
+    assert_eq(link_times(link), (second.us, 1300000000000001))
+    assert_eq(times(target), (first.us, first.us))
+
+    // `metadata` follows the link, so it reads the target's times, not the ones just set.
+    assert_eq(times(link), (first.us, first.us))
+    ignore(remove_dir_all(dir))
+end fst_link_leaves_the_target
+
+@test("set_times through a link sets the file it names and leaves the link's own times")
+fst_follow_leaves_the_link()
+    val dir = scratch("follow")
+    val target = dir + "/target"
+    val link = dir + "/link"
+
+    write_text(target, "x").unwrap()
+    symlink(target, link).unwrap()
+    link_set_times(link, Some(first), Some(first)).unwrap()
+    set_times(link, Some(second), Some(second)).unwrap()
+
+    assert_eq(times(target), (second.us, second.us))
+    assert_eq(link_times(link), (first.us, first.us))
+    ignore(remove_dir_all(dir))
+end fst_follow_leaves_the_link
+
+@test("link_set_times with one time leaves the link's other time as it was")
+fst_link_one_time()
+    val dir = scratch("link-one")
+    val link = dir + "/link"
+
+    symlink(dir + "/nowhere", link).unwrap()
+    link_set_times(link, Some(first), Some(first)).unwrap()
+    link_set_times(link, None, Some(second)).unwrap()
+    assert_eq(link_times(link), (first.us, second.us))
+    link_set_times(link, Some(second), None).unwrap()
+    assert_eq(link_times(link), (second.us, second.us))
+    ignore(remove_dir_all(dir))
+end fst_link_one_time
+
+@test("a link to nothing has times link_set_times sets, and set_times reports NotFound through it")
+fst_dangling_link()
+    val dir = scratch("dangling")
+    val link = dir + "/link"
+
+    symlink(dir + "/nowhere", link).unwrap()
+    link_set_times(link, Some(first), Some(second)).unwrap()
+    assert_eq(link_times(link), (first.us, second.us))
+
+    set_times(link, Some(first), Some(second)) match
+        Ok(_) -> assert(false, "a time was set through a link to nothing")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    // Neither time given still asks the path to be there, followed.
+    set_times(link, None, None) match
+        Ok(_) -> assert(false, "a link to nothing answered as there when followed")
+        Err(e) -> assert_eq(e, IoError.NotFound)
+
+    link_set_times(link, None, None).unwrap()
+    ignore(remove_dir_all(dir))
+end fst_dangling_link
+
+@test("link_set_times on a path that is not a link sets it as set_times does")
+fst_link_on_a_file()
+    val dir = scratch("link-file")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+    link_set_times(path, Some(first), Some(second)).unwrap()
+    assert_eq(times(path), (first.us, second.us))
+    ignore(remove_dir_all(dir))
+end fst_link_on_a_file
+
+// -- what is not there ----------------------------------------------------------------------------
+
+@test("set_times and link_set_times on a path that is not there report NotFound, whatever is given")
+fst_missing()
+    val dir = scratch("missing")
+    val path = dir + "/nothing"
+
+    for follow in [true, false]
+        for given in 0..<4
+            val a = if (given & 1) != 0 then Some(first) else None
+            val m = if (given & 2) != 0 then Some(second) else None
+            val r = if follow then set_times(path, a, m) else link_set_times(path, a, m)
+
+            r match
+                Ok(_) -> assert(false, f"a time was set on nothing (follow $follow, given $given)")
+                Err(e) -> assert_eq(e, IoError.NotFound)
+
+    ignore(remove_dir_all(dir))
+end fst_missing
+
+@test("set_times under something that is not a directory reports NotADirectory")
+fst_under_a_file()
+    val dir = scratch("under")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    set_times(path + "/inside", Some(first), None) match
+        Ok(_) -> assert(false, "a time was set under a file")
+        Err(e) -> assert_eq(e, IoError.NotADirectory)
+
+    ignore(remove_dir_all(dir))
+end fst_under_a_file
+
+@test("a path longer than any filesystem here allows is refused as too long, not truncated")
+fst_overlong()
+    var p = "/tmp/"
+
+    while p.len < 5000
+        p = p + "x"
+
+    set_times(p, Some(first), Some(first)) match
+        Ok(_) -> assert(false, "a time was set on an overlong path")
+        Err(e) -> assert(e.message().contains("too long"), e.message())
+
+    link_set_times(p, Some(first), Some(first)) match
+        Ok(_) -> assert(false, "a time was set on an overlong path")
+        Err(e) -> assert(e.message().contains("too long"), e.message())
+end fst_overlong
+
+/** A `string` is not terminated, so the bytes after a slice must not be read as part of the path:
+ * a slice of a longer name whose whole is NOT there names a file that is.
+ */
+@test("a sliced path is its length, not a terminator")
+fst_sliced_path()
+    val dir = scratch("sliced")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    val longer = path + "-is-not-here"
+
+    set_times(longer[0..<path.len], Some(first), Some(second)).unwrap()
+    assert_eq(times(path), (first.us, second.us))
+    link_set_times(longer[0..<path.len], Some(second), Some(first)).unwrap()
+    assert_eq(times(path), (second.us, first.us))
+    ignore(remove_dir_all(dir))
+end fst_sliced_path
+
+// -- the birth time -------------------------------------------------------------------------------
+
+/** macOS keeps a birth time on APFS, where the temporary directory is. Elsewhere it may be absent,
+ * and where it is present it must be the time the file was made, not something else read by mistake.
+ */
+@test("created is the time a new file was made, and macOS always answers it")
+fst_created_of_a_new_file()
+    val dir = scratch("created")
+    val path = dir + "/f"
+    val before = now()
+
+    write_text(path, "x").unwrap()
+
+    val after = now()
+    val created = metadata(path).unwrap().created
+
+#if macos
+    assert(created.is_some(), "macOS answered no birth time for a file on APFS")
+#endif
+
+    if created is Some(t)
+        // A second of slack each way: the filesystem's clock and this one are read separately.
+        assert(t.us >= before.us - 1000000, f"born ${t.us}, before ${before.us}")
+        assert(t.us <= after.us + 1000000, f"born ${t.us}, after ${after.us}")
+
+    ignore(remove_dir_all(dir))
+end fst_created_of_a_new_file
+
+@test("created reads the same through metadata, link_metadata and a Dir")
+fst_created_through_every_reading()
+    val dir = scratch("created-every")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    val followed = metadata(path).unwrap().created
+    val itself = link_metadata(path).unwrap().created
+    val d = open_dir(dir).unwrap()
+    val beneath = d.link_metadata("f").unwrap().created
+
+#if macos
+    assert(followed.is_some(), "metadata answered no birth time")
+    assert(beneath.is_some(), "a Dir answered no birth time")
+#endif
+
+    assert_eq(followed.is_some(), itself.is_some())
+    assert_eq(followed.is_some(), beneath.is_some())
+
+    if followed is Some(a)
+        if itself is Some(b) then assert_eq(a.us, b.us)
+        if beneath is Some(c) then assert_eq(a.us, c.us)
+
+    ignore(remove_dir_all(dir))
+end fst_created_through_every_reading
+
+@test("a link's own birth time is the link's, and the file's is the file's")
+fst_created_of_a_link()
+    val dir = scratch("created-link")
+    val target = dir + "/target"
+    val link = dir + "/link"
+
+    write_text(target, "x").unwrap()
+    set_times(target, Some(second), Some(second)).unwrap()
+    symlink(target, link).unwrap()
+
+    val of_target = metadata(link).unwrap().created
+    val of_link = link_metadata(link).unwrap().created
+
+    // One filesystem keeps a birth time for both kinds of entry or for neither.
+    assert_eq(of_target.is_some(), of_link.is_some())
+
+#if macos
+    // Setting the target's modification time to 2014 pulled its birth time back with it (below), so
+    // the two cannot agree: the link was made now.
+    assert(of_link.is_some(), "macOS answered no birth time for a link")
+    assert_eq(of_target.unwrap().us, second.us)
+    assert(of_link.unwrap().us > second.us, "the link's birth time is the target's")
+#endif
+
+    ignore(remove_dir_all(dir))
+end fst_created_of_a_link
+
+/** Darwin's own rule: a file cannot have been modified before it existed, so a modification time set
+ * earlier than the birth time moves the birth time back to it, and a later one leaves it alone. The
+ * access time moves nothing.
+ */
+@test("on macOS a modification time set before the birth time pulls the birth time back")
+fst_created_follows_an_earlier_modified()
+#if macos
+    val dir = scratch("created-earlier")
+    val path = dir + "/f"
+
+    write_text(path, "x").unwrap()
+
+    val born = metadata(path).unwrap().created.unwrap()
+
+    set_times(path, Some(second), None).unwrap()
+    assert_eq(metadata(path).unwrap().created.unwrap().us, born.us)
+
+    set_times(path, None, Some(Instant(born.us + 5000000))).unwrap()
+    assert_eq(metadata(path).unwrap().created.unwrap().us, born.us)
+
+    set_times(path, None, Some(second)).unwrap()
+    assert_eq(metadata(path).unwrap().created.unwrap().us, second.us)
+
+    set_times(path, None, Some(first)).unwrap()
+    assert_eq(metadata(path).unwrap().created.unwrap().us, second.us)
+
+    ignore(remove_dir_all(dir))
+#else
+    // Darwin's rule alone: elsewhere there is nothing to assert.
+    return
+#endif
+end fst_created_follows_an_earlier_modified
+
+// -- a reading's own word for "unknown" -----------------------------------------------------------
+
+@test("a reading whose supplier did not set the birth bit has no birth time, whatever its numbers")
+fst_unset_bit_is_none()
+    var st = fsys.unread()
+
+    st.created_s = 1500000000
+    st.created_ns = 5000
+
+    assert(meta_of(st).created.is_none(), "a birth time was read without its bit")
+end fst_unset_bit_is_none
+
+@test("a reading with the birth bit set has that birth time, the epoch included")
+fst_set_bit_is_some()
+    var st = fsys.unread()
+
+    st.has = fsys.stat_created
+    assert_eq(meta_of(st).created.unwrap().us, 0)
+
+    st.created_s = -2
+    st.created_ns = 765433000
+    assert_eq(meta_of(st).created.unwrap().us, -1234567)
+
+    st.created_s = 1500000000
+    st.created_ns = 123456789
+    assert_eq(meta_of(st).created.unwrap().us, 1500000000123456)
+
+    // A bit beside it, which nothing defines yet, neither hides the birth time nor makes one up.
+    st.has = fsys.stat_created | 2
+    assert_eq(meta_of(st).created.unwrap().us, 1500000000123456)
+    st.has = 2
+    assert(meta_of(st).created.is_none(), "a birth time was read from another bit")
+end fst_set_bit_is_some
+
+@test("a fresh reading is sixteen zeros, so a supplier that fills nothing answers no birth time")
+fst_unread_is_empty()
+    val st = fsys.unread()
+
+    assert_eq(st.has, 0)
+    assert_eq(st.created_s, 0)
+    assert_eq(st.created_ns, 0)
+    assert(meta_of(st).created.is_none(), "an empty reading has a birth time")
+end fst_unread_is_empty

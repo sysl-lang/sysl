@@ -5496,7 +5496,10 @@ read-modify-write costs a register whose read clears it. Under `@packed` a volat
 across two units of its declared type has no single access to make, and is refused. On AArch64 and on
 32-bit ARM each of those unit accesses is one plain `ldr`/`str` of the unit's width from a bare
 register address (on 32-bit ARM a `u64` unit is two, one per word), as every volatile access is there
-([memory](/reference/memory/#device-memory)).
+([memory](/reference/memory/#device-memory)). On 32-bit ARM a `@packed` struct of narrow fields is
+reached as its one container, so with a volatile field the container must be 8, 16 or 32 bits or whole
+32-bit words: two `u12` fields (24 bits) or two `u20` fields (40) are refused there, and a `u12` with a
+`u20` is one `ldr`.
 
 `@packed` on such a struct is GNU's `packed` (MSVC's `pack(1)`): the fields abut bit for bit, and
 `@align(n)` raises it as it raises any struct. The two kinds of bitfield do not mix in one struct — a

@@ -1,0 +1,409 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+
+// **Calm keeps**: where a local whose release can run a destructor may still be handed to an owned
+// parameter at its last use (`emit_moves.sysl`'s `local_at`, `reference/memory.md § A parameter the
+// function keeps arrives with its count`).
+//
+// Such a local lives to its scope's end: the caller retains it for the call and gives its own count
+// back there. Handing that count over instead changes one thing only -- where the destructor runs when
+// the callee's count is the last one to go. With the retain, it runs at the later of the scope's end
+// and the moment the callee's count goes; with the hand-over, at that moment. **The two agree wherever
+// the callee's count cannot go before the scope ends**, and this file is what proves it, from two
+// halves:
+//
+// - **The callee keeps it calmly**: on its one way out, the parameter lands somewhere that outlives the
+//   call -- a buffer's slot (`slot_place`), or another parameter that keeps it calmly -- and nothing runs
+//   between that and the return that could give a count back: no call, no release that can run code,
+//   no `defer`, no postcondition but plain reads. Nothing before it leaves early (`return`, `?`). That
+//   is a fact about the callee's body and its callees', a fixed point like `owned_params.sysl`'s.
+// - **The caller's statement is calm after**: the call is the whole statement (or the block's value),
+//   its result and every temporary of its arguments run no code when they go, and nothing from the
+//   statement's end to the scope's end calls or gives a count back (`Calm.rest_calm`) -- only plain
+//   reads, arithmetic and writes of uncounted places, a `return`, an `ensure`.
+//
+// Between the call and the scope's end nothing can then let go of what the callee kept, so the
+// destructor cannot run in between under either convention, and every print, store and destructor of
+// the program happens in the same order. `xs.push(a); xs.clear()` is not calm after, and keeps the
+// retain; so does a callee that pushes and then clears.
+//
+// A plain counted value needs none of this (`runs_code` is false): its release has no reader.
+
+// What the statement being emitted is followed by, to the end of its scope. `rest_calm`: nothing that
+// calls or gives back a count that can run code, and a scope whose end only releases. `rest_empty`:
+// nothing at all. `whole` is the span of the call that is the whole statement, where it is one.
+// `handing` is set by `hand_over_args` around the one argument it has proved may be handed over.
+struct Calm
+    rest_calm: bool
+    rest_empty: bool
+    whole: Option[Span]
+    handing: bool
+
+calm_none() -> Calm = Calm(false, false, None, false)
+
+// For each statement of a block, whether everything from it to the block's end -- the value included
+// -- is calm; one longer than the block, its last entry the value's own. All false where the scope's
+// end runs more than releases (`quiet_end`), where the block defers anything (a `defer` runs as the
+// scope ends), or where no type of the program has a destructor, since then nothing asks.
+calm_suffix(e: *Emit, xs: Buf[TStmt], tail: Option[TExpr], quiet_end: bool) -> Buf[bool]
+    var out: Buf[bool] = buf()
+    val n = xs.len()
+    var ok = quiet_end && !e.destructors.is_empty() && !defers_in(xs)
+
+    if ok && tail.is_some() then ok = calm_expr(e, tail.unwrap())
+
+    var backwards: Buf[bool] = buf()
+
+    backwards.push(ok)
+
+    for j in 0..<n
+        ok = ok && calm_stmt(e, xs[n - 1 - j])
+        backwards.push(ok)
+
+    for j in 0..<backwards.len()
+        out.push(backwards[backwards.len() - 1 - j])
+
+    out
+end calm_suffix
+
+// The calm statement `i` of a block is emitted under.
+calm_at(xs: Buf[TStmt], i: usize, tail: Option[TExpr], suffix: Buf[bool]) -> Calm
+    val after = i + 1 < suffix.len() && suffix[i + 1]
+    val whole = xs[i] match
+        TExprStmt(x) -> whole_call(x)
+        _ -> None
+
+    Calm(after, after && i + 1 == xs.len() && tail.is_none(), whole, false)
+end calm_at
+
+// The calm a block's value is emitted under: nothing follows it but the scope's end.
+calm_tail(e: *Emit, xs: Buf[TStmt], tail: TExpr, quiet_end: bool) -> Calm
+    val ok = quiet_end && !e.destructors.is_empty() && !defers_in(xs)
+
+    Calm(ok, ok, whole_call(tail), false)
+end calm_tail
+
+// Whether a function's end runs nothing but releases: no task to complete, no `old` snapshot, and
+// only postconditions made of plain reads.
+ends_quietly(e: *Emit, f: TFunc, is_async: bool) -> bool
+    if is_async || f.marks.is_async() || !f.olds.is_empty() then return false
+
+    for c in f.ensures
+        if !calm_expr(e, c.cond) then return false
+
+    true
+end ends_quietly
+
+private whole_call(x: TExpr) -> Option[Span] = *x.kind match
+    TCall(_, _, _, _) -> Some(x.span)
+    _ -> None
+
+private defers_in(xs: Buf[TStmt]) -> bool
+    for s in xs
+        s match
+            TDefer(_, _) -> return true
+            _ -> ()
+
+    false
+end defers_in
+
+// Whether the call `hand_over_args` is making may hand argument `k`, a local whose release can run
+// code, over at its last use: the statement is calm after, the call is all of it, the callee keeps
+// the parameter calmly, and nothing else the statement holds runs code when it goes.
+calm_hand_over(e: *Emit, name: string, k: usize, args: Buf[TExpr], ty: Type, span: Option[Span]) -> bool
+    val c = e.moves.calm
+
+    if !c.rest_calm || span.is_none() || c.whole.is_none() || c.whole.unwrap() != span.unwrap() then return false
+    if !e.calm_keeps.has(owned_key(name, k)) || runs_code(e, ty) then return false
+
+    *args[k].kind match
+        TLoad(_, _) -> ()
+        _ -> return false
+
+    for j in 0..<args.len()
+        if j != k && !calm_arg(e, args[j]) then return false
+
+    true
+end calm_hand_over
+
+// -- the callee's half --------------------------------------------------------------------------------
+
+// Every owned parameter, as `<function>|<position>`, whose type's release can run code and that its
+// function keeps calmly. Each starts in and is let go once its body is found not to, so a recursive
+// pair that hands the parameter on settles on keeping it, as `owned_params` does.
+calm_keeps(e: *Emit, funcs: Buf[TFunc]) -> Set[string]
+    var calm: Set[string] = set()
+    var asks: Buf[(TFunc, usize)] = buf()
+
+    if e.destructors.is_empty() then return calm
+
+    for f in funcs
+        for j in 0..<f.params.len()
+            val ty = f.params[j].1
+            val key = owned_key(f.name, j)
+
+            if e.owned_params.has(key) && runs_code(e, ty) && !value_drops(e, ty)
+                calm.add(key)
+                asks.push((f, j))
+
+    var moved = true
+
+    while moved
+        moved = false
+
+        for item in asks
+            val key = owned_key(item.0.name, item.1)
+
+            if calm.has(key) && !body_keeps_calmly(e, item.0, item.1, calm)
+                calm.remove(key)
+                moved = true
+
+    calm
+end calm_keeps
+
+private body_keeps_calmly(e: *Emit, f: TFunc, j: usize, calm: Set[string]) -> bool
+    if !ends_quietly(e, f, false) || defers_anywhere(f.body.stmts) then return false
+
+    for k in 0..<f.params.len()
+        if k != j && e.owned_params.has(owned_key(f.name, k)) && runs_code(e, f.params[k].1) then return false
+
+    seq_keeps(e, f.body.stmts, f.body.result, f.params[j].0, calm)
+end body_keeps_calmly
+
+// Whether a block keeps `p` calmly: the last thing naming it keeps it, nothing before that leaves the
+// body or declares a local whose release (at the block's end) runs code, and everything after is calm.
+private seq_keeps(e: *Emit, xs: Buf[TStmt], tail: Option[TExpr], p: string, calm: Set[string]) -> bool
+    var at: Option[usize] = None
+
+    for i in 0..<xs.len()
+        if stmt_names(xs[i], p) then at = Some(i)
+
+    if tail.is_some() && names(tail.unwrap(), p) then at = Some(xs.len())
+    if at.is_none() then return false
+
+    val k = at.unwrap()
+
+    for i in 0..<k
+        if leaves_early(xs[i]) then return false
+
+        xs[i] match
+            TVarDecl(_, ty, _, _) -> if runs_code(e, ty) then return false
+            _ -> ()
+
+    if k == xs.len() then return keeps_expr(e, tail.unwrap(), p, calm)
+
+    val kept = xs[k] match
+        TExprStmt(x) -> keeps_expr(e, x, p, calm)
+        _ -> false
+
+    if !kept then return false
+
+    for i in k + 1..<xs.len()
+        if !calm_stmt(e, xs[i]) then return false
+
+    tail.is_none() || calm_expr(e, tail.unwrap())
+end seq_keeps
+
+// Whether evaluating `x` keeps `p`, which it names exactly where the keeping happens.
+private keeps_expr(e: *Emit, x: TExpr, p: string, calm: Set[string]) -> bool = *x.kind match
+    TSlots(op, args, _, _) ->
+        op == "slot_place" && args.len() == 3 && is_load_of(args[2], p) && !names(args[0], p) &&
+            !names(args[1], p) && calm_arg(e, args[0]) && calm_arg(e, args[1])
+    TCall(name, args, ty, _) -> call_keeps(e, name, args, ty, p, calm)
+    TIf(cond, then_block, else_block, ty) -> else_block match
+        Some(eb) ->
+            !runs_code(e, ty) && cond_calm(e, cond, p) && seq_keeps(e, then_block.stmts, then_block.result, p, calm) &&
+                seq_keeps(e, eb.stmts, eb.result, p, calm)
+        None -> false
+    _ -> false
+
+// A call keeping `p`: handed, once, to a parameter that keeps it calmly, the rest of what it is
+// handed calm, and an answer that runs no code when the statement lets it go.
+private call_keeps(e: *Emit, name: string, args: Buf[TExpr], ty: Type, p: string, calm: Set[string]) -> bool
+    if runs_code(e, ty) then return false
+
+    var found: Option[usize] = None
+
+    for k in 0..<args.len()
+        if is_load_of(args[k], p)
+            if found.is_some() then return false
+
+            found = Some(k)
+        else if names(args[k], p) || !calm_arg(e, args[k])
+            return false
+
+    found.is_some() && calm.has(owned_key(name, found.unwrap()))
+end call_keeps
+
+// A branch's condition: plain tests that do not name `p` and leave nothing that runs code. A binding
+// term opens a scope of its own, let go of after the arms.
+private cond_calm(e: *Emit, cond: Buf[TCondTerm], p: string) -> bool
+    for term in cond
+        term match
+            TCondTest(c) -> if names(c, p) || !calm_arg(e, c) then return false
+            TCondIs(_, _, _) -> return false
+
+    true
+end cond_calm
+
+private is_load_of(x: TExpr, p: string) -> bool = *x.kind match
+    TLoad(n, _) -> n == p
+    _ -> false
+
+private struct Hit
+    yes: bool
+
+private names(x: TExpr, p: string) -> bool
+    val hit: &Hit = Hit(false)
+
+    walk_texpr(x, expr_walk(true, y -> *y.kind match
+        TLoad(n, _) -> if n == p then hit.yes = true
+        _ -> ()))
+    hit.yes
+end names
+
+private stmt_names(s: TStmt, p: string) -> bool
+    val hit: &Hit = Hit(false)
+
+    walk_stmt(s, expr_walk(true, y -> *y.kind match
+        TLoad(n, _) -> if n == p then hit.yes = true
+        _ -> ()))
+    hit.yes
+end stmt_names
+
+// Whether a statement may leave the body: a `return`, a `become`, a `?`.
+private leaves_early(s: TStmt) -> bool
+    val hit: &Hit = Hit(false)
+    val on_expr: &Fn(TExpr) -> unit = y -> *y.kind match
+        TTry(_, _, _, _, _, _, _) -> hit.yes = true
+        _ -> ()
+    val on_stmt: &Fn(TStmt) -> unit = t -> t match
+        TReturn(_) -> hit.yes = true
+        TBecome(_) -> hit.yes = true
+        _ -> ()
+
+    walk_stmt(s, TWalk(true, on_expr, w -> (), on_stmt))
+    hit.yes
+end leaves_early
+
+private defers_anywhere(xs: Buf[TStmt]) -> bool
+    val hit: &Hit = Hit(false)
+
+    walk_stmts(xs, stmt_walk(true, t -> t match
+        TDefer(_, _) -> hit.yes = true
+        _ -> ()))
+    hit.yes
+end defers_anywhere
+
+// -- what is calm ---------------------------------------------------------------------------------
+
+// An argument worked out before the call: whatever it calls has run by the time the callee keeps
+// anything, but every temporary it leaves is let go of at the statement's end, so none may run code
+// then. A read of a place makes no temporary.
+private calm_arg(e: *Emit, x: TExpr) -> bool
+    val hit: &Hit = Hit(false)
+
+    walk_texpr(x, expr_walk(true, y -> *y.kind match
+        TLoad(_, _) -> ()
+        TField(_, _, _) -> ()
+        TDeref(_, _) -> ()
+        _ -> if runs_code(e, texpr_type(y)) then hit.yes = true))
+    !hit.yes
+end calm_arg
+
+// A statement that calls nothing and gives back no count: a local, a write or an expression of an
+// uncounted type made of plain reads and arithmetic, an `assert`-like invariant, a `return`.
+calm_stmt(e: *Emit, s: TStmt) -> bool = s match
+    TVarDecl(_, ty, init, _) -> !contains_counted(ty) && calm_expr(e, init)
+    TExprStmt(x) -> !contains_counted(texpr_type(x)) && calm_expr(e, x)
+    TWriteStmt(w) ->
+        w.dispatch.is_none() && w.check.is_empty() && !contains_counted(texpr_type(w.place)) &&
+            calm_expr(e, w.place) && calm_expr(e, w.value)
+    TInvariant(c, _) -> calm_expr(e, c)
+    TReturn(v) -> v.is_none() || calm_expr(e, v.unwrap())
+    _ -> false
+
+// An expression that calls nothing and makes nothing: literals, reads of locals and of places, the
+// built-in arithmetic and comparisons of numbers and truth values, a write of an uncounted place, and
+// the re-check of a struct invariant made only of those (`calm_invariant`).
+calm_expr(e: *Emit, x: TExpr) -> bool = *x.kind match
+    TIntLit(_, _) -> true
+    TFloatLit(_, _) -> true
+    TBoolLit(_) -> true
+    TUnitLit -> true
+    TLoad(_, _) -> true
+    TField(r, _, _) -> calm_expr(e, r)
+    TDeref(o, _) -> calm_expr(e, o)
+    TLen(r, _) -> calm_expr(e, r)
+    TBinary(_, l, r, _) -> plain_scalar(l) && plain_scalar(r) && calm_expr(e, l) && calm_expr(e, r)
+    TUnary(_, o, _) -> plain_scalar(o) && calm_expr(e, o)
+    TCast(o, ty) -> plain_scalar(o) && !contains_counted(ty) && calm_expr(e, o)
+    TCompare(operands, cmps) -> calm_compare(e, operands, cmps)
+    TStore(place, value, ty, _) -> !contains_counted(ty) && calm_expr(e, place) && calm_expr(e, value)
+    TUpdate(place, _, value, ty, dispatch, _, _) ->
+        dispatch.is_none() && !contains_counted(ty) && calm_expr(e, place) && calm_expr(e, value)
+    TRecheck(after, recv, _, inv_fn) -> calm_expr(e, after) && calm_expr(e, recv) && calm_invariant(e, inv_fn)
+    TBlockExpr(b) -> calm_block(e, b)
+    _ -> false
+
+private calm_compare(e: *Emit, operands: Buf[TExpr], cmps: Buf[TCmp]) -> bool
+    for c in cmps
+        if c.dispatch.is_some() then return false
+
+    for o in operands
+        if !plain_scalar(o) || !calm_expr(e, o) then return false
+
+    true
+end calm_compare
+
+private calm_block(e: *Emit, b: TBlock) -> bool
+    for s in b.stmts
+        if !calm_stmt(e, s) then return false
+
+    b.result.is_none() || calm_expr(e, b.result.unwrap())
+end calm_block
+
+// A struct's synthesised invariant (`<struct>$inv`): calm tests answering a literal message.
+private calm_invariant(e: *Emit, name: string) -> bool
+    val found = e.inv_funcs.get(name)
+
+    if found.is_none() then return false
+
+    val f = found.unwrap()
+
+    for s in f.body.stmts
+        if !calm_stmt(e, s) then return false
+
+    f.body.result.is_none() || calm_answer(e, f.body.result.unwrap())
+end calm_invariant
+
+private calm_answer(e: *Emit, x: TExpr) -> bool = *x.kind match
+    TStrLit(_) -> true
+    TIf(cond, then_block, else_block, _) ->
+        else_block.is_some() && calm_tests(e, cond) && calm_arm(e, then_block) && calm_arm(e, else_block.unwrap())
+    _ -> calm_expr(e, x)
+
+private calm_tests(e: *Emit, cond: Buf[TCondTerm]) -> bool
+    for term in cond
+        term match
+            TCondTest(c) -> if !calm_expr(e, c) then return false
+            TCondIs(_, _, _) -> return false
+
+    true
+end calm_tests
+
+private calm_arm(e: *Emit, b: TBlock) -> bool
+    for s in b.stmts
+        if !calm_stmt(e, s) then return false
+
+    b.result.is_none() || calm_answer(e, b.result.unwrap())
+end calm_arm
+
+private plain_scalar(x: TExpr) -> bool
+    val t = texpr_type(x)
+
+    is_numeric(t) || underlying(t) == Bool
+end plain_scalar

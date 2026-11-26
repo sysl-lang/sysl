@@ -302,6 +302,7 @@ reached through a `&sync` is used through its members like a lock is: `@unchecke
 | `send_buffer` | `send_buffer(self) -> Result[int, IoError]` | The send buffer the kernel gave this socket, in bytes. |
 | `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
 | `send_vectored` | `send_vectored(self, parts: []const []const u8) -> Result[usize, IoError]` | Write the pieces of `parts` as one gather write -- `writev`'s job, one system call and no copying them into a buffer first -- and say how many bytes went in all. |
+| `send_file` | `send_file(self, file: File, offset: u64, count: usize) -> Result[usize, IoError]` | Send up to `count` bytes of `file`, starting `offset` bytes in, and say how many went -- the bytes go from the file to the socket in the kernel (`sendfile`), never through the program. |
 | `set_no_delay` | `set_no_delay(self, on: bool = true) -> Result[unit, IoError]` | Send small writes at once (`TCP_NODELAY`) rather than waiting to coalesce them -- what a request/response protocol wants. |
 | `no_delay` | `no_delay(self) -> Result[bool, IoError]` | Whether `set_no_delay` is on. |
 | `set_reuse_port` | `set_reuse_port(self, on: bool = true) -> Result[unit, IoError]` | Let several sockets bind one port (`SO_REUSEPORT`), the kernel spreading incoming connections among them -- how a server runs one listener per thread or process. |

@@ -195,8 +195,10 @@ crt_a_closure_capture_is_counted()
             print(f() + g() + a.v)
         """, true)
 
+    // One share per capture; each closure made in `make` is handed out with the count it was made
+    // with, the statement's temporary under its erased type (`retype_temp`).
     assert_eq(run.out, "21\n")
-    assert_eq(crt_said(crt_counts(run)), "4/7 atomic 0/0 views 0/0")
+    assert_eq(crt_said(crt_counts(run)), "2/5 atomic 0/0 views 0/0")
 end crt_a_closure_capture_is_counted
 
 // A `&Fn` in a buffer, made and called `k` times.
@@ -221,10 +223,10 @@ private crt_closures(k: int) -> string = s"""
         print(t)
     """
 
-// Each closure pushed costs five shares: the capture, the loop's share of the element, and a share
-// taken and given back at each of the three layers of the push -- a `&Fn` may run code when it is let
-// go of, so a local of one is not handed over to an owned parameter (`emit_moves.sysl`'s `local_at`).
-// A `&Node` pushed costs one. The count is what tells the two apart.
+// Each closure pushed costs two shares: the capture and the loop's share of the element. The push
+// itself costs none: the fresh closure is the statement's temporary under its erased type
+// (`retype_temp`), and each layer of the push hands it on, since `Buf.push` keeps it calmly
+// (`calm_keeps.sysl`) though a `&Fn` may run code when it is let go of.
 @test("each closure pushed and called is the same number of shares more: the count is linear and exact")
 crt_closures_in_a_buffer_are_counted_exactly()
     if !crt_ready() then return
@@ -233,10 +235,10 @@ crt_closures_in_a_buffer_are_counted_exactly()
     val two = crt_counts(crt_run(crt_closures(2), true))
     val six = crt_counts(crt_run(crt_closures(6), true))
 
-    assert_eq(two.retains - one.retains, 5)
-    assert_eq(two.releases - one.releases, 6)
-    assert_eq(six.retains - one.retains, 25)
-    assert_eq(six.releases - one.releases, 30)
+    assert_eq(two.retains - one.retains, 2)
+    assert_eq(two.releases - one.releases, 3)
+    assert_eq(six.retains - one.retains, 10)
+    assert_eq(six.releases - one.releases, 15)
 end crt_closures_in_a_buffer_are_counted_exactly
 
 @test("a string shared into a buffer is a view's share, counted among the views")
@@ -349,7 +351,7 @@ crt_threads_lose_no_count()
     assert_eq(crt_said(crt_counts(again)), crt_said(crt_counts(large)))
 end crt_threads_lose_no_count
 
-@test("a trait object's share is counted, three to a push: the same cost a closure's has")
+@test("a trait object's share is counted, one to a push: the same cost a '&Node' has")
 crt_a_trait_object_is_counted()
     if !crt_ready() then return
 
@@ -378,9 +380,11 @@ crt_a_trait_object_is_counted()
                 print(int(xs.len()) * a.area())
             """, true)))
 
-    assert_eq(crt_said(counts[0]), "4/7 atomic 0/0 views 0/1")
-    assert_eq(counts[1].retains - counts[0].retains, 3)
-    assert_eq(counts[2].retains - counts[1].retains, 3)
+    // One share per push, as for a `&Node`: the loop's, since `a` is read again in the next round.
+    // The object made for `a` is handed into its binding, so the first push is the first share.
+    assert_eq(crt_said(counts[0]), "1/4 atomic 0/0 views 0/1")
+    assert_eq(counts[1].retains - counts[0].retains, 1)
+    assert_eq(counts[2].retains - counts[1].retains, 1)
 end crt_a_trait_object_is_counted
 
 @test("an Option of a reference is the reference's share")
