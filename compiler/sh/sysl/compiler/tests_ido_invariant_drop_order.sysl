@@ -1,0 +1,517 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **A write to a struct with an `invariant` lets go of what it replaced only after the clause has
+// held** (`emit_expr.sysl`'s `gen_recheck`, `emit_stmt.sysl`'s `gen_multi_assign`, `emit_place.sysl`'s
+// `give_up`): the new values are stored, the struct is re-checked, and only then are the old values
+// released, in the order the writes gave them up. A destructor run by that release therefore never
+// sees the struct with its clause broken -- which the optimizer is told never happens. A check that
+// fails traps, and a trap runs nothing: the old value is then never let go of.
+//
+// Each destructor here reads the struct it was held in through a module `var` and prints whether the
+// clause holds, so the order is what the program says. Every cell is built in debug and in release.
+//
+// The cells: a multiple assignment, a single write, the trap path of each; a write through `*self`,
+// through `&self` (a boxed value), to a local, down a field path (two clauses, the inner and the
+// outer); a generic struct; a `@unique` field, on a module value and on a local (each value dropped
+// exactly once -- the clauses read a `@unique` field where it lies, and never drop it); a `Buf` field
+// whose release runs its elements' destructors; a struct with no invariant, whose order is today's;
+// a whole-struct reassignment.
+//
+// Skipped, with the reason: a compound assignment (`+=`) to a field holding a value with a
+// destructor -- it would need an operator over a `&T` with a `Drop`, and its store gives up the old
+// value through the same `give_up` the single write's cell runs.
+
+private ido_ready() -> bool = std_root().is_ok() && clang_available()
+
+// `text` as `main.sysl`, built in the mode `flag` names, and run: its status, and what it printed on
+// standard output and standard error.
+private ido_run(text: string, flag: string) -> (Status, string)
+    val root = make_temp_dir("sysl-ido").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), s"it did not build: ${failure_text(why)}")
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text)
+end ido_run
+
+// In both modes the program prints `want` and exits cleanly.
+private ido_runs(text: string, want: string) = ido_cell(text, want, false)
+
+// In both modes the program prints `want` and then stops on the invariant's trap.
+private ido_traps(text: string, want: string) = ido_cell(text, want, true)
+
+private ido_cell(text: string, want: string, traps: bool)
+    if !ido_ready() then return
+
+    for flag in ["--debug", "--release"]
+        val (state, printed) = ido_run(text, flag)
+
+        assert_eq(printed, want)
+
+        if traps then assert(state == Status.Signalled(5), s"$flag stopped with $state, having printed '$printed'")
+        else assert(state.ok(), s"$flag stopped with $state, having printed '$printed'")
+
+    var back: [1]string = ["--debug"]
+
+    assert_eq(took_search_flag(back[..], 0), 1)
+end ido_cell
+
+// A pair ordered by its clause, held in a module `var`, whose middle field's destructor says what it
+// sees of the pair.
+private val ido_pair: string = raw"""
+    struct Noisy
+        n: int
+
+    struct Pair
+        lo: int
+        item: &Noisy
+        hi: int
+        invariant lo <= hi
+
+    var g = Pair(0, Noisy(1), 1)
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.n, g.lo <= g.hi, g.lo, g.hi)
+
+    """
+
+// A destructor that says only which value it was, for the values a module `var` does not hold.
+private val ido_quiet: string = raw"""
+    struct Noisy
+        n: int
+
+    struct Pair
+        lo: int
+        item: &Noisy
+        hi: int
+        invariant lo <= hi
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.n)
+
+    """
+
+// -- the multiple assignment ---------------------------------------------------------------------------
+
+@test("a multiple assignment releases the old value after the clause has held, so its destructor sees the new pair")
+ido_multi_assign_releases_after_the_check()
+    ido_runs(ido_pair + raw"""
+        main()
+            g.lo, g.item, g.hi = 5, Noisy(2), 6
+            print("after", g.item.n)
+        """, "drop 1 true 5 6\nafter 2\n")
+
+@test("a multiple assignment whose clause fails traps without releasing the old value")
+ido_multi_assign_trap_releases_nothing()
+    ido_traps(ido_pair + raw"""
+        main()
+            print("before")
+            g.lo, g.item = 9, Noisy(2)
+            print("not reached")
+        """, "before\n")
+
+@test("a multiple assignment releases every old value after the check, in the order the arms wrote them")
+ido_multi_assign_releases_in_arm_order()
+    ido_runs(raw"""
+        struct Noisy
+            n: int
+
+        struct Two
+            a: &Noisy
+            lo: int
+            b: &Noisy
+            hi: int
+            invariant lo <= hi
+
+        var t = Two(Noisy(1), 0, Noisy(2), 1)
+
+        impl Drop for Noisy
+            drop(self) = print("drop", self.n, t.lo <= t.hi, t.lo, t.hi)
+
+        main()
+            t.b, t.lo, t.a, t.hi = Noisy(4), 5, Noisy(3), 6
+            print("after", t.a.n, t.b.n)
+        """, "drop 2 true 5 6\ndrop 1 true 5 6\nafter 3 4\n")
+
+// -- the single write --------------------------------------------------------------------------------
+
+// A clause over a field one write changes: it may read only storage the struct owns, so the field
+// holds a `@unique` value by value.
+private val ido_cap: string = raw"""
+    @unique
+    struct Noisy
+        n: int
+
+    @unique
+    struct Cap
+        item: Noisy
+        hi: int
+        invariant item.n <= hi
+
+    var c = Cap(Noisy(1), 5)
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.n, c.item.n <= c.hi)
+
+    """
+
+@test("a single write releases the old value after the clause has held")
+ido_single_write_releases_after_the_check()
+    ido_runs(ido_cap + raw"""
+        main()
+            c.item = Noisy(3)
+            print("kept", c.item.n)
+        """, "drop 1 true\nkept 3\n")
+
+@test("a single write whose clause fails traps before the old value's destructor can see the broken struct")
+ido_single_write_trap_releases_nothing()
+    ido_traps(ido_cap + raw"""
+        main()
+            c.item = Noisy(3)
+            print("kept")
+            c.item = Noisy(9)
+            print("not reached")
+        """, "drop 1 true\nkept\n")
+
+@test("a ':=' write yields the new value and releases the old one after the check")
+ido_yielding_write_releases_after_the_check()
+    ido_runs(ido_pair + raw"""
+        main()
+            val n = (g.item := Noisy(4)).n
+            print("yielded", n)
+        """, "drop 1 true 0 1\nyielded 4\n")
+
+// -- each receiver ---------------------------------------------------------------------------------
+
+@test("a multiple assignment through '*self' releases after the check")
+ido_through_star_self()
+    ido_runs(ido_pair + raw"""
+        impl Pair
+            reset(*self, n: int)
+                self.lo, self.item, self.hi = 5, Noisy(n), 6
+
+        main()
+            g.reset(2)
+            print("after", g.item.n)
+        """, "drop 1 true 5 6\nafter 2\n")
+
+@test("a single write through '*self' whose clause fails traps with nothing released")
+ido_through_star_self_trap()
+    ido_traps(ido_cap + raw"""
+        impl Cap
+            put(*self, n: int)
+                self.item = Noisy(n)
+
+        main()
+            c.put(2)
+            print("kept")
+            c.put(8)
+            print("not reached")
+        """, "drop 1 true\nkept\n")
+
+@test("a multiple assignment through '&self' of a boxed value releases after the check")
+ido_through_ref_self()
+    ido_runs(raw"""
+        struct Noisy
+            n: int
+
+        struct Pair
+            lo: int
+            item: &Noisy
+            hi: int
+            invariant lo <= hi
+
+        var gb: &Pair = Pair(0, Noisy(1), 1)
+
+        impl Drop for Noisy
+            drop(self) = print("drop", self.n, gb.lo <= gb.hi, gb.lo, gb.hi)
+
+        impl Pair
+            reset(&self, n: int)
+                self.lo, self.item, self.hi = 5, Noisy(n), 6
+
+        main()
+            gb.reset(2)
+            print("after", gb.item.n)
+        """, "drop 1 true 5 6\nafter 2\n")
+
+@test("a write to a local's field whose clause fails traps with the old value unreleased")
+ido_local_trap()
+    ido_traps(ido_quiet + raw"""
+        main()
+            var l = Pair(0, Noisy(1), 1)
+
+            l.lo, l.item, l.hi = 2, Noisy(2), 3
+            print("moved on")
+            l.lo, l.item = 9, Noisy(3)
+            print("not reached")
+        """, "drop 1\nmoved on\n")
+
+@test("a local's field writes release each old value once, and the last at the end of its scope")
+ido_local_each_once()
+    ido_runs(ido_quiet + raw"""
+        main()
+            var l = Pair(0, Noisy(1), 1)
+
+            l.lo, l.item, l.hi = 2, Noisy(2), 3
+            l.item = Noisy(3)
+            print("end", l.item.n)
+        """, "drop 1\ndrop 2\nend 3\ndrop 3\n")
+
+// -- a field path, and a generic ---------------------------------------------------------------------
+
+private val ido_nested: string = raw"""
+    @unique
+    struct Noisy
+        n: int
+
+    @unique
+    struct Pair
+        lo: int
+        item: Noisy
+        hi: int
+        invariant lo <= hi
+
+    @unique
+    struct Outer
+        cap: int
+        p: Pair
+        invariant p.item.n <= cap
+
+    var o = Outer(5, Pair(0, Noisy(1), 1))
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.n, o.p.lo <= o.p.hi, o.p.item.n <= o.cap)
+
+    """
+
+@test("a multiple assignment down a field path releases after both structs' clauses")
+ido_field_path_multi()
+    ido_runs(ido_nested + raw"""
+        main()
+            o.p.lo, o.p.item, o.p.hi = 5, Noisy(2), 6
+            print("after", o.p.item.n)
+        """, "drop 1 true true\nafter 2\n")
+
+@test("a write down a field path that breaks the outer struct's clause traps with nothing released")
+ido_field_path_outer_trap()
+    ido_traps(ido_nested + raw"""
+        main()
+            o.p.item = Noisy(3)
+            print("kept")
+            o.p.item = Noisy(9)
+            print("not reached")
+        """, "drop 1 true true\nkept\n")
+
+@test("a generic struct's field writes release after its clause has held")
+ido_generic()
+    ido_runs(raw"""
+        struct Noisy
+            n: int
+
+        struct GPair[T]
+            lo: int
+            item: T
+            hi: int
+            invariant lo <= hi
+
+        var g = GPair(0, Noisy(1), 1)
+
+        impl Drop for Noisy
+            drop(self) = print("drop", self.n, g.lo <= g.hi, g.lo, g.hi)
+
+        main()
+            g.lo, g.item, g.hi = 5, Noisy(2), 6
+            print("after", g.item.n)
+        """, "drop 1 true 5 6\nafter 2\n")
+
+// -- a `@unique` field ---------------------------------------------------------------------------------
+
+private val ido_tok: string = raw"""
+    @unique
+    struct Tok
+        n: int
+
+    @unique
+    struct Holder
+        lo: int
+        t: Tok
+        hi: int
+        invariant lo <= hi
+
+    """
+
+@test("a '@unique' field's old value is dropped after the clause has held")
+ido_unique_field_drops_after_the_check()
+    ido_runs(ido_tok + raw"""
+        var h = Holder(0, Tok(1), 1)
+
+        impl Drop for Tok
+            drop(self) = print("drop", self.n, h.lo <= h.hi, h.lo, h.hi)
+
+        main()
+            print("start")
+            h.lo, h.t, h.hi = 5, Tok(2), 6
+            print("after")
+        """, "start\ndrop 1 true 5 6\nafter\n")
+
+@test("a local with a '@unique' field drops each value exactly once: never by a check, once replaced, the last at the end")
+ido_unique_field_each_once()
+    ido_runs(ido_tok + raw"""
+        impl Drop for Tok
+            drop(self) = print("drop", self.n)
+
+        main()
+            var h = Holder(0, Tok(1), 1)
+
+            print("built")
+            h.lo, h.t, h.hi = 5, Tok(2), 6
+            print("after multi")
+            h.t = Tok(3)
+            print("after single", h.t.n)
+        """, "built\ndrop 1\nafter multi\ndrop 2\nafter single 3\ndrop 3\n")
+
+@test("a '@unique' field write whose clause fails traps without dropping the old value")
+ido_unique_field_trap()
+    ido_traps(ido_tok + raw"""
+        impl Drop for Tok
+            drop(self) = print("drop", self.n)
+
+        main()
+            var h = Holder(0, Tok(1), 1)
+
+            h.lo, h.t = 9, Tok(2)
+            print("not reached")
+        """, "")
+
+@test("a generic '@unique' struct's clauses read a '@unique' field without dropping it")
+ido_unique_generic_each_once()
+    ido_runs(ido_tok + raw"""
+        impl Drop for Tok
+            drop(self) = print("drop", self.n)
+
+        @unique
+        struct Slot[T]
+            lo: int
+            t: T
+            hi: int
+            invariant lo <= hi
+
+        main()
+            var s = Slot(0, Tok(1), 1)
+
+            s.lo, s.t, s.hi = 2, Tok(2), 3
+            print("end")
+        """, "drop 1\nend\ndrop 2\n")
+
+// -- a `Buf` field ------------------------------------------------------------------------------------
+
+private val ido_bag: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Noisy
+        n: int
+
+    struct Bag
+        count: usize
+        items: Buf[&Noisy]
+        invariant count <= items.len()
+
+    var b = Bag(0, buf())
+
+    impl Drop for Noisy
+        drop(self) = print("drop", self.n, b.count <= b.items.len(), b.count, b.items.len())
+
+    made(first: int, n: usize) -> Buf[&Noisy]
+        var out: Buf[&Noisy] = buf()
+
+        for i in 0..<n
+            out.push(Noisy(first + int(i)))
+
+        out
+
+    """
+
+@test("replacing a 'Buf' field releases the old buffer's elements after the clause has held")
+ido_buf_field_multi()
+    ido_runs(ido_bag + raw"""
+        main()
+            b.items, b.count = made(1, 2), 2
+            print("filled")
+            b.items, b.count = made(3, 1), 1
+            print("after")
+        """, "filled\ndrop 1 true 1 1\ndrop 2 true 1 1\nafter\n")
+
+@test("replacing a 'Buf' field with one its count does not fit traps before any element is released")
+ido_buf_field_trap()
+    ido_traps(ido_bag + raw"""
+        main()
+            b.items, b.count = made(1, 2), 2
+            print("filled")
+            b.items = made(5, 0)
+            print("not reached")
+        """, "filled\n")
+
+// -- what does not change -----------------------------------------------------------------------------
+
+@test("a struct with no invariant still releases each old value at its own store")
+ido_no_invariant_keeps_its_order()
+    ido_runs(raw"""
+        struct Noisy
+            n: int
+
+        struct Plain
+            lo: int
+            item: &Noisy
+            hi: int
+
+        var p = Plain(0, Noisy(1), 1)
+
+        impl Drop for Noisy
+            drop(self) = print("drop", self.n, p.lo, p.hi)
+
+        main()
+            p.lo, p.item, p.hi = 5, Noisy(2), 6
+            print("after")
+        """, "drop 1 5 1\nafter\n")
+
+@test("a whole-struct reassignment checks the new value as it is built and releases the old after the store")
+ido_whole_struct()
+    ido_runs(ido_pair + raw"""
+        main()
+            g = Pair(7, Noisy(4), 8)
+            print("after", g.item.n)
+        """, "drop 1 true 7 8\nafter 4\n")
+
+@test("a whole-struct reassignment to a broken value traps as it is built, with nothing released")
+ido_whole_struct_trap()
+    ido_traps(ido_pair + raw"""
+        main()
+            g = Pair(9, Noisy(4), 8)
+            print("not reached")
+        """, "")
