@@ -2141,7 +2141,10 @@ A `type` narrowed with `new`, `within` or `where` is exported the same way, as i
 to state the bound, and the header says what the value is made of.
 
 **A sysl caller is unaffected**, exactly as it is by a struct's C name: the exported `Handle` flows to
-and from `u64` with no conversion, as it did before it was exported.
+and from `u64` with no conversion, as it did before it was exported. Everything else is the base's
+too — its methods, the `impl`s written for it (an `impl` for `Handle` is one for `u64`, so writing both
+is one type implemented twice), how a `match` over it is exhausted, and every check made of a value
+of it. The name is the header's alone.
 
 **What it may stand for is a scalar or a pointer**, which is what C writes a `typedef` of without a
 layout — an integer, a float, `bool`, `char`, a pointer, or a function pointer, whose declarator goes
