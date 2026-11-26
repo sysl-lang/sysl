@@ -84,6 +84,77 @@ private first_sight(t: Type, seen: *Buf[Type]) -> bool
     true
 end first_sight
 
+// **The first empty aggregate the header would declare with a size C does not share**, under a type an
+// export hands C -- the path of struct fields leading to it (empty where it is reached directly) and
+// the aggregate -- or nothing.
+//
+// Where the target's C sizes an empty struct (`cabi.sysl`'s `c_sizes_empty`), the header's `typedef
+// struct { } E;` is four bytes to the C compiler reading it and none to sysl, so a C object of it, or
+// a store through an `E *`, writes bytes sysl never gave it: `extern E g;` is a zero-byte global that
+// `g = e` in C overwrites four bytes of. A struct HOLDING one is not asked: the header leaves a field
+// that occupies nothing out of its declaration, so the fields around it sit where sysl puts them.
+//
+// `by_value` is true for a parameter or result handed over by value, which crosses in the C slot
+// `c_hollow` gives it and is not a declaration C lays anything out by. Behind a pointer, as storage,
+// or as an array's element, the aggregate is declared, and refused. An opaque struct, or one with C
+// bitfields, is an incomplete type in the header and has no size C could get wrong.
+header_hollow(l: TargetLayout, target: Target, t: Type, by_value: bool) -> Option[(string, Type)]
+    if !c_sizes_empty(target) then return None
+
+    var seen: Buf[Type] = buf()
+
+    hollow_walk(l, target, t, by_value, &seen)
+end header_hollow
+
+private hollow_walk(l: TargetLayout, target: Target, t: Type, by_value: bool,
+                    seen: *Buf[Type]) -> Option[(string, Type)]
+    t match
+        Constrained(d) -> return hollow_walk(l, target, d.base, by_value, seen)
+        Volatile(inner) -> return hollow_walk(l, target, *inner, by_value, seen)
+        _ -> ()
+
+    if !by_value && hollow_in_c(l, target, t) then return Some(("", t))
+
+    t match
+        Struct(d) ->
+            if d.opaque || !d.c_bits.is_empty() || !first_sight(t, seen) then return None
+
+            val fields = d.stored()
+
+            for item in fields
+                hollow_walk(l, target, item.1, false, seen) match
+                    Some(found) ->
+                        val at = if found.0.is_empty() then item.0 else s"${item.0}.${found.0}"
+
+                        return Some((at, found.1))
+                    None -> ()
+
+            None
+        // No element is no store C could make in bounds, whatever the element's size.
+        Array(n, elem, _) -> if n == 0 then None else hollow_walk(l, target, *elem, false, seen)
+        Ptr(inner, _) -> hollow_walk(l, target, *inner, false, seen)
+        CFn(params, ret, _) ->
+            for param in params
+                val found = hollow_walk(l, target, param, true, seen)
+
+                if found.is_some() then return found
+
+            hollow_walk(l, target, *ret, true, seen)
+        _ -> None
+end hollow_walk
+
+// The C size of `t` where it occupies nothing in sysl and something in C -- `c_hollow`, for a type the
+// header declares in full.
+hollow_c_size(l: TargetLayout, target: Target, t: Type) -> int
+    underlying(t) match
+        Struct(d) -> if d.opaque || !d.c_bits.is_empty() then return 0
+        _ -> ()
+
+    c_hollow(l, t, target).unwrap_or(0)
+end hollow_c_size
+
+private hollow_in_c(l: TargetLayout, target: Target, t: Type) -> bool = hollow_c_size(l, target, t) > 0
+
 // A transparent named subtype or a qualifier taken off the top, and every name inside left where it
 // was written -- a name there is exactly the thing a header is asked to spell.
 private header_surface(t: Type) -> Type = t match

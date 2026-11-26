@@ -1,0 +1,269 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{cstring, split}
+
+// **A function has one address however many codegen units its program is cut into**
+// (`codegen_units.sysl`). A small local function -- `private`, or one an executable sealed -- is
+// copied into every unit that calls it so each copy can be inlined; one whose address is taken
+// must not be, or `&f == &f` compares two copies. It is shared under its promoted name instead, and
+// a unit that calls it gets an `available_externally` copy of that name.
+//
+// The axes: what the function is (plain, `become`-tail, a generic instance, a const-parameter
+// instance), where its address is taken against where it is compared (one unit and another), and
+// the build (`sysl build` sealing a program, `build-c` writing an archive, the cut itself on a
+// hand-written module). Not crossed: a cross target, which is always one unit.
+
+private extern "setenv" fau_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fau_c_unsetenv(name: *u8) -> int
+
+private fau_units(n: string)
+    val k = cstring("SYSL_CODEGEN_UNITS")
+    val v = cstring(n)
+
+    fau_c_setenv(k.ptr, v.ptr, 1)
+end fau_units
+
+private fau_units_default()
+    val k = cstring("SYSL_CODEGEN_UNITS")
+
+    fau_c_unsetenv(k.ptr)
+end fau_units_default
+
+private fau_ready() -> bool = std_root().is_ok() && clang_available()
+
+private fau_begin() -> (string, string)
+    val work = absolute_path(make_temp_dir("sysl-fau").unwrap())
+    val cache = make_temp_dir("sysl-fau-cache").unwrap()
+
+    use_c_object_cache_dir(Some(cache))
+    clear_unit_object_counts()
+    (work, cache)
+end fau_begin
+
+private fau_end(dirs: (string, string))
+    fau_units_default()
+    use_c_object_cache_dir(None)
+    remove_dir_all(dirs.0).unwrap_or(())
+    remove_dir_all(dirs.1).unwrap_or(())
+end fau_end
+
+// How many units of `parts` define `@name` as a body of their own, and how many carry an
+// `available_externally` copy of it.
+private fau_defines(parts: Buf[string], name: string) -> (int, int)
+    var own = 0
+    var copies = 0
+
+    for item in parts
+        for line in split(item, "\n")
+            if !line.starts_with("define ") || !line.contains(s"@$name(") then continue
+
+            if line.starts_with("define available_externally ") then copies += 1 else own += 1
+
+    (own, copies)
+end fau_defines
+
+// Eight public functions, each storing `@helper`'s address in the slot it is given and calling it;
+// a `main` calling all eight. `helper` is defined by `head`.
+private fau_module(head: string) -> string
+    var text = "target triple = \"arm64-apple-macosx\"\n\n" + head + "\n"
+
+    for i in 0..<8
+        text = text + s"define i32 @f$i(ptr %slot) {\nentry:\n  store ptr @helper, ptr %slot\n" +
+               "  %r = call i32 @helper(i32 1)\n  ret i32 %r\n}\n\n"
+
+    text = text + "define i32 @main() {\nentry:\n  %s = alloca ptr\n"
+
+    for i in 0..<8
+        text = text + s"  %r$i = call i32 @f$i(ptr %s)\n"
+
+    text + "  ret i32 0\n}\n"
+end fau_module
+
+@test("fau: a small private function whose address is taken is defined in one unit, and copied elsewhere only as available_externally")
+fau_an_addressed_private_function_has_one_definition()
+    val head = "define private i32 @helper(i32 %x) {\nentry:\n  %y = add i32 %x, 1\n  ret i32 %y\n}\n"
+    val parts = split_module(fau_module(head), 4).unwrap()
+    val (own, copies) = fau_defines(parts, "\"sysl.cgu:helper\"")
+
+    assert_eq(own, 1)
+    assert(copies >= 1, "a unit calling it gets a copy to inline")
+    assert_eq(fau_defines(parts, "helper").0, 0)
+
+    for item in parts
+        assert(!item.contains("define private i32 @helper("), "no unit keeps a private copy")
+
+        for line in split(item, "\n")
+            if line.starts_with("define available_externally ") && line.contains("helper\"(")
+                assert(line.starts_with("define available_externally hidden i32 @\"sysl.cgu:helper\"("), line)
+end fau_an_addressed_private_function_has_one_definition
+
+@test("fau: so is one an executable sealed")
+fau_an_addressed_sealed_function_has_one_definition()
+    val head = "define internal i32 @helper(i32 %x) \"sysl-sealed\" {\nentry:\n  %y = add i32 %x, 1\n" +
+               "  ret i32 %y\n}\n"
+    val parts = split_module(fau_module(head), 4).unwrap()
+
+    assert_eq(fau_defines(parts, "\"sysl.cgu:helper\"").0, 1)
+
+    for item in parts
+        assert(!item.contains("define internal i32 @helper("), "no unit keeps an internal copy")
+end fau_an_addressed_sealed_function_has_one_definition
+
+@test("fau: an address taken only in a global's initializer counts too")
+fau_an_address_in_a_global_counts()
+    val head = "define private i32 @helper(i32 %x) {\nentry:\n  %y = add i32 %x, 1\n  ret i32 %y\n}\n" +
+               "@table = global [1 x ptr] [ptr @helper]\n"
+    var text = "target triple = \"arm64-apple-macosx\"\n\n" + head + "\n"
+
+    for i in 0..<8
+        text = text + s"define i32 @f$i() {\nentry:\n  %r = call i32 @helper(i32 $i)\n  ret i32 %r\n}\n\n"
+
+    val parts = split_module(text, 4).unwrap()
+
+    assert_eq(fau_defines(parts, "\"sysl.cgu:helper\"").0, 1)
+    assert_eq(fau_defines(parts, "helper").0, 0)
+end fau_an_address_in_a_global_counts
+
+@test("fau: a small private function that is only called is still copied as itself into each unit that calls it")
+fau_a_called_only_function_is_still_copied()
+    var text = "target triple = \"arm64-apple-macosx\"\n\n" +
+               "define private i32 @helper(i32 %x) {\nentry:\n  %y = add i32 %x, 1\n  ret i32 %y\n}\n\n"
+
+    for i in 0..<8
+        text = text + s"define i32 @f$i() {\nentry:\n  %r = call i32 @helper(i32 $i)\n  ret i32 %r\n}\n\n"
+
+    val parts = split_module(text, 4).unwrap()
+
+    assert(fau_defines(parts, "helper").0 >= 2, "copied")
+    assert_eq(fau_defines(parts, "\"sysl.cgu:helper\"").0, 0)
+end fau_a_called_only_function_is_still_copied
+
+// Work enough that a function holding it is too large to copy into the units that call it, as
+// benchtop's decoders are: only the handler is small, so only the handler is copied.
+private fau_work() -> string
+    var text = "    var a = k\n"
+
+    for i in 0..<16
+        text = text + "    a = (a *% 31) ^ (a >> 3)\n"
+
+    text + "    sink = sink +% a\n"
+end fau_work
+
+// A program whose handler has its address taken in sixteen functions -- spread over the units by
+// their names -- and compared in sixteen others, against the address one of the first returns.
+private fau_program(decl: string, spelled: string) -> string
+    var text = "type H = *extern(u64) -> u64\n\nvar sink: u64 = 0\n\n" + decl + "\n\n"
+
+    for i in 0..<16
+        text = text + s"take$i(k: u64) -> H\n" + fau_work() + s"    $spelled\n\n"
+
+    for i in 0..<16
+        text = text + s"same$i(k: u64) -> bool\n" + fau_work() +
+               s"    take${(i + 5) % 16}(k) == $spelled && $spelled == take$i(k)\n\n"
+
+    text = text + "main()\n    var n = 0\n\n"
+
+    for i in 0..<16
+        text = text + s"    if same$i($i) then n += 1\n"
+
+    text + "    val h = take3(1)\n    print(s\"$n ${h(4)}\")\n"
+end fau_program
+
+// The text definitions `nm` lists in `exe`, local or global, of a symbol naming `base`, one per line.
+private fau_nm_defs(exe: string, base: string) -> string
+    var out = ""
+
+    for line in split(capture("nm", [exe]).unwrap().text, "\n")
+        val words = split(line, " ")
+
+        if words.len >= 3 && words[2].contains(base) && (words[1] == "t" || words[1] == "T")
+            out = out + words[2] + "\n"
+
+    out
+end fau_nm_defs
+
+// Builds `fau_program(decl, spelled)` in eight units and checks every comparison held, the handler
+// still ran, and the executable defines the function named `base` once.
+private fau_check(decl: string, spelled: string, base: string, ran: string)
+    if !fau_ready() then return
+
+    val dirs = fau_begin()
+
+    write_text(s"${dirs.0}/main.sysl", fau_program(decl, spelled)).unwrap()
+    fau_units("8")
+    build_native_program(dirs.0, None, None, DefaultOptimization, Some(s"${dirs.0}/prog")).unwrap()
+
+    assert(unit_object_counts().1 >= 2, s"units compiled: ${unit_object_counts().1}")
+    assert_eq(capture(s"${dirs.0}/prog", []).unwrap().text, s"16 $ran\n")
+    val defs = fau_nm_defs(s"${dirs.0}/prog", base)
+
+    assert(defs != "" && !defs[0..<defs.len - 1].contains("\n"), s"one definition of $base:\n$defs")
+    fau_end(dirs)
+end fau_check
+
+@test("fau: a plain function's address taken in one unit equals the one taken in another")
+fau_a_plain_function_has_one_address()
+    fau_check("h_plain(n: u64) -> u64 = n + 1", "&h_plain", "h_plain", "5")
+end fau_a_plain_function_has_one_address
+
+@test("fau: so does a function that ends in become")
+fau_a_become_function_has_one_address()
+    fau_check("h_next(n: u64) -> u64 = n * 2\n\nh_tail(n: u64) -> u64\n    if n == 0 then return 0\n    become h_next(n - 1)",
+              "&h_tail", "h_tail", "6")
+end fau_a_become_function_has_one_address
+
+@test("fau: so does a generic instance")
+fau_a_generic_instance_has_one_address()
+    fau_check("h_gen[T](n: u64) -> u64 = n + 2", "&h_gen[u16]", "h_gen", "6")
+end fau_a_generic_instance_has_one_address
+
+@test("fau: so does a const-parameter instance")
+fau_a_const_instance_has_one_address()
+    fau_check("h_const[const K: u32, const T: bool](n: u64) -> u64 = if T then n + u64(K) else n",
+              "&h_const[3, true]", "h_const", "7")
+end fau_a_const_instance_has_one_address
+
+@test("fau: build-c in four units keeps one address for a private function the archive compares")
+fau_build_c_keeps_one_address()
+    if !fau_ready() then return
+
+    val dirs = fau_begin()
+    val out = absolute_path(make_temp_dir("sysl-fau-c").unwrap())
+    var src = "type H = *extern(u64) -> u64\n\nvar sink: u64 = 0\n\nprivate helper(n: u64) -> u64 = n + 1\n\n"
+
+    for i in 0..<16
+        src = src + s"take$i(k: u64) -> H\n" + fau_work() + "    &helper\n\n"
+
+    // An archive's own functions are external only where exported, and only those are spread over
+    // the units by name, so each comparer is an export of its own.
+    var c = "#include <stdio.h>\n"
+    var sum = "0"
+
+    for i in 0..<16
+        src = src + s"@export(\"fau_same$i\")\nsame$i(k: u64) -> i32\n" + fau_work() +
+              s"    if take${(i + 7) % 16}(k) == &helper && &helper == take$i(k) then 1 else 0\n\n"
+        c = c + s"int fau_same$i(unsigned long long);\n"
+        sum = sum + s" + fau_same$i($i)"
+
+    c = c + s"int main(void) { printf(\"%d\\n\", $sum); return 0; }\n"
+
+    write_text(s"${dirs.0}/lib.sysl", src).unwrap()
+    write_text(s"$out/main.c", c).unwrap()
+    fau_units("4")
+    build_c_archive(dirs.0, None, None, DefaultOptimization, Some(s"$out/lib.a"), Some(s"$out/lib.h"),
+                    (m) -> ()).unwrap()
+
+    assert(unit_object_counts().1 >= 2, s"units compiled: ${unit_object_counts().1}")
+
+    val cc = find_clang(host_target(), None).unwrap()
+    val linked = capture(cc, [s"$out/main.c", s"$out/lib.a", "-o", s"$out/prog"]).unwrap()
+
+    assert(linked.status.ok(), linked.err.unwrap_or(linked.text))
+    assert_eq(capture(s"$out/prog", []).unwrap().text, "16\n")
+    remove_dir_all(out).unwrap_or(())
+    fau_end(dirs)
+end fau_build_c_keeps_one_address

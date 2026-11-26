@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_modified`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `executable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified`, `space`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `get_xattr`, `set_xattr`, `remove_xattr`, `list_xattrs` and their `link_` forms, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -119,6 +119,40 @@ refused: not UTF-8 at byte 2
 A caller that wants the text anyway — replacing what does not decode, or reading the file as some other
 encoding — reads `read_bytes` and decides for itself, with [`from_utf8`](/library/text/) or anything
 else.
+
+**A file the whole-file tier makes can be born with its permission bits.** `write_bytes`,
+`write_text`, `append_bytes`, `append_text` and the two `_atomic` writers take a last `mode`, `0o666`
+by default, with exactly the rules of `create`'s (§ One reading of an entry): the process umask
+narrows it, bits above the twelve permission bits are dropped, a target with no permission bits
+ignores it, and **a file that is already there keeps the mode it has** — its contents are replaced or
+added to, not the file. A secret is owner-only from the moment it exists, with no window before a
+`set_permissions`, and a failure answers the same error, the OS's reason included, whatever mode was
+asked for. The `_atomic` writers are the exception to keeping a mode, by their nature: they put a new
+file in the old one's place, and that file has the mode asked for.
+
+```sysl
+import sysl.fs.{append_text, metadata, read_text, remove_file, set_permissions, write_text}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-write-mode-${pid()}.txt"
+
+write_text(path, "key\n", 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o600)
+
+set_permissions(path, 0o640).unwrap()
+append_text(path, "more\n", 0o600).unwrap()
+write_text(path, "replaced\n", 0o600).unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o640, read_text(path).unwrap().len)
+
+remove_file(path).unwrap()
+```
+
+```output
+true
+true 9
+```
 
 ### Writing where somebody else is reading
 
@@ -197,6 +231,7 @@ enum IoError
     NotOpen
     NotPermitted
     InvalidUtf8(offset: usize)
+    NoAttribute
     Other(code: int)
 
     code(self) -> int
@@ -223,6 +258,10 @@ first is an operation this process may not perform at all, the second a file who
 `canonicalize`, `current_dir` and `make_temp_dir` answer when bytes that had to be text are not UTF-8,
 and its `offset` is the byte at which the decode stopped. Its `code()` is `EILSEQ` (92 on macOS, 84 on
 Linux); two of them are equal when they stopped at the same byte, and one is never equal to an `Other`.
+
+**`NoAttribute` is an [extended attribute](#extended-attributes) that is not there**: `ENOATTR`, 93,
+on macOS and `ENODATA`, 61, on Linux, whose C libraries spell the one as the other. It is a case of
+its own so that a missing attribute is not mistaken for a missing file.
 
 `code()` answers for every case, not only `Other`: the named ones hand back the code they were
 recognised from, which keeps the question answerable without a second table. `message()` is a sentence
@@ -340,9 +379,22 @@ impl Writer for File
 
 open(path: string) -> Result[File, IoError]          // an existing file, for reading
 create(path: string, mode: u32 = 0o666) -> Result[File, IoError] // makes one, or empties one that was there
-append(path: string) -> Result[File, IoError]        // writes at the end
+append(path: string, mode: u32 = 0o666) -> Result[File, IoError] // writes at the end
 open_update(path: string) -> Result[File, IoError]   // read and write; fails if it is not there
 create_update(path: string, mode: u32 = 0o666) -> Result[File, IoError] // read and write; empties what was there
+open_with(path: string, options: OpenOptions) -> Result[File, IoError] // exactly the options asked
+
+struct OpenOptions                                   // open_options() is the empty set
+    read(self) -> OpenOptions
+    write(self) -> OpenOptions
+    append(self) -> OpenOptions                      // implies write
+    truncate(self) -> OpenOptions                    // needs write
+    create(self) -> OpenOptions                      // O_CREAT
+    create_new(self) -> OpenOptions                  // O_CREAT | O_EXCL
+    sync(self) -> OpenOptions                        // O_SYNC
+    dsync(self) -> OpenOptions                       // O_DSYNC
+    nofollow(self) -> OpenOptions                    // O_NOFOLLOW
+    mode(self, bits: u32) -> OpenOptions             // a created file's permission bits
 ```
 
 **A `File` is a descriptor from `sysl.fs.sys` with a buffer in front of it, and the buffer is
@@ -381,6 +433,94 @@ remove_file(path).unwrap()
 
 ```output
 true true kept
+```
+
+### Saying the options one at a time
+
+**`open_with` opens a file with exactly the options in an `OpenOptions`**, for the combinations the five
+names above do not cover. `open_options()` is the empty set, and each member answers the set with one
+more thing asked, so a set reads as a chain and is a value a program can keep and open several files
+with. **Every option reaches the operating system or the open fails**; none is dropped quietly.
+
+- `read` and `write` say how the file is used; asking neither reads it. `append` writes at the end of
+  whatever is there at each write and implies `write`.
+- `truncate` empties a file that is there, and needs `write`: without it the open is refused with
+  `Other(22)` before the file is touched, since POSIX leaves `O_TRUNC` on a read-only open unspecified.
+- `create` makes the file where it is missing. **`create_new` makes it and fails with `AlreadyExists`
+  where anything is there** — a file, a directory, a symbolic link, even a dangling one — with the
+  check and the making one step (`O_CREAT | O_EXCL`). It is what a lock file or a never-overwrite
+  save needs, and what `exists` followed by `create` is not.
+- `sync` makes each write wait until the data and the metadata needed to read it back are on the
+  device (`O_SYNC`); `dsync` waits for the data, and the metadata only where reading the data needs it
+  (`O_DSYNC`, or `O_SYNC` where a C library has no `O_DSYNC`). They are the per-write form of
+  `full_sync` and `sync_data` below.
+- **`nofollow` refuses a symbolic link at the last component** (`O_NOFOLLOW`), and the error answers
+  `refused_link()`, as a `Dir`'s refusals do. A link in a directory above the last component is still
+  followed — confining a whole path is [`Dir`](#confined-to-one-directory)'s work — and a chain of
+  links that loops is refused the same way, since the kernel gives the two one code. Without
+  `nofollow` such a loop is an ordinary `Other` with the platform's `ELOOP`.
+- `mode` is the permission bits a file this open creates is born with, `0o666` unless asked and
+  narrowed by the umask, exactly as `create`'s; it applies only when the file is created, and bits
+  above the twelve permission bits are dropped.
+
+A target whose C library has no `O_SYNC` or no `O_NOFOLLOW` answers *not supported on this target* to
+an open asking for it.
+
+```sysl
+import sysl.fs.{open_with, open_options, metadata, read_text, remove_file, symlink, write_text}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-new-${pid()}.txt"
+val link = s"/tmp/sysl-fs-doc-new-${pid()}.link"
+val fresh = open_options().write().create_new().mode(0o600)
+
+var f = open_with(path, fresh).unwrap()
+
+f.write("first".bytes)
+f.close().unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o600)
+print(open_with(path, fresh).unwrap_err())
+
+symlink(path, link).unwrap()
+
+val refused = open_with(link, open_options().write().truncate().nofollow()).unwrap_err()
+
+print(refused.refused_link(), refused)
+print(read_text(path).unwrap())
+
+remove_file(link).unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+true
+already exists
+true the path goes through a symbolic link
+first
+```
+
+A file opened with `sync` or `dsync` is an ordinary `File`; each write that reaches the descriptor
+returns once it is on the device, so a buffered write is durable from the `flush` that sends it.
+
+```sysl
+import sysl.fs.{open_with, open_options, read_text, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-dsync-${pid()}.log"
+
+var log = open_with(path, open_options().append().create().dsync()).unwrap()
+
+log.write("entry 1\n".bytes)
+log.flush().unwrap()
+log.close().unwrap()
+
+print(read_text(path).unwrap() == "entry 1\n")
+remove_file(path).unwrap()
+```
+
+```output
+true
 ```
 
 ### It is a `Reader` and a `Writer`, whole
@@ -872,6 +1012,25 @@ false true 1
 false no such file or directory
 ```
 
+**A path holding a zero byte is refused, with `Other(22)` (`EINVAL`), by every call that takes one** —
+before C is asked, because C reads a path up to its first zero and the call would act on a different
+file than the one named (`open("a\0b")` would open `a`). Only the bytes of the path count, so a slice
+that ends before a zero is a fine path. `exists`, `is_file` and `is_dir` answer `false` for it.
+
+```sysl
+import sysl.fs.{metadata, exists}
+
+val p = "/tmp\0zzz"
+
+print(metadata(p).unwrap_err())
+print(exists(p), exists(p[0..<4]))
+```
+
+```output
+Invalid argument
+false true
+```
+
 **`exists` answers `false` for a path that exists under a directory the program may not search**,
 which is the one way it differs from the question it looks like it is asking. That case cannot be told
 from absence without a second call whose answer would already be stale — and every caller that
@@ -889,6 +1048,41 @@ which is why it is read through a call rather than written as a literal.
 concerned when both paths are on the same filesystem, and *fails* rather than copying when they are
 not. That is `rename(2)`'s contract and worth knowing, since a program moving a file across devices
 has to read and write it itself.
+
+**`rename_no_replace` moves a path only where nothing is at the destination**, and reports
+`AlreadyExists` where anything is — a file, a directory, a dangling link, and the moved file itself
+by the same path or a hard link, where `rename` succeeds doing nothing — leaving both names as they
+were. The check and the move are one step in the kernel: `renamex_np` with `RENAME_EXCL` on macOS,
+`renameat2` with `RENAME_NOREPLACE` on Linux. `exists` followed by `rename` is a race that replaces
+whatever appears between the two, so **a target with neither call answers *not supported on this
+target*** rather than that, and a Linux filesystem that cannot make the promise answers `Other(22)`
+(`EINVAL`).
+
+```sysl
+import sysl.fs.{read_text, remove_file, rename_no_replace, write_text}
+import sysl.process.pid
+
+val a = s"/tmp/sysl-fs-doc-rn-a-${pid()}.txt"
+val b = s"/tmp/sysl-fs-doc-rn-b-${pid()}.txt"
+val c = s"/tmp/sysl-fs-doc-rn-c-${pid()}.txt"
+
+write_text(a, "from").unwrap()
+write_text(b, "to").unwrap()
+
+print(rename_no_replace(a, b).unwrap_err(), read_text(b).unwrap())
+
+rename_no_replace(a, c).unwrap()
+
+print(read_text(c).unwrap())
+
+remove_file(b).unwrap()
+remove_file(c).unwrap()
+```
+
+```output
+already exists to
+from
+```
 
 **`make_dir` makes one directory and needs its parent to be there.** It asks for `0o777`, letting the
 process umask narrow it: asking for less would override the environment's decision rather than defer
@@ -965,11 +1159,12 @@ remove_file(path).unwrap()
 true true true
 ```
 
-**A file can be born with its permission bits.** `create` and `create_update` take a `mode`, `0o666`
-by default, which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
+**A file can be born with its permission bits.** `create`, `append` and `create_update` take a
+`mode`, `0o666` by default (as do the whole-file writers and a `Dir`'s own `create`, `append`,
+`create_update`, `write_bytes` and `write_text`), which goes to `open(2)` with `O_CREAT` and so is narrowed by the process umask as in
 POSIX. A secret file asks `0o600` and is owner-only from the moment it exists; creating it and then
 calling `set_permissions` leaves a window in which it is open to group and others. **The mode applies
-only when the file is created**: `create_update` on a file that exists keeps the mode it has. Bits
+only when the file is created**: `create_update` or `append` on a file that exists keeps the mode it has. Bits
 above the twelve permission bits are dropped, as `set_permissions` drops them. `File.set_permissions(mode)`
 is `fchmod` on the open descriptor, for a program that holds the file and wants its mode changed
 without trusting the path; a closed file answers `NotOpen`. On a target with no permission bits the
@@ -1007,15 +1202,48 @@ behaviour available.
 `Meta.same_file` is the inode and the device together, which is what says two paths name one file.
 Neither identifies a file on its own: inode numbers are reused, and are unique only within a device.
 
+**Whether something is a program is asked two ways, and they answer different questions.**
+`Meta.executable()` reads the bits: a regular file with any of its three execute bits set, whoever is
+asking — so a directory, whose execute bits mean it may be searched, answers `false`, as does a link
+that `link_metadata` described. `executable(path)` asks the system, beside `readable` and `writable`
+and as POSIX's `access` with `X_OK` does: whether **this** program may run it, which a file whose only
+execute bit is another class's is not. A program acting as user 0 may run a file with any execute bit
+set.
+
+```sysl
+import sysl.fs.{write_text, metadata, set_permissions, executable, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-exec-${pid()}.sh"
+
+write_text(path, "#!/bin/sh\necho hi\n").unwrap()
+set_permissions(path, 0o755).unwrap()
+print(metadata(path).unwrap().executable(), executable(path))
+
+set_permissions(path, 0o644).unwrap()
+print(metadata(path).unwrap().executable(), executable(path))
+
+print(metadata("/tmp").unwrap().executable(), executable("/tmp"))
+
+remove_file(path).unwrap()
+```
+
+```output
+true true
+false false
+false true
+```
+
 ### Who owns it
 
 **`Meta.owner` and `Meta.group` are `u32`s, the type [`sysl.process.user()`](/library/process/#who-the-program-is)
 answers**, so "is this file mine" is one comparison with nothing converted on either side.
 `set_owner(path, owner, group)` is the writing half, beside `set_permissions` and over one `chown`:
-it sets both, so a program changing only one passes the other as `metadata` read it.
+it sets both, and a program changing only one passes `unchanged` for the other, the `4294967295` that
+`chown(2)` reads as "leave this id as it is".
 
 ```sysl
-import sysl.fs.{write_text, metadata, set_owner, remove_file}
+import sysl.fs.{write_text, metadata, set_owner, remove_file, unchanged}
 import sysl.process.{pid, user}
 
 val path = s"/tmp/sysl-fs-doc-owner-${pid()}.txt"
@@ -1029,10 +1257,18 @@ print(m.owner == user())
 set_owner(path, m.owner, m.group).unwrap()
 print(metadata(path).unwrap().owner == m.owner)
 
+set_owner(path, unchanged, m.group).unwrap()
+print(metadata(path).unwrap().owner == m.owner)
+
+set_owner(path, unchanged, unchanged).unwrap()
+print(unchanged == 4294967295)
+
 remove_file(path).unwrap()
 ```
 
 ```output
+true
+true
 true
 true
 ```
@@ -1040,8 +1276,39 @@ true
 **Giving a file away is privileged**, as `chown(2)` makes it: a program not acting as user 0 that
 hands one to somebody else is refused with `NotPermitted`. Giving a file to the owner and group it
 already has is the one change anybody may make. A symbolic link is followed, as `set_permissions`
-follows one, and there is no variant that changes the link itself, there being none for its
-permissions either. A target whose filesystem has no owners answers *not supported on this target*.
+follows one. A target whose filesystem has no owners answers *not supported on this target*.
+
+**`set_link_owner(path, owner, group)` is the same change to the path *itself***, over one `lchown`:
+a symbolic link is given the ids and what it names keeps its own, the writing half of
+`link_metadata`'s reading. Anything else at the path is changed exactly as `set_owner` changes it,
+under the same privilege rule. So a link the program made to a file of root's is the program's to
+set, and the file is not:
+
+```sysl
+import sysl.fs.{symlink, link_metadata, metadata, set_owner, set_link_owner, remove_file, IoError}
+import sysl.process.{pid, user}
+
+val link = s"/tmp/sysl-fs-doc-lchown-${pid()}"
+
+symlink("/bin/sh", link).unwrap()
+
+val mine = link_metadata(link).unwrap()
+
+print(set_link_owner(link, mine.owner, mine.group).is_ok())
+print(metadata(link).unwrap().owner == 0)
+print(user() == 0 || set_owner(link, mine.owner, mine.group).unwrap_err() == IoError.NotPermitted)
+
+remove_file(link).unwrap()
+```
+
+```output
+true
+true
+true
+```
+
+The names behind the ids are `sysl.process`'s, beside `user()` and `group()`:
+[`user_name` and `group_name`, and `user_id` and `group_id` the other way](/library/process/#who-the-program-is).
 
 **`set_modified(path, when)` sets the modification time** of a file or a directory, and its access
 time with it, over one `utimensat` hook. It is how a program records that something was used without
@@ -1066,6 +1333,30 @@ remove_file(path).unwrap()
 ```output
 1500000000
 ```
+
+### How much room a filesystem has
+
+**`space(path)` is one `statvfs` of the filesystem holding `path`**, as a `Space` of three byte
+counts: `total`, `free`, and `available` — the part of `free` a program not acting as user 0 may take,
+since a filesystem may hold a reserve back for root. So `available <= free <= total` always, and
+`available` is the one to compare a write against. Each is a block count times the fragment size,
+`f_frsize`, which is the unit POSIX says the counts are in. `path` may name a file or a directory
+anywhere on the filesystem; a path that is not there is `NotFound`.
+
+```sysl
+import sysl.fs.space
+
+val s = space("/tmp").unwrap()
+
+print(s.total > 0, s.available <= s.free, s.free <= s.total)
+```
+
+```output
+true true true
+```
+
+**It is a reading, not a reservation**: another program can take the room before the next write
+lands, so a program that must not run out still handles the write's own `NoSpaceLeft`.
 
 ### Links, and the path the filesystem agrees on
 
@@ -1112,6 +1403,82 @@ when the last of them does, which is what `Meta.links` counts.
 [`sysl.path.normalize`](/library/path/)'s counterpart and **not** its equivalent: where `a/b` is a
 link, the two answer different files, and confusing them is the shape of every path-traversal bug
 there is. Reach for this one whenever the answer decides access to something.
+
+### Extended attributes
+
+```sysl
+get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+remove_xattr(path: string, name: string) -> Result[unit, IoError]
+list_xattrs(path: string) -> Result[Buf[string], IoError]
+
+link_get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+link_set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+link_remove_xattr(path: string, name: string) -> Result[unit, IoError]
+link_list_xattrs(path: string) -> Result[Buf[string], IoError]
+```
+
+An extended attribute is a named value a filesystem keeps beside a file's contents: a download's
+quarantine mark, a backup tool's checksum, a security label. **A name is text and a value is bytes**:
+a value may hold any byte, a zero among them, and may be empty, and it is passed with its length,
+never terminated. **An attribute that is not there is `NoAttribute`**, so "no such attribute" is not
+mistaken for "no such file", which stays `NotFound`:
+
+```sysl
+import sysl.fs.{write_text, get_xattr, set_xattr, remove_xattr, list_xattrs, make_dir_all,
+                remove_dir_all, NoAttribute}
+import sysl.process.pid
+
+val dir = s"/tmp/sysl-fs-doc-xattr-${pid()}"
+val f = dir + "/notes"
+
+remove_dir_all(dir).unwrap()
+make_dir_all(dir).unwrap()
+write_text(f, "hello").unwrap()
+
+val value: []u8 = [104, 0, 105]
+
+set_xattr(f, "user.sysl.tag", value).unwrap()
+
+val back = get_xattr(f, "user.sysl.tag").unwrap()
+
+print(back.len, back[0], back[1], back[2])
+print(list_xattrs(f).unwrap().any((n) -> n == "user.sysl.tag"))
+
+remove_xattr(f, "user.sysl.tag").unwrap()
+
+print(get_xattr(f, "user.sysl.tag").unwrap_err() == NoAttribute)
+print(get_xattr(dir + "/gone", "user.sysl.tag").unwrap_err())
+
+remove_dir_all(dir).unwrap()
+```
+
+```output
+3 104 0 105
+true
+true
+no such file or directory
+```
+
+**Every call comes in two, like `metadata` and `link_metadata`.** The plain one follows a symbolic
+link and asks about what it points at; the `link_` one asks about the link itself, which is the
+platform's `XATTR_NOFOLLOW` on macOS and its `l`-prefixed calls on Linux. macOS keeps attributes on
+a link apart from its target's; Linux refuses a `user.` attribute on a link with `NotPermitted`.
+
+**A name is what the platform says it is.** Linux wants a namespace before a dot (`user.`,
+`trusted.`, `security.`) and refuses a bare name with `Other(95)`, `EOPNOTSUPP`; macOS takes any name,
+by convention reverse-DNS. A name holding a zero byte is refused with `Other(22)`, `EINVAL`, before
+anything is asked, since C would read it as the shorter name before the zero. A filesystem that
+keeps no attributes answers its own refusal — `ENOTSUP`, or `EPERM` on a device node.
+
+**`list_xattrs` answers what this process may see, in the filesystem's order.** That is neither sorted
+nor everything: Linux leaves out a `trusted.` attribute for an unprivileged process, and macOS puts
+names of its own on files it has seen (`com.apple.provenance`), so a program asks for the names it
+set rather than counting. A name that is not UTF-8 makes the call answer `InvalidUtf8`, as
+[`entries`](#listing-a-directory) does.
+
+**A value is asked for twice** — its size, then its bytes — and one that grew in between is asked
+for again rather than handed back cut short.
 
 ### Where the program is, and somewhere to put things
 
@@ -1516,11 +1883,14 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit),
-`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_opendir`,
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit and, from `open_with`, an exclusive, a sync, a dsync and a nofollow bit),
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_rename_no_replace` (asked only by a program that calls `rename_no_replace`), `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_lchown` and `_space` (asked only by a program that calls `set_link_owner` or `space`), `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
-which refuse a link with `ELOOP` and an escape with `EXDEV`. Each answers an `int` by the contract every `*.sys` module has
+which refuse a link with `ELOOP` and an escape with `EXDEV`, and for the extended attributes `_getxattr`, `_setxattr`,
+`_removexattr` and `_listxattr`, each taking a `follow` flag (non-zero follows a link) and the two that answer bytes asked
+first with no room for the size they would take, then with room for the bytes, answering `-34`, `ERANGE`, where it grew in
+between. Each answers an `int` by the contract every `*.sys` module has
 (`sysl.io.sys`, `sysl.process.sys`, `sysl.net.sys` and `sysl.env.sys` too): zero or more is success, a negative answer is the `code()`
 of the `IoError` it failed with, **negated** as a system call answers it (so `-1` is `EPERM` and comes back as
 `NotPermitted`, where `-13`, `EACCES`, is `PermissionDenied`), and the one status `UNSUPPORTED` means the target cannot make that call at
@@ -1553,7 +1923,7 @@ The question is asked only of what the program reaches, so a freestanding progra
 a file is asked nothing.
 
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
-`link_metadata`, `set_permissions`, `set_owner` and `set_modified` are one `stat`, `chmod`, `chown` or `utimensat` hook, the walk and `remove_dir_all`,
+`link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified` and `space` are one `stat`, `chmod`, `chown`, `lchown`, `utimensat` or `statvfs` hook, `executable` is the `access` hook `readable` and `writable` are, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
 `make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
 thirteen numbers in POSIX's shape and leaves zero what it has nothing to say about; a hook it answers

@@ -1,0 +1,255 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.split
+
+// **A C function pointer type whose signature carries an `f128` is refused where C has no binary128
+// type**, as an `extern` of that signature is (`tests_qd_quad.sysl`): a call through one is lowered as
+// an `extern` call is, and C calls through one it was handed under its own signature, which on those
+// machines no C compiler wrote. sysl 0.13.7 on aarch64-macos refused `extern take_q(x: f128) -> i32`
+// and accepted `*extern(f128) -> i32`, calling it with `call i32 %t2(fp128 %t3)` -- a binary128 in
+// `q0` handed to C, whose widest float there is a `double`.
+
+// Every error a program earns through the checks that run before lowering, on a named machine.
+private qfp_said(text: string, target_name: string) -> string
+    val done = typed_of_target(text, target_named(target_name).unwrap())
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), buf())
+
+    val errors = errors_of(done.an.diagnostics())
+
+    if errors.is_empty() then "" else analysis_report(errors)
+end qfp_said
+
+private qfp_has(said: string, part: string) = assert(said.contains(part), said)
+
+private qfp_lacks(said: string, part: string) = assert(!said.contains(part), said)
+
+// The machines whose C has no binary128 type, each with what its `long double` is.
+private qfp_refusing() -> [4](string, string) =
+    [("aarch64-macos", "a 'double'"), ("x86_64-linux", "the x87 80-bit extended format"),
+     ("x86_64-windows", "a 'double'"), ("thumb-freestanding", "a 'double'")]
+
+// The machines whose `long double` is binary128, where every program here crosses as written.
+private qfp_accepting() -> [4]string = ["aarch64-linux", "riscv64-linux", "riscv32-freestanding",
+                                        "wasm32-freestanding"]
+
+// The tail every refusal on `target` ends with.
+private qfp_reason(target: string, kind: string) -> string =
+    s"and C on '$target' has no binary128 type to spell it with — its 'long double' is $kind there. A " +
+    "'c type' measured as \"long double\" is the type that matches C's on every machine"
+
+// The refusal of parameter `n`, of type `ty`, of the function pointer type `shown`.
+private qfp_param(n: int, shown: string, ty: string, target: string, kind: string) -> string =
+    s"parameter $n of the function pointer type '$shown' is $ty, ${qfp_reason(target, kind)}"
+
+// The refusal of the result `ty` of the function pointer type `shown`.
+private qfp_result(shown: string, ty: string, target: string, kind: string) -> string =
+    s"the function pointer type '$shown' returns $ty, ${qfp_reason(target, kind)}"
+
+// How many times `part` occurs in `said`.
+private qfp_count(said: string, part: string) -> usize = split(said, part).len - 1
+
+// `text` refused on every refusing machine with parameter `n` of `shown` being `ty`, and accepted on
+// every other.
+private qfp_param_everywhere(text: string, n: int, shown: string, ty: string)
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        qfp_has(qfp_said(text, refusing[i].0), qfp_param(n, shown, ty, refusing[i].0, refusing[i].1))
+
+    qfp_accepted_elsewhere(text)
+end qfp_param_everywhere
+
+private qfp_accepted_elsewhere(text: string)
+    val accepting = qfp_accepting()
+
+    for i in 0..<accepting.len
+        assert_eq(qfp_said(text, accepting[i]), "")
+end qfp_accepted_elsewhere
+
+@test("a call through a function pointer taking an f128 is refused where C has no binary128 type")
+qfp_call_param_refused()
+    qfp_param_everywhere("extern get_fp() -> *extern(f128) -> i32\nextern keep(a: i32)\n" +
+                         "val f = get_fp()\nkeep(f(f128(1)))\n", 1, "*extern(f128) -> int", "f128")
+
+@test("a function pointer answering an f128 is refused, and only for its result")
+qfp_call_result_refused()
+    val text = "extern get_fp() -> *extern() -> f128\nextern keep(a: i32)\nval f = get_fp()\nkeep(i32(f()))\n"
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        val said = qfp_said(text, refusing[i].0)
+
+        qfp_has(said, qfp_result("*extern() -> f128", "f128", refusing[i].0, refusing[i].1))
+        qfp_lacks(said, "parameter 1 of the function pointer type")
+
+    qfp_accepted_elsewhere(text)
+
+@test("a later f128 parameter is named by its position, and every refused one is said")
+qfp_later_params_refused()
+    val text = "extern get_fp() -> *extern(i32, f128, f128) -> i32\nextern keep(a: i32)\n" +
+               "keep(get_fp()(1, f128(1), f128(2)))\n"
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        val said = qfp_said(text, refusing[i].0)
+        val shown = "*extern(int, f128, f128) -> int"
+
+        qfp_has(said, qfp_param(2, shown, "f128", refusing[i].0, refusing[i].1))
+        qfp_has(said, qfp_param(3, shown, "f128", refusing[i].0, refusing[i].1))
+        qfp_lacks(said, "parameter 1 of")
+
+    qfp_accepted_elsewhere(text)
+
+@test("a struct holding an f128, passed by value through a function pointer, is refused")
+qfp_struct_param_refused()
+    qfp_param_everywhere("struct H\n    a: f128\n    b: real\nextern get_fp() -> *extern(H) -> real\n" +
+                         "extern keep(a: real)\nkeep(get_fp()(H(f128(1), 2.0)))\n",
+                         1, "*extern(H) -> real", "H")
+
+@test("an array of f128 as a field of a function pointer's parameter is refused")
+qfp_array_field_refused()
+    qfp_param_everywhere("struct A\n    q: [2]f128\nextern get_fp() -> *extern(A) -> real\n" +
+                         "extern keep(a: real)\nkeep(get_fp()(A([f128(1), f128(2)])))\n",
+                         1, "*extern(A) -> real", "A")
+
+@test("an f128 two structs down in a function pointer's parameter is refused")
+qfp_nested_struct_refused()
+    qfp_param_everywhere("struct H\n    a: f128\nstruct W\n    n: i32\n    h: H\n" +
+                         "extern install(f: *extern(W) -> unit)\ninstall(null)\n",
+                         1, "*extern(W) -> unit", "W")
+
+// C calls through a pointer it was handed under its own signature, whether or not sysl ever calls it.
+@test("such a function pointer as an extern's parameter is refused though sysl never calls it")
+qfp_extern_param_refused()
+    qfp_param_everywhere("extern install(f: *extern(f128) -> i32)\ninstall(null)\n",
+                         1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer as a struct's field is refused")
+qfp_struct_field_refused()
+    qfp_param_everywhere("struct Ops\n    run: *extern(f128) -> i32\n    n: i32\n" +
+                         "extern install(o: *Ops)\nextern made() -> *Ops\ninstall(made())\n",
+                         1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer as module storage is refused")
+qfp_global_refused()
+    qfp_param_everywhere("var hook: *extern(f128) -> i32 = null\nextern note(x: bool)\nnote(hook == null)\n",
+                         1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer held in a local is refused")
+qfp_local_refused()
+    qfp_param_everywhere("extern note(x: bool)\n" +
+                         "check() -> bool\n    var f: *extern(f128) -> i32 = null\n    f == null\n" +
+                         "note(check())\n", 1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer as a sysl function's parameter is refused")
+qfp_function_param_refused()
+    qfp_param_everywhere("extern note(x: bool)\npass(f: *extern(f128) -> i32) -> bool = f == null\n" +
+                         "note(pass(null))\n", 1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer as a sysl function's result is refused")
+qfp_function_result_refused()
+    qfp_param_everywhere("extern note(x: bool)\nextern get_fp() -> *extern(f128) -> i32\n" +
+                         "give() -> *extern(f128) -> i32 = get_fp()\nnote(give() == null)\n",
+                         1, "*extern(f128) -> int", "f128")
+
+@test("a named alias and named parameters are the same type, and refused the same")
+qfp_alias_refused()
+    qfp_param_everywhere("type Cb = *extern(x: f128) -> i32\nextern install(f: Cb)\ninstall(null)\n",
+                         1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer as a generic struct's argument is refused")
+qfp_generic_argument_refused()
+    qfp_param_everywhere("struct Holder[T]\n    v: T\nextern note(x: bool)\n" +
+                         "extern get_fp() -> *extern(f128) -> i32\n" +
+                         "held(h: Holder[*extern(f128) -> i32]) -> bool = h.v == null\n" +
+                         "note(held(Holder(get_fp())))\n", 1, "*extern(f128) -> int", "f128")
+
+@test("a pointer to such a function pointer is refused")
+qfp_pointer_to_pointer_refused()
+    qfp_param_everywhere("extern note(x: bool)\npp(f: **extern(f128) -> i32) -> bool = f == null\n" +
+                         "note(pp(null))\n", 1, "*extern(f128) -> int", "f128")
+
+@test("such a function pointer as another function pointer's parameter is refused, and the outer one is not")
+qfp_inside_fn_pointer_refused()
+    val text = "extern each(visit: *extern(*extern(f128) -> i32) -> unit)\neach(null)\n"
+    val refusing = qfp_refusing()
+
+    qfp_param_everywhere(text, 1, "*extern(f128) -> int", "f128")
+
+    for i in 0..<refusing.len
+        // The outer pointer takes a pointer, which is one register on both sides.
+        qfp_lacks(qfp_said(text, refusing[i].0), "'*extern(*extern(f128) -> int) -> unit' is")
+
+@test("an export taking such a function pointer is refused")
+qfp_export_param_refused()
+    qfp_param_everywhere("@export(\"takes_cb\")\n" +
+                         "takes_cb(f: *extern(f128) -> i32) -> i32 = if f == null then 0 else 1\n" +
+                         "extern keep(a: i32)\nkeep(takes_cb(null))\n", 1, "*extern(f128) -> int", "f128")
+
+// The callback's own `@export` is refused as before (`qd_export_is_spelled_or_refused`); the pointer
+// type it is handed over as is refused as well.
+@test("an exported callback handed to C as such a function pointer is refused, both ways")
+qfp_callback_refused()
+    val text = "@export(\"cb\")\ncb(x: f128) -> i32 = i32(x)\n" +
+               "extern install(f: *extern(f128) -> i32)\ninstall(&cb)\n"
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        val said = qfp_said(text, refusing[i].0)
+
+        qfp_has(said, s"'x' of the exported 'cb' is f128, ${qfp_reason(refusing[i].0, refusing[i].1)}")
+        qfp_has(said, qfp_param(1, "*extern(f128) -> int", "f128", refusing[i].0, refusing[i].1))
+
+    qfp_accepted_elsewhere(text)
+
+@test("a function pointer type over f128 met in many places is refused once")
+qfp_refused_once()
+    val text = "extern install(f: *extern(f128) -> i32)\nextern get_fp() -> *extern(f128) -> i32\n" +
+               "var hook: *extern(f128) -> i32 = null\nextern keep(a: i32)\n" +
+               "install(get_fp())\nhook = get_fp()\nkeep(hook(f128(1)))\n"
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        assert_eq(qfp_count(qfp_said(text, refusing[i].0), "of the function pointer type"), 1)
+
+// On Windows x64 a struct holding both an empty struct and an `f128` earns both refusals, as an
+// `extern` of it does.
+@test("a parameter holding an empty struct and an f128 is refused for both on Windows x64")
+qfp_both_reasons_on_windows()
+    val text = "struct E\nend E\nstruct B\n    q: f128\n    e: E\n    n: i32\n" +
+               "extern install(f: *extern(B) -> unit)\ninstall(null)\n"
+    val said = qfp_said(text, "x86_64-windows")
+
+    qfp_has(said, qfp_param(1, "*extern(B) -> unit", "B", "x86_64-windows", "a 'double'"))
+    qfp_has(said, "parameter 1 of the function pointer type '*extern(B) -> unit' is B, whose field 'e' is E")
+    qfp_param_everywhere(text, 1, "*extern(B) -> unit", "B")
+
+@test("a pointer to an f128 and a real still cross through a function pointer everywhere")
+qfp_accepted()
+    val text = "extern keep(a: real)\nextern made() -> *f128\n" +
+               "extern get_fp() -> *extern(*f128, real) -> real\nkeep(get_fp()(made(), 1.0))\n"
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        assert_eq(qfp_said(text, refusing[i].0), "")
+
+    qfp_accepted_elsewhere(text)
+
+// `reference/ffi.md § f128` shows this refusal in an `error` block; this pins it on every machine.
+@test("the ffi page's f128 function pointer example is refused in the words the page quotes")
+qfp_ffi_page_example()
+    qfp_param_everywhere("extern \"on_tick\" on_tick(f: *extern(f128) -> real)\n\non_tick(null)\n",
+                         1, "*extern(f128) -> real", "f128")
+
+// As `qd_an_uncalled_quad_extern_is_not_refused`: what the build never emits is never asked.
+@test("such a function pointer type nothing reached mentions is not refused")
+qfp_unreached_accepted()
+    val text = "type Cb = *extern(f128) -> i32\nextern install(f: *extern(f128) -> i32)\n" +
+               "extern give() -> Cb\n"
+    val refusing = qfp_refusing()
+
+    for i in 0..<refusing.len
+        assert_eq(qfp_said(text, refusing[i].0), "")

@@ -28,7 +28,10 @@ import sysl.text.{from_utf8_unchecked, join, str_builder, StrBuilder, Search}
 //
 //   - a **small local function** -- the ARC runtime's blocks, a closure body, a helper -- is copied
 //     into every partition that calls it, and so is a local one marked `@inline` of any length. It stays local in each, so each copy can still be inlined,
-//     which is the one thing a call across partitions cannot be.
+//     which is the one thing a call across partitions cannot be. **Not one whose address is taken**
+//     (named other than as a callee, anywhere): a function has one address, so it is shared as a
+//     large local is, and each other partition that calls it gets an `available_externally` copy of
+//     the promoted symbol instead.
 //   - a **small or `@inline` external function** stays in the partition its name hashes to, and every
 //     other partition that calls it gets an `available_externally` copy (`importable_define`): one
 //     definition at the link, and a body the caller's optimizer can still inline. A copy the program
@@ -153,6 +156,7 @@ private struct Module
     items: Buf[Entity]
     ref_start: Buf[usize]     // item i names refs[ref_start[i] ..< ref_start[i + 1]]
     refs: Buf[usize]
+    addressed: Buf[bool]      // item i is named somewhere other than as the callee of a call
 
 // The module's pieces, or nothing where it holds something that has to stay in one module.
 private read_module(text: string) -> Option[Module]
@@ -205,6 +209,10 @@ private read_module(text: string) -> Option[Module]
 
     var ref_start: Buf[usize] = buf()
     var refs: Buf[usize] = buf()
+    var addressed: Buf[bool] = buf()
+
+    for i in 0..<items.len()
+        addressed.push(false)
 
     for i in 0..<items.len()
         ref_start.push(refs.len())
@@ -214,10 +222,10 @@ private read_module(text: string) -> Option[Module]
         if e.piece == PieceDefine || e.piece == PieceGlobal
             // A global's own name is on its line too, and is not a use of itself.
             val from = if e.piece == PieceGlobal then e.start + 1 + e.name.len else e.start
-            scan_symbols(b, from, e.end, &named, i, &refs)
+            scan_symbols(b, from, e.end, &named, i, &refs, &addressed)
 
     ref_start.push(refs.len())
-    Some(Module(text, items, ref_start, refs))
+    Some(Module(text, items, ref_start, refs, addressed))
 end read_module
 
 private line_end(b: []const u8, from: usize) -> usize
@@ -511,7 +519,7 @@ end plain_global
 // Every `@symbol` between `from` and `to`, outside a string, recorded as an index where it names one
 // of the module's pieces other than `me`.
 private scan_symbols(b: []const u8, from: usize, to: usize, named: *Map[string, usize], me: usize,
-                     out: *Buf[usize])
+                     out: *Buf[usize], addressed: *Buf[bool])
     var i = from
 
     while i < to
@@ -529,7 +537,13 @@ private scan_symbols(b: []const u8, from: usize, to: usize, named: *Map[string, 
 
             if e > i + 1
                 named.get(from_utf8_unchecked(b[i + 1..<e])) match
-                    Some(k) -> if k != me then out.push(k)
+                    Some(k) ->
+                        if k != me then out.push(k)
+
+                        // A callee is `@f(`; any other spelling -- stored, compared, in a table,
+                        // handed to a call -- is the function's address. Its own name heading its
+                        // definition is followed by `(` too.
+                        if e >= to || b[e] != u8('(') then addressed[k] = true
                     None -> ()
 
             i = e
@@ -626,7 +640,7 @@ split_module(text: string, n: int) -> Option[Buf[string]]
                     work.push((p, r))
                 elif it.piece == PieceDeclare || !it.local
                     needed[p * count + r] = true
-                elif it.piece == PieceDefine && (it.cost <= CopyCost || marked_inline(m, r))
+                elif it.piece == PieceDefine && !m.addressed[r] && copyable_local(m, r)
                     member[p * count + r] = true
                     work.push((p, r))
                 elif home[r] < 0
@@ -636,6 +650,14 @@ split_module(text: string, n: int) -> Option[Buf[string]]
                 else
                     needed[p * count + r] = true
                     promoted[r] = true
+
+                    // **A function whose address is taken has one definition**, or `&f == &f`
+                    // compares two copies. One small enough to copy is promoted like any shared
+                    // local, and this partition gets an `available_externally` copy of the
+                    // promoted symbol: its calls can still inline, and its address is the home's.
+                    if it.piece == PieceDefine && copyable_local(m, r)
+                        imported[p * count + r] = true
+                        work.push((p, r))
 
         if swept then break
 
@@ -674,6 +696,10 @@ split_module(text: string, n: int) -> Option[Buf[string]]
 
     Some(out)
 end split_module
+
+// Whether local function `i` is small enough, or marked `@inline`, to be copied into a partition
+// that calls it.
+private copyable_local(m: Module, i: usize) -> bool = m.items[i].cost <= CopyCost || marked_inline(m, i)
 
 private name_hash(name: string) -> u64
     var h: u64 = 0xcbf29ce484222325

@@ -4792,7 +4792,10 @@ The fields are laid end to end, the aggregate needs no alignment of its own, and
 no gap between elements either. A register block, and a C struct that has to match one, are what it
 is for.
 
-The fields still read and write their own values — packing changes where they sit, not what they are:
+The fields still read and write their own values — packing changes where they sit, not what they are.
+Each is read and written as storage on no boundary, as C's packed fields are, so a core that cannot
+reach a word at an odd address (an ARMv6-M Cortex-M0+) moves the `u32` below a byte at a time rather
+than faulting:
 
 ```sysl
 @packed
@@ -4834,6 +4837,52 @@ that is the point of the attribute — while a `*u32` is a `*u32` wherever it ca
 of one is entitled to assume the address is aligned. Only the escaped address loses that, and it
 would lose it arbitrarily far from the `&` that made it. **The struct's own address is untouched**,
 being an ordinary pointer to an ordinary aggregate.
+
+**A `volatile` field off its boundary is refused.** A volatile access is exactly one access of its
+width ([`volatile`](/reference/memory/)) — on ARM one `ldr` or `str` — and that one instruction at an
+address off the type's boundary faults on an ARMv6-M core always, and on any core's device memory,
+which is what `volatile` is for. Byte-at-a-time is not an option: it would be four accesses to one
+register. So selecting such a field is refused where it is written:
+
+```sysl
+@packed
+struct Reg
+    tag: u8
+    word: volatile u32
+
+@export("get")
+get(r: *Reg) -> u32 = r.word
+```
+
+```error
+'Reg.word' is a 'volatile' uint at byte 1 of Reg, which is misaligned: 1 is not a multiple of 4, a uint's alignment on this target. A volatile access is exactly one access of its width, and one off that boundary faults on device memory — place it at a multiple of 4 bytes from the start of Reg
+```
+
+**Misaligned is exact**: a volatile value sits at a byte offset, counted from the start of the struct
+whose field is selected, that is not a multiple of its type's natural alignment on the target — what
+`alignof` says of the type outside any packed struct, so a `volatile usize` at byte 4 is refused on a
+64-bit target and accepted on a 32-bit one. The offset counts through every struct and array that holds
+the value by value: a packed struct held one byte into another, an ordinary struct held in a packed
+one, a packed one held in an ordinary one (it needs no alignment of its own, so it may begin at any
+byte), and an array's element, each a stride on from the last — so an array is on its boundary when
+its first two elements are. A bitfield struct is one volatile container of its width, and a C
+bitfield's unit is the access it names. A generic struct is checked at each instantiation, and a field
+of a type whose alignment is one byte (`u8`, `bool`) is never off its boundary. An ordinary field is
+unaffected: `Head.len` above still moves a byte at a time. Pad the register to its boundary instead:
+
+```sysl
+@packed
+struct Reg
+    tag: u8
+    pad: [3]u8
+    word: volatile u32
+
+print(sizeof(Reg))
+```
+
+```output
+8
+```
 
 ### Bitfields — an `iN` field in exactly N bits
 
@@ -5444,9 +5493,10 @@ narrowed. That is the AAPCS rule for volatile bitfields, and what a peripheral r
 device may ignore, or fault on, an access narrower than its register. As with today's bitfields, the
 qualifier on any field of a unit qualifies every access to that unit, and nothing diagnoses what a
 read-modify-write costs a register whose read clears it. Under `@packed` a volatile field that lies
-across two units of its declared type has no single access to make, and is refused. On AArch64 each of
-those unit accesses is one plain `ldr`/`str` of the unit's width from a bare register address, as
-every volatile access is there ([memory](/reference/memory/#device-memory)).
+across two units of its declared type has no single access to make, and is refused. On AArch64 and on
+32-bit ARM each of those unit accesses is one plain `ldr`/`str` of the unit's width from a bare
+register address (on 32-bit ARM a `u64` unit is two, one per word), as every volatile access is there
+([memory](/reference/memory/#device-memory)).
 
 `@packed` on such a struct is GNU's `packed` (MSVC's `pack(1)`): the fields abut bit for bit, and
 `@align(n)` raises it as it raises any struct. The two kinds of bitfield do not mix in one struct — a

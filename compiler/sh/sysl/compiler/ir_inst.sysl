@@ -201,10 +201,17 @@ ord_on_failure(o: IrOrdering) -> IrOrdering = o match
 // `ldr x9, [x0], #-8`, or into a floating-point register, and a hypervisor cannot emulate either at a
 // device -- the trap carries no syndrome (ISV=0). An `asm` is the one form no LLVM rewrites. `emit`
 // chooses it; every pass reads it as it reads `AccVolatile`.
+//
+// **`AccVolatileArm` is the same on 32-bit ARM (Thumb)**: one `ldr`/`str` (`b`/`h`) of a general
+// register from a bare register address, where LLVM's own may be a post-indexed `ldr r3, [r2], #4`, an
+// `ldm r2!, {r3}`, or a `vldr s2, [r0]` -- an `ldm`/`stm` an exception may abandon and restart, so a
+// read-to-clear register is read twice. A volatile wider than a word there is one such access per word,
+// lowest address first (`arm_volatile_words`, `emit.sysl`'s `emit_arm_words`).
 enum IrAccess
     AccPlain
     AccVolatile
     AccVolatileA64
+    AccVolatileArm
     AccAtomic(ordering: IrOrdering)
     AccBufHeader
     AccBufBox
@@ -219,26 +226,49 @@ end IrAccess
 // carried one.
 is_plain_access(acc: IrAccess) -> bool = acc match
     AccPlain | AccBufHeader | AccBufBox | AccBufElement | AccBufHandle -> true
-    AccVolatile | AccVolatileA64 | AccAtomic(_) -> false
+    AccVolatile | AccVolatileA64 | AccVolatileArm | AccAtomic(_) -> false
 
 // The bytes a volatile access of `ty` moves as one plain AArch64 instruction into a general register,
 // or `None` where no one such instruction moves it: storage of 1, 2, 4 or 8 bytes (an `i1`, an `i12`
 // and a `half` included, an `i24` or an `i128` not), at no less than its natural alignment.
-a64_volatile_bytes(ty: LType, align: Option[int]) -> Option[int]
+a64_volatile_bytes(ty: LType, align: Option[int]) -> Option[int] = plain_volatile_bytes(ty, align, 8)
+
+// The same on 32-bit ARM, whose general registers and pointers are 4 bytes: storage of 1, 2 or 4.
+arm_volatile_bytes(ty: LType, align: Option[int]) -> Option[int] = plain_volatile_bytes(ty, align, 4)
+
+// The 32-bit words a volatile of `ty` is made as on 32-bit ARM, where it is wider than one: an integer or
+// float of a whole number of words (a `u64`, an `f64`, a `u128`), at no less than a word's alignment.
+// `None` for anything one access moves, or that no run of word accesses moves exactly (a `u48`, which
+// the analyzer refuses there).
+arm_volatile_words(ty: LType, align: Option[int]) -> Option[int]
     val bits = ty match
         LInt(n) -> n
         LFloat(n, _) -> n
-        LPtr -> 64
+        _ -> return None
+
+    if bits <= 32 || bits % 32 != 0 then return None
+
+    align match
+        Some(a) if a < 4 -> None
+        _ -> Some(bits / 32)
+end arm_volatile_words
+
+// The bytes of `ty`'s storage where one `ldr`/`str` of a `word`-byte general register moves it.
+private plain_volatile_bytes(ty: LType, align: Option[int], word: int) -> Option[int]
+    val bits = ty match
+        LInt(n) -> n
+        LFloat(n, _) -> n
+        LPtr -> word * 8
         _ -> return None
 
     val bytes = (bits + 7) / 8
 
-    if bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8 then return None
+    if bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8 || bytes > word then return None
 
     align match
         Some(a) if a < bytes -> None
         _ -> Some(bytes)
-end a64_volatile_bytes
+end plain_volatile_bytes
 
 // `ldr`/`str` with the width's suffix and the register operand `n` at the width's view of it.
 private a64_mnemonic(op: string, bytes: int) -> string = bytes match
@@ -249,14 +279,15 @@ private a64_mnemonic(op: string, bytes: int) -> string = bytes match
 private a64_reg(n: int, bytes: int) -> string = "${" + n.to_string() + (if bytes == 8 then ":x}" else ":w}")
 
 // A volatile load as one `ldr` from a register address. The `asm` declares no memory effects, so the
-// optimizer treats it as reading and writing anything: it is neither moved nor dropped.
-private a64_volatile_load(d: Val, ty: LType, p: Val, bytes: int) -> string =
+// optimizer treats it as reading and writing anything: it is neither moved nor dropped. On 32-bit ARM
+// (`arm`) a register has one view, `$0`.
+private plain_volatile_load(d: Val, ty: LType, p: Val, bytes: int, arm: bool) -> string =
     s"${v_render(d)} = call ${l_render(ty)} asm sideeffect \"" + a64_mnemonic("ldr", bytes) + " " +
-        a64_reg(0, bytes) + ", [$1]\", \"=r,r,~{memory}\"(ptr " + v_render(p) + ")"
+        (if arm then "$0" else a64_reg(0, bytes)) + ", [$1]\", \"=r,r,~{memory}\"(ptr " + v_render(p) + ")"
 
 // A volatile store as one `str` to a register address.
-private a64_volatile_store(ty: LType, v: Val, p: Val, bytes: int) -> string =
-    "call void asm sideeffect \"" + a64_mnemonic("str", bytes) + " " + a64_reg(0, bytes) +
+private plain_volatile_store(ty: LType, v: Val, p: Val, bytes: int, arm: bool) -> string =
+    "call void asm sideeffect \"" + a64_mnemonic("str", bytes) + " " + (if arm then "$0" else a64_reg(0, bytes)) +
         ", [$1]\", \"r,r,~{memory}\"(" + l_render(ty) + " " + v_render(v) + ", ptr " + v_render(p) + ")"
 
 // Whether `ty` is an integer narrower than the storage it is moved at -- a `bool`'s `i1`, a `u12`'s
@@ -266,11 +297,12 @@ a64_narrow(ty: LType, bytes: int) -> bool = ty match
     LInt(n) -> n != bytes * 8
     _ -> false
 
-// The bytes an `AccVolatileA64` access is written as one instruction for: one `a64_volatile_bytes`
-// admits, at a type that is its storage's own width.
-private a64_written(ty: LType, align: Option[int]) -> Option[int] = a64_volatile_bytes(ty, align) match
-    Some(n) if !a64_narrow(ty, n) -> Some(n)
-    _ -> None
+// The bytes an `AccVolatileA64` (`AccVolatileArm` where `arm`) access is written as one instruction
+// for: one `a64_volatile_bytes` (`arm_volatile_bytes`) admits, at a type that is its storage's own width.
+private plain_written(ty: LType, align: Option[int], arm: bool) -> Option[int] =
+    plain_volatile_bytes(ty, align, if arm then 4 else 8) match
+        Some(n) if !a64_narrow(ty, n) -> Some(n)
+        _ -> None
 
 // What a call says about floating point: a relaxation the back end is allowed (`reassoc`, written
 // after `call`), or `strictfp`, which every call inside a `@strict_fp` body carries
@@ -379,10 +411,14 @@ inst_render(i: Inst) -> string = i match
     InCast(d, op, f, v, t) ->
         s"${v_render(d)} = ${cast_render(op)} ${l_render(f)} ${v_render(v)} to ${l_render(t)}"
     InAlloca(d, ty, align) -> s"${v_render(d)} = alloca ${l_render(ty)}${align_text(align)}"
-    InLoad(d, ty, p, AccVolatileA64, align) if a64_written(ty, align).is_some() ->
-        a64_volatile_load(d, ty, p, a64_written(ty, align).unwrap())
-    InStore(ty, v, p, AccVolatileA64, align) if a64_written(ty, align).is_some() ->
-        a64_volatile_store(ty, v, p, a64_written(ty, align).unwrap())
+    InLoad(d, ty, p, AccVolatileA64, align) if plain_written(ty, align, false).is_some() ->
+        plain_volatile_load(d, ty, p, plain_written(ty, align, false).unwrap(), false)
+    InStore(ty, v, p, AccVolatileA64, align) if plain_written(ty, align, false).is_some() ->
+        plain_volatile_store(ty, v, p, plain_written(ty, align, false).unwrap(), false)
+    InLoad(d, ty, p, AccVolatileArm, align) if plain_written(ty, align, true).is_some() ->
+        plain_volatile_load(d, ty, p, plain_written(ty, align, true).unwrap(), true)
+    InStore(ty, v, p, AccVolatileArm, align) if plain_written(ty, align, true).is_some() ->
+        plain_volatile_store(ty, v, p, plain_written(ty, align, true).unwrap(), true)
     InLoad(d, ty, p, acc, align) ->
         s"${v_render(d)} = load${access_text(acc)} ${l_render(ty)}, ptr ${v_render(p)}" +
             s"${order_text(acc)}${align_text(align)}${scope_text(acc)}"
@@ -523,7 +559,7 @@ private switch_arms(ty: LType, cases: Buf[(BigInt, string)]) -> string
 end switch_arms
 
 private access_text(a: IrAccess) -> string = a match
-    AccVolatile | AccVolatileA64 -> " volatile"
+    AccVolatile | AccVolatileA64 | AccVolatileArm -> " volatile"
     AccAtomic(_) -> " atomic"
     _ -> ""
 

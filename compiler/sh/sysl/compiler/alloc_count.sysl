@@ -104,8 +104,6 @@ alloc_count_text(word: string) -> string
     @sysl.count.bytes.var = private constant [${variable.bytes.len + 1} x i8] c"$variable\\00"
 
     declare void @free(ptr)
-    declare i32 @dprintf(i32, ptr, ...)
-    declare i32 @atexit(ptr)
     declare i32 @posix_memalign(ptr, $word, $word)
     declare void @abort()
     declare ptr @getenv(ptr)
@@ -207,18 +205,19 @@ alloc_count_mismatch_said() -> string =
 gen_alloc_count_mark(e: *Emit)
     if !alloc_counting_active() then return
 
+    request_text(e, count_report_libc(), count_report_libc_text())
     request_text(e, "sysl.count", alloc_count_text(s"i${e.word_bits}"))
     emit(e, ir_call(None, LVoid, VGlobal("sysl.count.mark"), buf()))
 end gen_alloc_count_mark
 
-// Whether this module carries the counting runtime, and so defines the pair and declares `malloc`,
-// `free`, `dprintf`, `atexit` and `getenv` itself: nothing else may state those again.
+// Whether this module carries the counting runtime, and so defines the pair and declares `free`,
+// `posix_memalign`, `abort` and `getenv` itself (`dprintf` and `atexit` are the reports' shared text,
+// `count_report_libc`): nothing else may state those again.
 defines_alloc_count(e: *Emit) -> bool = e.requested_set.has("sysl.count")
 
 // The symbols the counting runtime states.
 alloc_count_symbols() -> []const string =
-    [counted_allocator().0, counted_allocator().1, "free", "dprintf", "atexit", "posix_memalign", "abort",
-     "getenv"]
+    [counted_allocator().0, counted_allocator().1, "free", "posix_memalign", "abort", "getenv"]
 
 // What a counted program said about its heap: the net count it reported, or zero where it said
 // nothing. Read off its standard error.
