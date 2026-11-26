@@ -1,0 +1,97 @@
+module sh.sysl.compiler
+
+// **A volatile access is exactly one access of its type's width** (`reference/memory.md § Device
+// memory`), and on AArch64 and 32-bit ARM it is one `ldr`/`str` (`ir_inst.sysl`'s `plain_volatile_load`):
+// at an address off the type's boundary that is a fault on an ARMv6-M core, and on any core's device
+// memory, which is what `volatile` is for. Only `@packed` moves a field off its boundary, so only a
+// struct that is packed, or holds one by value, can place a volatile there.
+//
+// **Misaligned** is exact: a volatile value sits at a byte offset, counted from the start of the struct
+// whose field is selected, that is not a multiple of its type's natural alignment on the target
+// (`TargetLayout.align` of the unqualified type). The offset counts through every struct and array
+// holding it by value; an array's element `k` is `k` strides on, so element 1 being on the boundary
+// as well as element 0 puts every one there. A bitfield struct's container is one unit at the
+// boundary of its own width, and a C bitfield's unit is the one `c_volatile_unit` names.
+
+// The volatile value found off its boundary: the path to it from the value being placed (`""` for the
+// value itself, `.f`, `[1]`), its offset from the struct's start, its type, and the boundary it needs.
+struct MisplacedVolatile
+    path: string
+    offset: usize
+    ty: Type
+    align: usize
+
+// The first volatile value inside a `t` placed `at` bytes into a struct that is not on its boundary.
+misplaced_volatile(l: TargetLayout, t: Type, at: usize) -> Option[MisplacedVolatile]
+    if !volatile_in(t) then return None
+
+    t match
+        Volatile(_) -> unit_off_boundary(t, at, l.align(unqualified(t)))
+        Array(n, elem, _) -> misplaced_element(l, *elem, at, 0) match
+            Some(m) -> Some(m)
+            None -> if n < 2 then None else misplaced_element(l, *elem, at + l.size(*elem), 1)
+        Struct(d) -> misplaced_in_struct(l, d, at)
+        Constrained(d) -> misplaced_volatile(l, d.base, at)
+        _ -> None
+end misplaced_volatile
+
+private misplaced_element(l: TargetLayout, elem: Type, at: usize, k: int) -> Option[MisplacedVolatile] =
+    misplaced_volatile(l, elem, at) match
+        Some(m) -> Some(MisplacedVolatile(s"[$k]${m.path}", m.offset, m.ty, m.align))
+        None -> None
+
+private unit_off_boundary(t: Type, at: usize, align: usize) -> Option[MisplacedVolatile] =
+    if align > 1 && at % align != 0 then Some(MisplacedVolatile("", at, t, align)) else None
+
+private misplaced_in_struct(l: TargetLayout, d: &StructType, at: usize) -> Option[MisplacedVolatile]
+    // A bitfield struct is one integer container, read and written whole.
+    if bitfield_ranges(d).is_some()
+        val container = Integer(int(l.size(Struct(d))) * 8, false, false)
+
+        return unit_off_boundary(container, at, l.align(container))
+    end if
+
+    for i in 0..<d.fields.len()
+        misplaced_member(l, d, i, at) match
+            Some(m) -> return Some(MisplacedVolatile(s".${d.fields[i].0}${m.path}", m.offset, m.ty, m.align))
+            None -> ()
+
+    None
+end misplaced_in_struct
+
+// The first volatile value inside the `i`th field of a `d` that begins `at` bytes into the struct. A C
+// bitfield with no one unit is the straddle refusal's (`expr_member.sysl`), not this one's.
+private misplaced_member(l: TargetLayout, d: &StructType, i: usize, at: usize) -> Option[MisplacedVolatile]
+    val f = d.fields[i]
+
+    if !volatile_in(f.1) then return None
+
+    d.c_bit(i) match
+        Some(bit) -> c_volatile_unit(l, d, i) match
+            Some(unit) -> unit_off_boundary(bit.storage, at + unit.0, l.align(bit.storage))
+            None -> None
+        None -> l.field_offset(d, f.0) match
+            Some(off) -> misplaced_volatile(l, f.1, at + off)
+            None -> None
+end misplaced_member
+
+// What selecting the `i`th field of `d` is told, where a volatile value in it is off its boundary. A
+// bitfield struct's own fields are bits of one container, which begins at the struct's start.
+misplaced_field(cx: &Analyzer, d: &StructType, i: usize) -> Option[string]
+    if bitfield_ranges(d).is_some() then return None
+
+    misplaced_member(cx.an.tables.layout, d, i, 0) match
+        Some(m) -> Some(misplaced_volatile_message(d, d.fields[i].0, m))
+        None -> None
+end misplaced_field
+
+// The words of that refusal.
+private misplaced_volatile_message(d: &StructType, field: string, m: MisplacedVolatile) -> string
+    val owner = type_show(Struct(d))
+    val ty = type_show(unqualified(m.ty))
+
+    s"'$owner.$field${m.path}' is a 'volatile' $ty at byte ${m.offset} of $owner, which is misaligned: " +
+        s"${m.offset} is not a multiple of ${m.align}, a $ty's alignment on this target. A volatile access " +
+        s"is exactly one access of its width, and one off that boundary faults on device memory — place it " +
+        s"at a multiple of ${m.align} bytes from the start of $owner"
+end misplaced_volatile_message
