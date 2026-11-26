@@ -1171,8 +1171,9 @@ is what makes the boundary writable rather than merely restricted.
 
 ### A trap inside an export
 
-**A check that fails inside an exported function ends the process, and nothing after it runs.** A
-bounds check, an overflow check in a debug build, a `require` or other contract, an index past a
+**A check that fails inside an exported function ends the process, and nothing after it runs** —
+except an allocation refused inside one marked `@out_of_memory(value)`, which answers the value
+([below](#an-export-that-answers-out-of-memory)). A bounds check, an overflow check in a debug build, a `require` or other contract, an index past a
 container's count and `trap()` all stop exactly as they do in a sysl program
 ([errors](/reference/errors/#what-stopping-looks-like)): the line the check reports goes to standard
 error, C's open output streams are flushed, and the trap instruction ends the process — status 133
@@ -1209,6 +1210,134 @@ any other.
 they end a program: their line goes to standard error and the process aborts, SIGABRT, status 134.
 `abort` runs no `atexit` handler either, so the caller's handlers, which a panic has no reason to
 trust, are never run against the state it reported.
+
+### An export that answers out of memory
+
+**`@out_of_memory(value)` beside an `@export` makes an allocation refused anywhere inside the call
+into `value` for its C caller**, where everywhere else a refused allocation traps
+([memory](/reference/memory/#an-allocation-that-may-fail)). A C API that promises an out-of-memory
+status writes it once, on the export, rather than reaching for a `try_` form at every allocation the
+call can reach. That includes the allocations no `try_` form exists for: a string's copy, an
+interpolation, a `to_string`, a derived `clone`, a `Map` growing, and building the error value
+itself:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Table
+    name: string
+
+impl Drop for Table
+    drop(self)
+        print("dropped", self.name)
+
+@export("table_open")
+@out_of_memory(-2001)
+table_open(rows: u64) -> i32
+    val t: &Table = Table("orders")
+
+    defer print("deferred")
+
+    var b: Buf[u64] = buf()
+
+    b.reserve(usize(rows))
+    b.push(rows)
+    i32(b.len())
+
+extern "table_open" c_table_open(rows: u64) -> i32
+
+print(c_table_open(4))
+print(c_table_open(u64(1) << 61))
+```
+
+```output
+deferred
+dropped orders
+1
+deferred
+dropped orders
+-2001
+```
+
+The `extern` of the export's own symbol is how a sysl program calls it the way C does. The second
+call asks for more than a `usize` can count, so the heap is never asked; a heap that answers null
+(libc's `malloc`, or the pair a manifest names) is refused the same way.
+
+**The call is unwound by returning, not by jumping.** Every frame between the refused allocation
+and the export ends the way a failing `return` ends it. Its `defer`s run. Its `errdefer`s run, except
+one that binds the error (`errdefer e -> …`): the function is not returning an error, so there is
+nothing to bind. Its destructors run, and everything it owns is given back, last made first. So
+nothing it made stays allocated, and a lock taken with `Mutex.with` is released by that member's own
+`defer`. The lock is not poisoned: the next call takes it as if the last one had returned.
+
+What the call wrote before the refusal to storage that outlives it stays written: module storage,
+what the caller's pointers reach, a structure updated halfway. That is the guarantee Rust's
+`catch_unwind` gives, no leak and no dangling reference, not a transaction. An export that must
+leave its state as it found it builds the new state aside and links it in last.
+
+**The value is an expression of the export's result type, over its parameters**, held to
+`@no_alloc`, since there is no memory left to make anything with. It may call a `@no_alloc` function,
+and that function is where a C API's error out-parameter is filled:
+
+```sysl
+@export("open_db")
+@out_of_memory(i32((5).to_string().len))
+open_db(path: *u8) -> i32 = 0
+
+print(open_db(null))
+```
+
+```error
+'open_db''s '@out_of_memory' value is answered when an allocation has just been refused, so it may make nothing on the heap
+```
+
+A function C's caller cannot read a value from is refused it: one whose result is not written, or is
+nothing, and any function that is not an `@export`. A sysl caller of a function that may run out of
+memory uses the `try_` forms and reads the `AllocError` itself.
+
+**The boundary is the export's thunk, and it is per thread.** Each thread keeps one word,
+`sysl_oom_state`, in the library's C (`sys/oom.c`). The word holds twice the number of answering
+exports the thread is inside, plus one while a refusal is being carried out to the nearest of them.
+A refusal where none is open traps exactly as it always did. That covers:
+
+- the export's function called from sysl by name rather than through its symbol: a sysl call does
+  not go through the thunk;
+- a thread started inside the call: every thread starts outside every boundary;
+- a fiber started inside it (`sysl.fiber`): its frames are not the caller's;
+- a sysl function C calls back from inside it. Around a call into C the count is hidden, since the C
+  frames in between could not be unwound by returning. An `@export` that C calls from inside is a
+  boundary of its own if it is marked, and traps if it is not;
+- an `async` body: its way out is its task's;
+- an allocation refused while a way out is already running, as in a `defer` that allocates.
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+@export("count_rows")
+@out_of_memory(-1)
+count_rows(rows: u64) -> i32
+    var b: Buf[u64] = buf()
+
+    b.reserve(usize(rows))
+    i32(b.len())
+
+print("before")
+print(count_rows(u64(1) << 61))
+```
+
+```output trap
+before
+```
+
+**A build with no such export is lowered exactly as before**, byte for byte. A build with one pays
+only in what an answering export can reach. After each call that can reach an allocation there is a
+load of the word and a branch. Around each call into C, the word is saved, zeroed and put back. Each
+allocation gets one more branch on its refused edge. The standard module is built in its unwinding
+form, keyed apart from the ordinary one, since any of its bodies may be reached. On a hosted target
+the word is thread-local. On a freestanding one it is one word for the image, so a kernel that
+switches tasks inside such an export saves and restores it with the rest of a task's state. Nothing
+needs an unwinder, `setjmp` or a landing pad, so `thumb-freestanding` and `wasm32` builds lower it
+the same way.
 
 ### A variadic export
 

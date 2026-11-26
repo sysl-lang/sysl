@@ -1,0 +1,479 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.math.bigint.from_int
+
+// **An allocation refused inside an `@export` that says `@out_of_memory(value)` becomes that value
+// for its C caller** (`reference/ffi.md § An export that answers out of memory`), where everywhere
+// else a refused allocation traps.
+//
+// **The call is unwound by returning, not by jumping.** One word per thread, `sysl_oom_state` (the
+// library's `sys/oom.c`), holds how many such exports the thread is inside, times two, and in its low
+// bit whether a refusal is being carried out. An opted export's thunk adds two on the way in. A
+// refused allocation inside it -- a box, a buffer, a string, a task's frame -- finds the count non-zero,
+// sets the bit and leaves its function the way a failing `?` does: what the frame deferred runs, its
+// `errdefer`s too, and everything it owns is given back. Every call in the body that can reach an
+// allocation is followed by a test of the bit, so each caller leaves in turn, until the thunk finds
+// the bit set, clears both and answers the value. Nothing is skipped, so nothing leaks and no lock
+// stays held; nothing needs an unwinder, `setjmp` or a landing pad, so it is the same on a board and
+// on wasm.
+//
+// **Only what an opted export can reach pays** (`oom_scope`): a function outside that set is lowered
+// exactly as before, and a build with no opted export is lowered exactly as before everywhere. The
+// count is zero wherever no opted export is on the stack -- a thread's own start, a call from C --
+// and a refusal there traps as it always did. A call to C hides the count for its duration, so a
+// sysl function C calls back is outside the boundary and traps: its frames could be unwound, the C
+// ones between could not.
+
+// The name the value is lifted into: the export's own, with a suffix only a backquoted name could
+// spell. A key holds the `$` a name was written with as `$24` (`analyzer.sysl`'s `guarded`), so the
+// key of the lifted function is the export's key with `OomKeySuffix`.
+const OomValueSuffix: string = "$out_of_memory"
+const OomKeySuffix: string = "$24out_of_memory"
+
+oom_value_name(export_key: string) -> string = export_key + OomKeySuffix
+
+// Whether a key is one of the lifted values, and the export it belongs to.
+oom_value_of(key: string) -> Option[string] =
+    if key.ends_with(OomKeySuffix) then Some(key[0..<key.len - OomKeySuffix.len]) else None
+
+// -- reading it ------------------------------------------------------------------------------------
+
+// The places `@out_of_memory` cannot stand, said where it was written: beside a function that is not
+// an export, which has no C caller to answer; and beside one whose result is not written, or is
+// nothing, which has no result to put the value in.
+refuse_misplaced_oom(p: *Parser, f: *FuncDecl, written_ret: Option[TypeRef], is_async: bool)
+    if f.marks.out_of_memory.is_none() then return
+
+    val at = f.marks.out_of_memory.unwrap().span
+
+    if f.exported.is_none()
+        p.fault(at, s"'@out_of_memory' says what an export answers its C caller when an allocation inside the call is refused, and '${f.name}' is not '@export' — a sysl caller of a function that may run out of memory calls the 'try_' forms ('try_box', 'Buf.try_push') and reads the 'AllocError' itself")
+        f.marks.out_of_memory = None
+        return
+    end if
+
+    if is_async then return
+
+    val nothing = written_ret match
+        None -> true
+        Some(t) -> *t.kind match
+            TupleType(parts, _) -> parts.is_empty()
+            NamedType(n, _) -> n == "never"
+            _ -> false
+
+    if nothing
+        p.fault(at, s"'@out_of_memory' is the value '${f.name}' answers in place of its result when an allocation inside it is refused, and '${f.name}' writes no result to put it in — write the result type, an integer status or a pointer C can test")
+        f.marks.out_of_memory = None
+    end if
+end refuse_misplaced_oom
+
+// **Each value becomes a function of its own**, declared beside the export with the same parameters
+// and result, private to the file, and `@no_alloc`: the analysis then types it against the result,
+// reads the parameters in it, and refuses an allocation in it -- which there is no memory left for --
+// with the sentences every function gets. The export's thunk calls it with the arguments C passed.
+lift_oom_values(body: Buf[Stmt]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for s in body
+        out.push(s)
+
+        *s.kind match
+            FuncDecl(d) ->
+                d.marks.out_of_memory match
+                    Some(v) ->
+                        out.push(stmt(v.span, FuncDecl(lifted_value(d, v))))
+
+                        // The standard module is asked for before anything is lowered, so the
+                        // program says it wants the unwinding one as soon as it is read.
+                        oom_std_wanted = true
+                    None -> ()
+            _ -> ()
+
+    out
+end lift_oom_values
+
+private lifted_value(d: FuncDecl, v: Expr) -> FuncDecl
+    var f = blank_func(d.name + OomValueSuffix)
+    var body: Buf[Stmt] = buf()
+    var params: Buf[Param] = buf()
+
+    for item in d.params
+        params.push(item)
+
+    body.push(stmt(v.span, ExprStmt(v)))
+    f.params = params
+    f.ret_type = d.ret_type
+    f.body = body
+    f.vis = File
+    f.marks.forgoes.push("alloc")
+    f.at = v.span
+    f
+end lifted_value
+
+// -- which build holds one -------------------------------------------------------------------------
+
+// Whether the program being built holds an export answering out of memory, which is what the standard
+// module it links must be built for: every body in it unwinds, since any of them may be reached
+// (`std_artifact.sysl`). Settled as the program's files are read, before the module is asked for.
+private var oom_std_wanted: bool = false
+
+// Whether the standard module being built now is that one.
+private var oom_std_building: bool = false
+
+want_oom_std(on: bool)
+    oom_std_wanted = on
+end want_oom_std
+
+// What the choice adds to the standard module's key: nothing for the default.
+oom_std_key() -> string = if oom_std_wanted then "-oom" else ""
+
+begin_oom_std() -> bool
+    val was = oom_std_building
+
+    oom_std_building = oom_std_wanted
+    was
+end begin_oom_std
+
+end_oom_std(was: bool)
+    oom_std_building = was
+end end_oom_std
+
+// -- which bodies unwind ---------------------------------------------------------------------------
+
+// The prefix an opted export's key is filed under in `Emit.oom_scope`, beside the keys and symbols of
+// what it reaches.
+private const OomExportMark: string = "\u{1}oom-export "
+
+// **What an opted export can reach**: every function a call, an address, a dispatch or an erased
+// table can arrive at from one, and every destructor, which a release anywhere may run. A body
+// outside the set never runs inside a boundary -- the count is hidden across a call to C, so a
+// callback C makes starts outside one -- and is lowered as it always was.
+note_oom_scope(e: *Emit, p: TProgram)
+    if oom_std_building
+        e.oom_whole = true
+
+        for f in p.funcs
+            e.oom_scope.add(f.name)
+            e.oom_scope.add(symbol_of(e, f.name))
+
+        return
+    end if
+
+    var names: Set[string] = set()
+
+    for f in p.funcs
+        names.add(f.name)
+
+    val root = no_refs()
+    var any = false
+
+    for f in p.funcs
+        if f.exported.is_some() && names.has(oom_value_name(f.name))
+            root.call(f.name)
+            e.oom_scope.add(OomExportMark + f.name)
+            any = true
+        end if
+
+    if !any then return
+
+    oom_std_wanted = true
+
+    for d in p.destructors
+        root.call(d.1)
+
+    val r = reaches_over(p.funcs, p.vtables, buf())
+
+    for name in reached_names(r, root)
+        // An async body is a coroutine, whose way out is its task's: a refusal in one traps.
+        if !async_named(p, name)
+            e.oom_scope.add(name)
+            e.oom_scope.add(symbol_of(e, name))
+        end if
+end note_oom_scope
+
+private async_named(p: TProgram, name: string) -> bool
+    for f in p.funcs
+        if f.name == name then return f.marks.is_async()
+
+    false
+end async_named
+
+// Whether the body of `name` unwinds a refusal rather than trapping.
+oom_in_scope(e: *Emit, name: string) -> bool = !e.oom_scope.is_empty() && e.oom_scope.has(name)
+
+// Whether this module holds code that unwinds at all, which is what its runtime helpers ask.
+oom_unwinds(e: *Emit) -> bool = !e.oom_scope.is_empty()
+
+// Whether `key` is an export answering out of memory.
+oom_opted(e: *Emit, key: string) -> bool = e.oom_scope.has(OomExportMark + key)
+
+// -- the state word ----------------------------------------------------------------------------------
+
+const OomStateSymbol: string = "sysl_oom_state"
+
+// The word as this module declares it: thread-local where the target has threads to tell apart, as
+// the library's C defines it (`library/sysl/sys/oom.c`).
+oom_state_global(e: *Emit) -> Option[IrGlobal]
+    if !e.oom_named then return None
+
+    val g = ir_extern_global(OomStateSymbol, l_i32(), binds_locally(e))
+
+    Some(if os_hosted(e.target.os) then g with { thread_local = true } else g)
+end oom_state_global
+
+// The word's address on this thread.
+private oom_state_addr(e: *Emit) -> Val
+    e.oom_named = true
+
+    if !os_hosted(e.target.os) then return VGlobal(OomStateSymbol)
+
+    request_intrinsic(e, ir_sig(trace_address_intrinsic(), trace_address_type()))
+
+    val r = fresh_reg(e)
+    var args: Buf[IrArg] = buf()
+
+    args.push(ir_arg(LPtr, VGlobal(OomStateSymbol)))
+    emit(e, ir_call(Some(r), LPtr, VGlobal(trace_address_intrinsic()), args))
+    r
+end oom_state_addr
+
+private oom_load(e: *Emit, at: Val) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, l_i32(), at, AccPlain, None))
+    r
+end oom_load
+
+private oom_store(e: *Emit, at: Val, v: Val)
+    emit(e, InStore(l_i32(), v, at, AccPlain, None))
+end oom_store
+
+private oom_bin(e: *Emit, op: BinOp, a: Val, n: int) -> Val
+    val r = fresh_reg(e)
+
+    emit(e, InBin(r, op, l_i32(), a, VInt(from_int(n))))
+    r
+end oom_bin
+
+// -- a refusal, and the way out it takes ---------------------------------------------------------------
+
+// Where an allocation's answer `ok` is false: inside an unwinding body, the refusal is carried out
+// to the nearest boundary when there is one on this thread and traps where there is none; anywhere
+// else it traps, as `trap_unless` always did.
+oom_refusal_unless(e: *Emit, ok: Val, what: string)
+    if !e.oom_here || e.oom_quiet > 0
+        trap_unless(e, ok, what)
+        return
+    end if
+
+    val got_l = fresh_label(e, "oom.got")
+    val refused_l = fresh_label(e, "oom.refused")
+    val out_l = fresh_label(e, "oom.out")
+    val stop_l = fresh_label(e, "oom.stop")
+
+    emit_term(e, InCondBr(ok, got_l, refused_l))
+    emit_label(e, refused_l)
+
+    val at = oom_state_addr(e)
+    val s = oom_load(e, at)
+    val inside = fresh_reg(e)
+
+    emit(e, InIntCmp(inside, IUge, l_i32(), s, VInt(from_int(2))))
+    emit_term(e, InCondBr(inside, out_l, stop_l))
+    emit_label(e, stop_l)
+    oom_trap(e, what)
+    emit_label(e, out_l)
+    oom_store(e, at, oom_bin(e, OpOr, s, 1))
+    oom_leave(e)
+    emit_label(e, got_l)
+end oom_refusal_unless
+
+// A trap with the check's own report, from a block that reaches it unconditionally.
+private oom_trap(e: *Emit, what: string)
+    trap_unless(e, VInt(from_int(0)), what)
+
+    if !e.terminated then emit_term(e, InUnreachable)
+end oom_trap
+
+// **The way out of a body unwinding a refusal**, which is a failing `return`'s: everything deferred
+// runs (an `errdefer` that binds an error excepted -- there is none), everything owned is given back,
+// and the result is the type's zero, which no caller reads -- each tests the bit first. The bit is
+// clear while the deferred statements run, so what they call runs normally; a refusal among them
+// traps (`oom_quiet`).
+private oom_leave(e: *Emit)
+    val at = oom_state_addr(e)
+
+    oom_store(e, at, oom_bin(e, OpAnd, oom_load(e, at), -2))
+
+    e.oom_quiet += 1
+    release_all_as(e, Refused)
+    e.oom_quiet -= 1
+
+    val again = oom_state_addr(e)
+
+    oom_store(e, again, oom_bin(e, OpOr, oom_load(e, again), 1))
+
+    val ty = e.body_func match
+        Some(f) -> f.ret_ty
+        None -> Unit
+
+    if no_value(ty)
+        emit_term(e, InRet(None, None))
+    else if e.layout.indirect(ty)
+        emit(e, InStore(lty(e, ty), VZero, sret_param(), AccPlain, None))
+        emit_term(e, InRet(None, None))
+    else
+        emit_term(e, InRet(Some(lty(e, ty)), Some(zero_of(e, ty))))
+end oom_leave
+
+// **The test after a call that can reach a refusal**: where the bit is set, the callee left early and
+// its answer is no answer, so this body leaves too -- or traps, where it is laying a way out already.
+oom_after_call(e: *Emit)
+    val at = oom_state_addr(e)
+    val bit = oom_bin(e, OpAnd, oom_load(e, at), 1)
+    val set = fresh_reg(e)
+    val out_l = fresh_label(e, "oom.unwind")
+    val on_l = fresh_label(e, "oom.on")
+
+    emit(e, InIntCmp(set, INe, l_i32(), bit, VInt(from_int(0))))
+    emit_term(e, InCondBr(set, out_l, on_l))
+    emit_label(e, out_l)
+
+    if e.oom_quiet > 0 then oom_trap(e, "alloc") else oom_leave(e)
+
+    emit_label(e, on_l)
+end oom_after_call
+
+// Whether a call `emit` is writing is one the body must test after: a direct call to a body that
+// unwinds, or to a runtime helper that allocates. A call through a register is tested where it is
+// made (`gen_sysl_call_into`); a call C receives hides the count instead (`oom_hide`).
+oom_watches(e: *Emit, i: Inst) -> bool
+    if !e.oom_here then return false
+
+    i match
+        InCall(_, _, callee, _, _, _, _, must_tail) ->
+            if must_tail then return false
+
+            callee match
+                VGlobal(sym) -> oom_unwinding_symbol(e, sym)
+                _ -> false
+        _ -> false
+end oom_watches
+
+// The same test after a sysl call through a register -- a method table's slot, a closure's body --
+// which may reach any body that unwinds.
+oom_after_indirect(e: *Emit, callee: Val)
+    if !e.oom_here || e.terminated then return
+
+    callee match
+        VGlobal(_) -> ()
+        _ -> oom_after_call(e)
+end oom_after_indirect
+
+private oom_unwinding_symbol(e: *Emit, sym: string) -> bool
+    if sym.starts_with("sysl.str.") || sym.starts_with("sysl.w.buf.") then return true
+    if e.oom_scope.has(sym) then return true
+
+    // A body's other entries -- its owned body, its `self` form, its +0, frame and place entries --
+    // are the same body.
+    for suffix in [".owned", ".self", "-zero", "-frame", "-place"]
+        if sym.ends_with(suffix) && oom_unwinding_symbol(e, sym[0..<sym.len - suffix.len]) then
+            return true
+
+    false
+end oom_unwinding_symbol
+
+// Around a call C receives -- an `extern`, or a call through a `*extern` pointer -- the count is
+// hidden: a sysl function C calls back from inside it starts outside every boundary, since the C
+// frames between could not be unwound. Answers what to put back. An LLVM intrinsic is no call into C.
+oom_hide(e: *Emit, call: Inst) -> Option[Val]
+    if !e.oom_here || e.terminated then return None
+
+    call match
+        InCall(_, _, VGlobal(sym), _, _, _, _, _) -> if sym.starts_with("llvm.") then return None
+        _ -> ()
+
+    oom_hide_count(e)
+end oom_hide
+
+// The count hidden across a switch to another stack, or a call into C.
+oom_hide_count(e: *Emit) -> Option[Val]
+    if !e.oom_here || e.terminated then return None
+
+    val at = oom_state_addr(e)
+    val s = oom_load(e, at)
+
+    oom_store(e, at, VInt(from_int(0)))
+    Some(s)
+end oom_hide_count
+
+oom_unhide(e: *Emit, saved: Option[Val])
+    saved match
+        Some(s) -> oom_store(e, oom_state_addr(e), s)
+        None -> ()
+end oom_unhide
+
+// -- the thunk -------------------------------------------------------------------------------------------
+
+// An opted export's thunk counts itself in, and answers the count it found.
+oom_enter_export(e: *Emit) -> Val
+    val at = oom_state_addr(e)
+    val s = oom_load(e, at)
+
+    oom_store(e, at, oom_bin(e, OpAdd, s, 2))
+    s
+end oom_enter_export
+
+// After the definition returns: where the bit is set, the count goes back to what it was on the way
+// in and the thunk answers the export's `@out_of_memory` value; where not, the count goes back and the
+// definition's answer stands. Answers whether the refused branch is open, which the caller fills.
+oom_leave_export(e: *Emit, was: Val, refused_l: string, fine_l: string)
+    val at = oom_state_addr(e)
+    val bit = oom_bin(e, OpAnd, oom_load(e, at), 1)
+    val set = fresh_reg(e)
+
+    oom_store(e, at, was)
+    emit(e, InIntCmp(set, INe, l_i32(), bit, VInt(from_int(0))))
+    emit_term(e, InCondBr(set, refused_l, fine_l))
+end oom_leave_export
+
+// -- the runtime's own allocations -----------------------------------------------------------------------
+
+// What a runtime helper's refused block holds in place of the trap, in a module whose bodies unwind:
+// the refusal carried out (`sysl.oom.refuse`, which traps where no boundary is open), then a return of
+// `ret`, the helper's zero. Nothing where the module's bodies do not unwind.
+oom_refused_text(e: *Emit, ret: string) -> Option[string]
+    if !oom_unwinds(e) then return None
+
+    request_text(e, "sysl.oom.refuse", oom_refuse_text(e))
+    Some(s"  call void @sysl.oom.refuse()\n  ret $ret\n")
+end oom_refused_text
+
+private oom_refuse_text(e: *Emit) -> string
+    e.oom_named = true
+    e.traps = true
+
+    val trap = trap_symbol(e)
+    val addr = if os_hosted(e.target.os) then
+        request_intrinsic(e, ir_sig(trace_address_intrinsic(), trace_address_type()))
+        s"  %a = call ptr @${trace_address_intrinsic()}(ptr @$OomStateSymbol)\n"
+    else s"  %a = getelementptr i8, ptr @$OomStateSymbol, i32 0\n"
+
+    s"""
+    define private void @sysl.oom.refuse() cold noinline {
+    entry:
+    $addr  %s = load i32, ptr %a
+      %in = icmp uge i32 %s, 2
+      br i1 %in, label %mark, label %stop
+    stop:
+      call void @$trap()
+      unreachable
+    mark:
+      %t = or i32 %s, 1
+      store i32 %t, ptr %a
+      ret void
+    }
+    """
+end oom_refuse_text
