@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`get_xattr`](#get_xattr) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_get_xattr`](#link_get_xattr) [`link_list_xattrs`](#link_list_xattrs) [`link_metadata`](#link_metadata) [`link_remove_xattr`](#link_remove_xattr) [`link_set_xattr`](#link_set_xattr) [`list_xattrs`](#list_xattrs) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`remove_xattr`](#remove_xattr) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`set_xattr`](#set_xattr) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Constants
 
@@ -277,6 +277,23 @@ The chain is over `errno` values rather than over a name per platform because th
 that have been stable since V7 -- `ENOENT` has been 2 on every Unix anyone has shipped -- and the
 one that is not is `not_empty` above, which is why it is a call rather than a literal here.
 
+### `get_xattr`
+
+```sysl
+get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+```
+
+The value of the extended attribute `name` of what `path` names, following a symbolic link.
+
+**An attribute that is not there is `NoAttribute`**, whatever the platform calls it, so a caller
+can tell "the file has no such attribute" from "there is no such file" (`NotFound`). A filesystem
+that keeps no attributes at all answers its own `ENOTSUP` as an `Other`: 45 on macOS, 95 on Linux.
+A name holding a zero byte is refused with `Other(22)`, `EINVAL`, before anything is asked, since
+the platform would read it as the shorter name before the zero.
+
+The value is the platform's copy, and it is asked for twice: once for its size and once for the
+bytes. A value that grew between the two asks is asked for again rather than handed back cut short.
+
 ### `hard_link`
 
 ```sysl
@@ -335,6 +352,23 @@ Whether the path itself is a symbolic link. It follows nothing, so a link to a d
 `true` here and `is_dir` answers `true` about the same path -- the two are asking different
 questions and both answers are right.
 
+### `link_get_xattr`
+
+```sysl
+link_get_xattr(path: string, name: string) -> Result[[]u8, IoError]
+```
+
+`get_xattr` about a symbolic link itself rather than what it points at. On a path that is not a
+link, the two are the same question.
+
+### `link_list_xattrs`
+
+```sysl
+link_list_xattrs(path: string) -> Result[Buf[string], IoError]
+```
+
+`list_xattrs` about a symbolic link itself.
+
 ### `link_metadata`
 
 ```sysl
@@ -346,6 +380,38 @@ The same, about the path **itself** -- so a symbolic link is described rather th
 This is the only call in the module that can report a link at all. `is_dir`, `exists` and
 `metadata` all follow one silently, which is the right default and was until now the only
 behaviour available.
+
+### `link_remove_xattr`
+
+```sysl
+link_remove_xattr(path: string, name: string) -> Result[unit, IoError]
+```
+
+`remove_xattr` on a symbolic link itself.
+
+### `link_set_xattr`
+
+```sysl
+link_set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+```
+
+`set_xattr` on a symbolic link itself, leaving what it points at untouched. macOS keeps attributes
+on a link; Linux refuses a `user.` attribute there with `NotPermitted`.
+
+### `list_xattrs`
+
+```sysl
+list_xattrs(path: string) -> Result[Buf[string], IoError]
+```
+
+The names of every extended attribute of what `path` names, following a symbolic link, in the
+order the filesystem keeps them -- which is not sorted and is not promised to be stable. A file with
+none answers an empty list.
+
+**The list holds what this process may see**, not everything there is: Linux leaves out a
+`trusted.` attribute for a process without the privilege to read it, and macOS may hold names the
+system itself set (`com.apple.provenance`). A name that is not UTF-8 makes the whole call answer
+`InvalidUtf8` at the offset within that name, as `entries` does for a directory.
 
 ### `make_dir`
 
@@ -637,6 +703,16 @@ Removes a file, and refuses a directory rather than removing it: `unlink` is the
 that line, where C's own `remove` quietly does either. Two names for two intentions is what lets
 a program that meant one of them find out it had the other.
 
+### `remove_xattr`
+
+```sysl
+remove_xattr(path: string, name: string) -> Result[unit, IoError]
+```
+
+The extended attribute `name` of what `path` names removed, following a symbolic link. One that is
+not there is `NoAttribute` -- removing is not idempotent here, because the platform does not make
+it so and a caller that wants it to be matches the case away.
+
 ### `rename`
 
 ```sysl
@@ -729,6 +805,20 @@ set_permissions(path: string, mode: u32) -> Result[unit, IoError]
 The permission bits set to exactly what is given. It is not a mask to add: `0o644` means the file
 ends up `0o644` whatever it was, which is `chmod(2)`'s own meaning and the one a program that read
 `permissions()` first is expecting.
+
+### `set_xattr`
+
+```sysl
+set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError]
+```
+
+The extended attribute `name` of what `path` names set to `value`, following a symbolic link. The
+attribute is made where it is missing and its value replaced where it is not; an empty value is a
+value, and the attribute is there afterwards holding nothing.
+
+Linux refuses a name outside a namespace it knows (`Other(95)`, `EOPNOTSUPP`), and refuses a `user.`
+attribute on anything but a regular file or a directory (`NotPermitted`). A name holding a zero byte
+is `Other(22)`, as for `get_xattr`.
 
 ### `size_of`
 
@@ -1007,6 +1097,7 @@ enum IoError
     NotOpen
     NotPermitted
     InvalidUtf8(offset: usize)
+    NoAttribute
     Other(code: int)
 ```
 
