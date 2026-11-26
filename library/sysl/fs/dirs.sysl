@@ -166,12 +166,15 @@ end temp_root
  * a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
  *
  * A root that is not there answers `NotFound`, and one this process may not write in
- * `PermissionDenied`.
+ * `PermissionDenied`. **A prefix holding a `/` or a NUL is refused** with `Other(22)`, `EINVAL`,
+ * before anything is made: it would name something other than one entry of the root.
  */
 temp_dir(prefix: string = "") -> Result[string, IoError] = make_temp_dir(prefix)
 
 /** `temp_dir` under the name it had first; the two are one call. */
 make_temp_dir(prefix: string) -> Result[string, IoError]
+    if !one_name(prefix) then return Err(Other(invalid_argument))
+
     var into: []u8 = [0; path_bytes]
     var n: usize = 0
     val code = fsys.temp_dir(as_ptr(prefix.bytes), prefix.bytes.len, as_mut_ptr(into), into.len, &n)
@@ -202,9 +205,11 @@ end make_temp_dir
  * so it runs after the `File` is closed or dropped.
  *
  * A root that is not there answers `NotFound`, and one this process may not write in
- * `PermissionDenied`.
+ * `PermissionDenied`. A prefix holding a `/` or a NUL is refused as `temp_dir` refuses it.
  */
 temp_file(prefix: string = "") -> Result[(File, string), IoError]
+    if !one_name(prefix) then return Err(Other(invalid_argument))
+
     var into: []u8 = [0; path_bytes]
     var n: usize = 0
     var fd = 0
@@ -223,6 +228,15 @@ temp_file(prefix: string = "") -> Result[(File, string), IoError]
             _ = fsys.unlink(as_ptr(into), n)
             Err(e)
 end temp_file
+
+/** `EINVAL`, which is 22 on every platform this library is hosted on. */
+private const invalid_argument: int = 22
+
+/** Whether a prefix can only be the start of one name in the root. A `/` would make it a path that
+ * reaches into some other directory, below the root or, with `..`, out of it; a NUL would end the
+ * name early where C reads it, so a different name from the one asked for would be made.
+ */
+private one_name(prefix: string) -> bool = !prefix.has_byte(u8('/')) && !prefix.has_byte(0)
 
 /** A path the platform wrote, read as text. */
 private answered_path(b: []u8) -> Result[string, IoError] =

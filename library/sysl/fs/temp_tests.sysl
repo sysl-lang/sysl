@@ -171,6 +171,38 @@ tmf_many_in_a_row()
     for p in made
         assert(!exists(p), p)
 
+@test("tmf: a prefix holding a slash or a NUL is refused by all three calls with EINVAL")
+tmf_prefix_one_name()
+    for prefix in ["a/b-", "/", "x/", "../sysl-tmf-up-", "a\0b"]
+        assert_eq(temp_dir(prefix).err(), Some(Other(22)), prefix)
+        assert_eq(make_temp_dir(prefix).err(), Some(Other(22)), prefix)
+        assert_eq(temp_file(prefix).err(), Some(Other(22)), prefix)
+
+@test("tmf: a slash cannot reach into a directory that exists, below the root or above it")
+tmf_prefix_reaches_nowhere()
+    val d = temp_dir("sysl-tmf-inside-").unwrap()
+    val inside = tmf_name(d) + "/x-"
+
+    assert_eq(temp_dir(inside).err(), Some(Other(22)))
+    assert_eq(temp_file(inside).err(), Some(Other(22)))
+    assert_eq(entries(d).unwrap().len(), 0)
+    remove_dir_all(d).unwrap()
+
+    val above = parent(temp_root()).unwrap_or("/")
+
+    assert(temp_file("../sysl-tmf-escape-").is_err())
+
+    for name in entries(above).unwrap_or(buf())
+        assert(!name.starts_with("sysl-tmf-escape-"), name)
+
+@test("tmf: a prefix of only dots names one entry like any other")
+tmf_prefix_dots()
+    val (_, p) = temp_file("..").unwrap()
+
+    assert_eq(parent(p).unwrap(), temp_root())
+    assert(tmf_name(p).starts_with(".."), p)
+    remove_file(p).unwrap()
+
 @test("tmf: a name the system cannot hold is refused at every length, and nothing is made")
 tmf_name_too_long()
     // Past one name's limit, past the template's buffer, and past the hook's own storage.
