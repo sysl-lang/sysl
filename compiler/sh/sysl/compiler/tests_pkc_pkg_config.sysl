@@ -339,3 +339,95 @@ pkc_manifold_c_api()
 
     remove_dir_all(root).unwrap_or(())
     assert_eq(said, "2\n")
+
+// -- why a module that pkg-config was asked about is refused ---------------------------------------
+
+// A directory of real `.pc` files and the machine's own `pkg-config` pointed at it alone, so a case
+// is the same wherever it runs. The answer is the directory; `pkc_drop_pcs` removes it.
+private pkc_pcs(files: []const string) -> string
+    val dir = pkc_tree("sysl-pkc-pcs", files)
+
+    pkc_set_env("PKG_CONFIG_LIBDIR", dir)
+    pkc_set_env("PKG_CONFIG_PATH", "")
+    dir
+
+private pkc_drop_pcs(dir: string)
+    pkc_unset_env("PKG_CONFIG_LIBDIR")
+    pkc_unset_env("PKG_CONFIG_PATH")
+    remove_dir_all(dir).unwrap_or(())
+
+private pkc_pc(name: string, requires: string) -> string =
+    s"Name: $name\nDescription: $name\nVersion: 1.0\n${if requires == "" then "" else s"Requires: $requires\n"}Libs: -l$name\n"
+
+// The refusal's reason for one module, with `.pc` files of the test's own and the real tool.
+private pkc_reason(pc: string, files: []const string) -> string
+    val dir = pkc_pcs(files)
+    val got = pkg_config_query(pc)
+
+    pkc_drop_pcs(dir)
+
+    got match
+        Err(why) -> why
+        Ok(_) -> "answered"
+
+@test("a module no .pc names keeps the sentence it always had")
+pkc_reason_absent()
+    if !pkg_config_available() then return
+
+    assert_eq(pkc_reason("sdl3-mixer", ["present.pc", pkc_pc("present", "")]), "'pkg-config' knows no 'sdl3-mixer'")
+
+@test("a .pc whose Requires names an absent package is found, and the requirement is the reason")
+pkc_reason_requirement_absent()
+    if !pkg_config_available() then return
+
+    assert_eq(pkc_reason("sdl3-mixer", ["sdl3-mixer.pc", pkc_pc("sdl3-mixer", "readline")]),
+              "'pkg-config' found 'sdl3-mixer', but its requirement 'readline' is not found")
+
+// The real case: the requirement that is missing is two links down, and the sentence names the link
+// that asked for it.
+@test("and one two links down names the package that required it")
+pkc_reason_requirement_transitive()
+    if !pkg_config_available() then return
+
+    assert_eq(pkc_reason("sdl3-mixer", ["sdl3-mixer.pc", pkc_pc("sdl3-mixer", "fluidsynth"),
+                                        "fluidsynth.pc", pkc_pc("fluidsynth", "readline")]),
+              "'pkg-config' found 'sdl3-mixer', but its requirement 'readline' (required by 'fluidsynth') is not found")
+
+@test("a version constraint that fails quotes pkg-config's own words")
+pkc_reason_version_too_old()
+    if !pkg_config_available() then return
+
+    assert_eq(pkc_reason("app", ["app.pc", pkc_pc("app", "dep >= 5"), "dep.pc", pkc_pc("dep", "")]),
+              "'pkg-config' found 'app', but cannot use it: Package 'dep' has version '1.0', " +
+              "required version is '>= 5'")
+
+// pkg-config does not tell a file it cannot read from a file that is not there, so the sentence is
+// the one for an absent module; this pins that it is not a worse one.
+@test("a .pc that does not parse is reported as pkg-config reports it")
+pkc_reason_unparseable()
+    if !pkg_config_available() then return
+
+    assert_eq(pkc_reason("junk", ["junk.pc", "this is not a pc file\n@@@\nName\n"]),
+              "'pkg-config' knows no 'junk'")
+
+// A requirement that is present and satisfied is no reason at all.
+@test("a .pc whose requirement is there is answered")
+pkc_reason_requirement_present()
+    if !pkg_config_available() then return
+
+    assert_eq(pkc_reason("app", ["app.pc", pkc_pc("app", "dep"), "dep.pc", pkc_pc("dep", "")]), "answered")
+
+@test("the build's refusal carries the reason and the same two ways to answer it")
+pkc_reason_reaches_the_refusal()
+    if !pkc_ready() then return
+    if !pkg_config_available() then return
+
+    val dir = pkc_pcs(["sdl3-mixer.pc", pkc_pc("sdl3-mixer", "readline")])
+    val root = pkc_project("\"sdl3-mixer\" = \"SDL3_mixer\"")
+    val said = pkc_ran(root)
+
+    pkc_drop_pcs(dir)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "build failed: sysl: error: this project needs the 'sdl3-mixer' library and 'pkg-config' " +
+              "found 'sdl3-mixer', but its requirement 'readline' is not found — SDL3_mixer. Install it, or " +
+              "say where it is with '--include-path sdl3-mixer=<dir>' and '--link-path <dir>'")
