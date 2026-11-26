@@ -1,0 +1,551 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.text.{cstring, Search}
+
+// **A factory of a factory is a factory** (`stack_box.sysl`'s `stack_boxes`, `emit_box.sysl`'s
+// `gen_frame_call`; `reference/memory.md § A box nothing keeps is laid in the frame`): a body that
+// builds no box of its own but answers the box another factory's call answers it, and keeps it nowhere
+// else, gets a frame entry that hands its caller's slot on to that call's frame entry -- `vector_with`
+// answering `vector_of_size(1)`'s box.
+//
+// The axes: how the outer answers the inner's box (as its value, `fnf_direct`; through a local it
+// writes first, `fnf_through_local`), how deep the chain is (`fnf_three_deep`), a generic chain
+// instantiated twice (`fnf_generic`), a method (`fnf_method`), a loop calling it (`fnf_in_a_loop`), a
+// two-module program built as four units (`fnf_two_modules`); and every way the box gets out, each on
+// the heap: the outer stores it before answering (`fnf_outer_stores`), the caller keeps the answer
+// (`fnf_kept`), a holder outliving the loop turn the inner is called in (`fnf_loop_reassigned`). Then the
+// shapes that must only stay correct: one way out answering the fresh box and another a kept one
+// (`fnf_mixed`), recursion through the chain (`fnf_recursive`) and mutual recursion (`fnf_mutual`), a
+// chain reached through a trait object (`fnf_through_table`), and an inner whose parameter crosses by
+// address, which has no frame entry, so neither has its outer (`fnf_lent_param`).
+//
+// Each cell is run on the counted heap with `SYSL_COUNT_BYTES`: a frame cell allocates NO bytes, a heap
+// cell some, and every cell prints what it should and gives back everything it took. The frame cells
+// and the correctness cells run again under AddressSanitizer.
+//
+// Skipped cells, and why: a factory from a precompiled `.syslib` (std's included) is no factory at all
+// (`factory_shaped` refuses every precompiled body), so a chain over one is the unchanged heap path; an
+// async body or one with a tail call is never a factory (`frame_shaped`), as `tests_fbx_frame_box.sysl`
+// pins; `--explain-escapes` says nothing of `&T` boxes yet, factory calls included.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct FnfRun
+    out: string
+    err: string
+    bytes: long
+end FnfRun
+
+// The program (a `main.sysl`, and `made/made.sysl` where `second` is not empty, built as four units)
+// built on the counted heap and run with `SYSL_COUNT_BYTES`, or with `flags` handed to clang.
+private fnf_run(text: string, second: string, flags: string) -> FnfRun
+    val root = make_temp_dir("sysl-fnf").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    if second != ""
+        make_dir_all(s"$root/made").unwrap()
+        write_text(s"$root/made/made.sysl", forms_imported(second)).unwrap()
+    end if
+
+    val exe = s"$root/built"
+
+    if flags != "" then fnf_set("SYSL_EXTRA_CFLAGS", flags)
+    if second != "" then fnf_set("SYSL_CODEGEN_UNITS", "4")
+
+    force_alloc_counting(flags == "")
+
+    val made = build_native_program(if second != "" then root else s"$root/main.sysl", None, None,
+                                    DefaultOptimization, Some(exe))
+
+    force_alloc_counting(false)
+
+    if flags != "" then fnf_unset("SYSL_EXTRA_CFLAGS")
+    if second != "" then fnf_unset("SYSL_CODEGEN_UNITS")
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return FnfRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> FnfRun("could not be started", "", -1)
+        Ok(o) -> FnfRun(o.text, o.err.unwrap_or(""), alloc_bytes_reported(o.err.unwrap_or("")))
+end fnf_run
+
+private fnf_set(name: string, value: string)
+    val n = cstring(name)
+    val v = cstring(value)
+
+    fnf_c_setenv(n.ptr, v.ptr, 1)
+end fnf_set
+
+private fnf_unset(name: string)
+    val n = cstring(name)
+
+    fnf_c_unsetenv(n.ptr)
+end fnf_unset
+
+private extern "setenv" fnf_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" fnf_c_unsetenv(name: *u8) -> int
+
+// The program printed `want` and gave back everything it took; it allocated nothing where its box is
+// `framed`, something where it is not.
+private fnf_check(name: string, text: string, want: string, framed: bool)
+    val got = fnf_run(text, "", "")
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+
+    if framed then assert(got.bytes == 0, s"$name allocated ${got.bytes} bytes:\n${got.err}")
+    else assert(got.bytes > 0, s"$name allocated nothing, so its box was laid in the frame")
+end fnf_check
+
+// The program printed `want` and gave back everything it took, whatever it allocated.
+private fnf_sound(text: string, want: string)
+    val got = fnf_run(text, "", "")
+
+    assert_eq(got.out, want)
+    assert_eq(alloc_count_reported(got.err), 0)
+end fnf_sound
+
+// The LLVM text of a program, or its report.
+private fnf_ir(text: string) -> string
+    val root = make_temp_dir("sysl-fnf").unwrap()
+
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val out = emit_llvm_text(s"$root/main.sysl", None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then made.text else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end fnf_ir
+
+private fnf_lines_with(ir: string, part: string) -> int
+    var n = 0
+
+    for line in lines_of(ir).view()
+        if line.contains(part) then n += 1
+
+    n
+end fnf_lines_with
+
+// -- the cells that stay in the frame ---------------------------------------------------------------
+
+private const fnf_direct: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    counter_at(start: int) -> &Counter = counter(start + 1)
+
+    main()
+        val c = counter_at(5)
+
+        c.n += 2
+        print(c.n)
+    """
+
+private const fnf_through_local: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    counter_plus(start: int) -> &Counter
+        val c = counter(start)
+
+        c.n += 1
+        c
+
+    main()
+        val c = counter_plus(5)
+
+        c.n += 2
+        print(c.n)
+    """
+
+private const fnf_three_deep: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    twice(start: int) -> &Counter
+        val c = counter(start)
+
+        c.n *= 2
+        c
+
+    twice_plus(start: int) -> &Counter
+        val c = twice(start)
+
+        c.n += 1
+        c
+
+    main()
+        val c = twice_plus(5)
+
+        print(c.n)
+    """
+
+private const fnf_generic: string = raw"""
+    struct Cell[T]
+        v: T
+        k: int
+
+    cell[T](v: T) -> &Cell[T] = Cell(v, 0)
+
+    counted[T](v: T) -> &Cell[T]
+        val c = cell(v)
+
+        c.k = 1
+        c
+
+    main()
+        val a = counted(3)
+        val b = counted("hi")
+
+        print(a.v, a.k, b.v, b.k)
+    """
+
+private const fnf_method: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    struct Maker
+        base: int
+
+    impl Maker
+        make(self) -> &Counter
+            val c = counter(self.base)
+
+            c.n += 10
+            c
+
+    main()
+        val m = Maker(2)
+        val c = m.make()
+
+        print(c.n)
+    """
+
+private const fnf_in_a_loop: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    counter_plus(start: int) -> &Counter
+        val c = counter(start)
+
+        c.n += 1
+        c
+
+    main()
+        var t = 0
+
+        for i in 0..<10
+            val c = counter_plus(i)
+
+            t += c.n
+
+        print(t)
+    """
+
+@test("a factory of a factory lays its box in the caller's frame, through every chain")
+fnf_chains_allocate_nothing()
+    if xvr_no_library() then return
+
+    fnf_check("fnf_direct", fnf_direct, "8\n", true)
+    fnf_check("fnf_through_local", fnf_through_local, "8\n", true)
+    fnf_check("fnf_three_deep", fnf_three_deep, "11\n", true)
+    fnf_check("fnf_generic", fnf_generic, "3 1 hi 1\n", true)
+    fnf_check("fnf_method", fnf_method, "12\n", true)
+    fnf_check("fnf_in_a_loop", fnf_in_a_loop, "55\n", true)
+end fnf_chains_allocate_nothing
+
+private const fnf_two_modules_main: string = raw"""
+    import made.{counter_plus}
+
+    main()
+        val c = counter_plus(5)
+
+        c.n += 2
+        print(c.n)
+    """
+
+private const fnf_two_modules_made: string = raw"""
+    module made
+
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    counter_plus(start: int) -> &Counter
+        val c = counter(start)
+
+        c.n += 1
+        c
+    """
+
+@test("a chain across two modules, built as four units, allocates nothing")
+fnf_two_modules_allocate_nothing()
+    if xvr_no_library() then return
+
+    val got = fnf_run(fnf_two_modules_main, fnf_two_modules_made, "")
+
+    assert_eq(got.out, "8\n")
+    assert_eq(alloc_count_reported(got.err), 0)
+    assert(got.bytes == 0, s"fnf_two_modules allocated ${got.bytes} bytes:\n${got.err}")
+end fnf_two_modules_allocate_nothing
+
+@test("the outer factory's frame entry hands its slot to the inner one's")
+fnf_frame_entry_hands_its_slot_on()
+    if xvr_no_library() then return
+
+    val made = fnf_ir(fnf_through_local)
+
+    // `counter_plus-frame` calls `counter-frame` with the slot it was handed; `main` calls
+    // `counter_plus-frame` with a slot of its own.
+    assert_eq(fnf_lines_with(made, "-frame(ptr %frame$slot"), 3)
+    assert_eq(fnf_lines_with(made, "-frame(ptr %t"), 1)
+end fnf_frame_entry_hands_its_slot_on
+
+// -- the ways out, each on the heap ------------------------------------------------------------------
+
+private const fnf_outer_stores: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    var kept: Option[&Counter] = None
+
+    counter_kept(start: int) -> &Counter
+        val c = counter(start)
+
+        kept = Some(c)
+        c
+
+    main()
+        val c = counter_kept(5)
+
+        c.n += 1
+        print(kept.unwrap().n)
+        kept = None
+    """
+
+private const fnf_kept: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    counter_at(start: int) -> &Counter = counter(start + 1)
+
+    var kept: Option[&Counter] = None
+
+    main()
+        val c = counter_at(5)
+
+        kept = Some(c)
+        print(kept.unwrap().n)
+        kept = None
+    """
+
+private const fnf_loop_reassigned: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    last_of(n: int) -> &Counter
+        var last = counter(0)
+
+        for i in 0..<n
+            last = counter(i)
+
+        last
+
+    main()
+        print(last_of(4).n)
+    """
+
+@test("a chain whose box gets out keeps it on the heap, and gives back all it took")
+fnf_ways_out_stay_on_the_heap()
+    if xvr_no_library() then return
+
+    fnf_check("fnf_outer_stores", fnf_outer_stores, "6\n", false)
+    fnf_check("fnf_kept", fnf_kept, "6\n", false)
+    fnf_check("fnf_loop_reassigned", fnf_loop_reassigned, "3\n", false)
+end fnf_ways_out_stay_on_the_heap
+
+// -- the shapes that must only stay correct --------------------------------------------------------------
+
+private const fnf_mixed: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    var spare: Option[&Counter] = None
+
+    fresh_or_spare(start: int) -> &Counter
+        if start < 0 then return spare.unwrap()
+
+        val c = counter(start)
+
+        c.n += 1
+        c
+
+    main()
+        spare = Some(counter(100))
+
+        val a = fresh_or_spare(5)
+        val b = fresh_or_spare(-1)
+
+        a.n += 1
+        b.n += 1
+        print(a.n, b.n, spare.unwrap().n)
+        spare = None
+    """
+
+private const fnf_recursive: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    down(n: int) -> &Counter
+        if n == 0 then return counter(7)
+
+        val c = down(n - 1)
+
+        c.n += 1
+        c
+
+    main()
+        print(down(0).n, down(3).n)
+    """
+
+private const fnf_mutual: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    ping(n: int) -> &Counter
+        if n == 0 then return counter(1)
+
+        val c = pong(n - 1)
+
+        c.n *= 2
+        c
+
+    pong(n: int) -> &Counter
+        val c = ping(n)
+
+        c.n += 1
+        c
+
+    main()
+        print(ping(0).n, pong(0).n, ping(2).n, pong(3).n)
+    """
+
+private const fnf_through_table: string = raw"""
+    struct Counter
+        n: int
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    trait Maker
+        make(&self) -> &Counter
+
+    struct Plus
+        k: int
+
+    impl Maker for Plus
+        make(&self) -> &Counter
+            val c = counter(self.k)
+
+            c.n += 1
+            c
+
+    main()
+        val m: &Maker = Plus(4)
+        val c = m.make()
+
+        print(c.n)
+    """
+
+private const fnf_lent_param: string = raw"""
+    struct Counter
+        n: int
+
+    struct Big
+        xs: [32]int
+
+    counter_from(big: Big) -> &Counter
+        var t = 0
+
+        for x in big.xs
+            t += x
+
+        Counter(t)
+
+    counter_plus(k: int) -> &Counter
+        var big = Big([0; 32])
+
+        big.xs[3] = k
+
+        val c = counter_from(big)
+
+        c.n += 1
+        c
+
+    main()
+        print(counter_plus(4).n)
+    """
+
+@test("a chain with a way out answering another box, recursion, a table or a lent parameter prints the same")
+fnf_other_shapes_stay_correct()
+    if xvr_no_library() then return
+
+    fnf_sound(fnf_mixed, "7 101 101\n")
+    fnf_sound(fnf_recursive, "7 10\n")
+    fnf_sound(fnf_mutual, "1 2 10 23\n")
+    fnf_sound(fnf_through_table, "5\n")
+    fnf_sound(fnf_lent_param, "5\n")
+end fnf_other_shapes_stay_correct
+
+@test("and under AddressSanitizer: instrumented, and nothing read outside a live frame")
+fnf_chains_run_clean_under_asan()
+    if !enm_ready() then return
+
+    for item in [(fnf_direct, "8\n"), (fnf_through_local, "8\n"), (fnf_three_deep, "11\n"),
+                 (fnf_generic, "3 1 hi 1\n"), (fnf_method, "12\n"), (fnf_in_a_loop, "55\n"),
+                 (fnf_mixed, "7 101 101\n"), (fnf_recursive, "7 10\n"), (fnf_mutual, "1 2 10 23\n"),
+                 (fnf_through_table, "5\n"), (fnf_lent_param, "5\n"), (fnf_loop_reassigned, "3\n")]
+        val got = fnf_run(item.0, "", "-fsanitize=address -g")
+
+        assert_eq(got.out, item.1)
+        assert_eq(got.err, "")
+    end for
+end fnf_chains_run_clean_under_asan
