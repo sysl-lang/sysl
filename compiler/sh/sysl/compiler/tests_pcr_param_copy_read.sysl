@@ -1316,8 +1316,26 @@ pcr_overwritten_through_a_ref()
             print(*held)
         """, pcr_lets_out("f1"))
 
-// TODO: un-ignore when what a body answers is gathered along its ways too (`answered`).
-@test("an answer made of a copy overwritten before it is answered", ignore: "what a body answers is gathered flow-insensitively")
+// -- what a body answers, along its ways ------------------------------------------------------------
+//
+// What a body answers (`keeps.sysl`'s `answered`) is asked along the same ways: each `return`'s value
+// and each leaf of the body's result, as the walk reaches it. The axes: the shape of the way (straight,
+// `if` with and without `else`, a `match` arm, a loop that may not run, a put-back at a loop's bottom,
+// an early `return` before the overwrite, a `defer`), what puts the copy back (a store of the parameter,
+// a put-back inside the answering piece itself), the copy (a copy of a copy before and after the
+// overwrite, a struct overwritten whole or by one field), a closure built before and after the
+// overwrite, and a walk of what is read through the parameter. Still counted, on purpose: an answer
+// the walk does not reach as a piece of its own -- a loop's `break` value -- is asked with no copy
+// overwritten.
+//
+// Skipped cells: a method and a generic body take the same `answered` as a function (their handing-over
+// cells above cover the way there); a `ref`, a pointer to the copy and a nested function make it no copy
+// at all (`copy_locals`), the same for an answer as for a hand-over.
+
+private pcr_answer_kept(call: string) -> string =
+    s"'$call' holds the address of a local of 'other', and it is stored in 'held', which outlives 'other'"
+
+@test("an answer made of a copy overwritten before it is answered")
 pcr_answers_an_overwritten_copy()
     pcr_prints(raw"""
         pick(a: *int) -> *int
@@ -1334,6 +1352,478 @@ pcr_answers_an_overwritten_copy()
             other()
             print(*held)
         """, "5\n7\n")
+
+@test("an answer made of a copy returned after it is overwritten")
+pcr_returns_an_overwritten_copy()
+    pcr_prints(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            b = &spare
+            return b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("an answer made of a copy overwritten in both arms of an 'if'")
+pcr_answers_overwritten_both_arms()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        pick(a: *int) -> *int
+            var b = a
+            if *a > 3 then b = &spare else b = &other_spare
+            b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("an answer made of a copy overwritten in one arm of an 'if' without an 'else'")
+pcr_answers_overwritten_one_arm()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            if *a > 30 then b = &spare
+            b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+@test("an answer in each arm of a 'match', one arm answering the copy before overwriting it")
+pcr_answers_in_match_arms()
+    pcr_refused(raw"""
+        pick(a: *int, k: int) -> *int
+            var b = a
+            k match
+                0 ->
+                    b = &spare
+                    b
+                _ -> b
+
+        other()
+            var y = 5
+            held = pick(&y, 1)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y, 1)"))
+
+@test("an answer in each arm of a 'match', every arm overwriting the copy first")
+pcr_answers_in_match_arms_all_overwritten()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        pick(a: *int, k: int) -> *int
+            var b = a
+            k match
+                0 ->
+                    b = &spare
+                    b
+                _ ->
+                    b = &other_spare
+                    b
+
+        other()
+            var y = 5
+            held = pick(&y, 1)
+
+        main()
+            other()
+            print(*held)
+        """, "9\n")
+
+@test("an early 'return' of the copy before it is overwritten")
+pcr_answers_early_return()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            if *a > 3 then return b
+            b = &spare
+            b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+@test("an answer made of a copy overwritten in a loop body that may not run")
+pcr_answers_overwritten_in_a_loop()
+    pcr_refused(raw"""
+        pick(a: *int, n: int) -> *int
+            var b = a
+            for i in 0..<n
+                b = &spare
+            b
+
+        other()
+            var y = 5
+            held = pick(&y, 0)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y, 0)"))
+
+@test("a 'return' of the copy inside a loop body below its overwrite")
+pcr_returns_in_a_loop_below_the_overwrite()
+    pcr_prints(raw"""
+        pick(a: *int, n: int) -> *int
+            var b = a
+            for i in 0..<n
+                b = &spare
+                if i == 1 then return b
+            &spare
+
+        other()
+            var y = 5
+            held = pick(&y, 3)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a 'return' of the copy at the top of a loop body whose bottom puts it back")
+pcr_returns_in_a_loop_above_the_put_back()
+    pcr_refused(raw"""
+        pick(a: *int, n: int) -> *int
+            var b = a
+            b = &spare
+            for i in 0..<n
+                if i == 1 then return b
+                b = a
+            &spare
+
+        other()
+            var y = 5
+            held = pick(&y, 3)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y, 3)"))
+
+@test("an answer made of a copy put back from the parameter after the overwrite")
+pcr_answers_a_put_back_copy()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            b = &spare
+            b = a
+            b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+@test("an answer whose own piece puts the copy back before answering it")
+pcr_answers_put_back_in_the_answering_piece()
+    pcr_refused(raw"""
+        same(p: *int) -> *int = p
+
+        pick(a: *int, c: bool) -> *int
+            var b = a
+            b = &spare
+            same(c match
+                true ->
+                    b = a
+                    b
+                false -> b)
+
+        other()
+            var y = 5
+            held = pick(&y, true)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y, true)"))
+
+@test("a hand-over whose own piece puts the copy back before handing its address over")
+pcr_hands_over_put_back_in_the_piece()
+    pcr_refused(raw"""
+        key(a: *int, c: bool)
+            var b = a
+            b = &spare
+            f1(c match
+                true ->
+                    b = a
+                    &b
+                false -> &b)
+
+        other()
+            var y = 5
+            key(&y, true)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_lets_out("f1"))
+
+@test("an answer handed through a callee answering it, the copy overwritten first")
+pcr_answers_through_a_callee()
+    pcr_prints(raw"""
+        same(p: *int) -> *int = p
+
+        pick(a: *int) -> *int
+            var b = a
+            b = &spare
+            same(b)
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("an answer made of a copy of the copy, taken before the first is overwritten")
+pcr_answers_a_copy_of_a_copy()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            var c = b
+            b = &spare
+            c
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+@test("an answer made of a copy of an overwritten copy")
+pcr_answers_a_copy_of_an_overwritten_copy()
+    pcr_prints(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            b = &spare
+            var c = b
+            c
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("an answer read out of a struct holding the copy, overwritten whole")
+pcr_answers_struct_overwritten_whole()
+    pcr_prints(raw"""
+        struct H
+            p: *int
+
+        pick(a: *int) -> *int
+            var h = H(a)
+            h = H(&spare)
+            h.p
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("an answer read out of a struct holding the copy, only the field overwritten, is still followed")
+pcr_answers_struct_field_overwritten()
+    pcr_refused(raw"""
+        struct H
+            p: *int
+
+        pick(a: *int) -> *int
+            var h = H(a)
+            h.p = &spare
+            h.p
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+// TODO: un-ignore when a call of a closure value is followed into what its body answers of a capture.
+@test("an answer a closure built before the overwrite makes of what it captured", ignore: "a closure call's answer made of a capture is not followed")
+pcr_answers_closure_built_before()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            val g = () -> b
+            b = &spare
+            g()
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+// TODO: un-ignore when a call of a closure value is followed into what its body answers of a capture.
+@test("a parameter a closure captured, answered by a call of the closure", ignore: "a closure call's answer made of a capture is not followed")
+pcr_answers_closure_of_the_parameter()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            val g = () -> a
+            g()
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+// TODO: un-ignore when a call of a closure value is followed into what its body answers of a capture.
+@test("a parameter a closure captured, stored from a call of the closure", ignore: "a closure call's answer made of a capture is not followed")
+pcr_stores_closure_call_of_the_parameter()
+    pcr_refused(raw"""
+        key(a: *int)
+            val g = () -> a
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("an answer a closure built after the overwrite makes of what it captured")
+pcr_answers_closure_built_after()
+    pcr_prints(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            b = &spare
+            val g = () -> b
+            g()
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("an answer made of a copy a 'defer' overwrites only on the way out")
+pcr_answers_copy_a_defer_overwrites()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            defer b = &spare
+            b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
+
+@test("an answer read through the parameter into a local, overwritten before it is answered")
+pcr_answers_read_value_overwritten()
+    pcr_prints(raw"""
+        relay(p: **int) -> *int
+            var q = *p
+            print(*q)
+            q = &spare
+            q
+
+        other()
+            var y = 5
+            var x = &y
+            held = relay(&x)
+
+        main()
+            other()
+            print(*held)
+        """, "5\n7\n")
+
+@test("an answer read through the parameter into a local, overwritten on one way only")
+pcr_answers_read_value_one_way()
+    pcr_refused(raw"""
+        relay(p: **int) -> *int
+            var q = *p
+            if **p > 30 then q = &spare
+            q
+
+        other()
+            var y = 5
+            var x = &y
+            held = relay(&x)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("relay(&x)"))
+
+@test("a loop's 'break' value made of an overwritten copy is still counted")
+pcr_answers_loop_break_value()
+    pcr_refused(raw"""
+        pick(a: *int) -> *int
+            var b = a
+            b = &spare
+            loop
+                break b
+
+        other()
+            var y = 5
+            held = pick(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_answer_kept("pick(&y)"))
 
 @test("a copy handed to a callee that keeps its address is followed as before")
 pcr_address_kept_by_a_callee()

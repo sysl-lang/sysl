@@ -28,7 +28,7 @@ handling away from every program with no operating system to ask. Deciding what 
 ### `unchanged`
 
 ```sysl
-const unchanged: u32 = 4294967295
+const unchanged: u32 = …
 ```
 
 What `set_owner` and `set_link_owner` take for an owner or a group to leave as it is: `4294967295`,
