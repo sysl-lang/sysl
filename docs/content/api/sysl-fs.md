@@ -660,7 +660,8 @@ something outside the tree it was pointed at. `entries` says what is in a direct
 follows links, so the test here is `link_metadata` -- the one reading in the module that describes
 the path itself.
 
-A path that is not there at all is success. A caller tearing down after a failure should not have
+A path that is not there at all is success, except one holding a zero byte, which is `Other(22)`:
+it names nothing the filesystem could lack. A caller tearing down after a failure should not have
 to know how far the failure got.
 
 ### `remove_file`
