@@ -342,3 +342,203 @@ nhk_hosted_library_answers_weakly()
 
     assert(said.1.contains("@sysl_net_posix_recv_from("), "the hosted answer does not call the shim")
 end nhk_hosted_library_answers_weakly
+
+// -- `send_file` ---------------------------------------------------------------------------------------
+
+// A static file server's one call: a file opened, a connection, and its bytes sent from the file.
+private val nhk_file_program: string = raw"""
+    import sysl.fs.open
+    import sysl.net.{ipv4, socket}
+    import sysl.net.sys.Endpoint
+    import sysl.sys.UNSUPPORTED
+
+    go() -> int
+        var n = 0
+        val here = ipv4(10, 0, 2, 15, 8080)
+
+        open("/srv/index.html") match
+            Ok(f) ->
+                socket(here) match
+                    Ok(s) ->
+                        var c = s
+
+                        if c.connect(here).is_ok() then
+                            c.send_file(f, 0, 4096) match
+                                Ok(k) -> n += int(k)
+                                Err(_) -> ()
+
+                        val _ = c.close()
+                    Err(_) -> ()
+            Err(_) -> ()
+
+        n
+    end go
+
+    @export("sysl_net_socket")
+    k_socket(family: int, kind: int) -> int = 3
+
+    @export("sysl_net_connect")
+    k_connect(fd: int, to: *Endpoint) -> int = 0
+
+    @export("sysl_net_send")
+    k_send(fd: int, from: *u8, len: usize) -> isize = isize(len)
+
+    @export("sysl_net_close")
+    k_close(fd: int) -> int = 0
+
+    @export("sysl_fs_open")
+    k_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
+        *fd = 4
+        0
+
+    @export("sysl_fs_write")
+    k_write(fd: int, from: *u8, len: usize, put: *usize) -> int
+        *put = len
+        0
+
+    @export("sysl_fs_pread")
+    k_pread(fd: int, into: *u8, room: usize, offset: long, got: *usize) -> int
+        *got = 0
+        0
+
+    @export("sysl_fs_close")
+    k_file_close(fd: int) -> int = 0
+    """
+
+@test("a freestanding program calling send_file answers its hook, and is refused naming it if not")
+nhk_send_file_hook_is_answered_or_named()
+    if !nhk_link_ready() then return
+
+    val bare = nhk_tree(nhk_file_program + nhk_runtime)
+    val (refused, none) = nhk_build(bare)
+
+    assert(refused.0 != 0, "built with send_file's hook unanswered")
+    assert(refused.1.contains("so the program answers it: define 'sysl_net_send_file' with '@export'"),
+        refused.1)
+
+    val answered = nhk_tree(nhk_file_program + nhk_runtime + raw"""
+        @export("sysl_net_send_file")
+        k_send_file(fd: int, file: int, offset: i64, count: usize) -> isize = isize(count)
+        """)
+    val (said, out) = nhk_build(answered)
+
+    assert(said.0 == 0, said.1)
+
+    val all = nhk_symbols(s"$out/img.elf", false)
+
+    assert(all.contains(" T sysl_net_send_file"), all)
+    assert(!nhk_names(all, "sendfile") && !nhk_names(all, "sysl_net_posix_send_file"), all)
+    lbr_drop([bare, none, answered, out])
+end nhk_send_file_hook_is_answered_or_named
+
+@test("a freestanding supplier answering send_file UNSUPPORTED links the read-and-send loop instead")
+nhk_send_file_unsupported_links_the_loop()
+    if !nhk_link_ready() then return
+
+    val p = nhk_tree(nhk_file_program + nhk_runtime + raw"""
+        @export("sysl_net_send_file")
+        k_send_file(fd: int, file: int, offset: i64, count: usize) -> isize = isize(UNSUPPORTED)
+        """)
+    val (said, out) = nhk_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    // The loop reads the file at the offset and sends what it read: both hooks are called from it.
+    val all = nhk_symbols(s"$out/img.elf", false)
+
+    assert(all.contains(" T sysl_fs_pread") && all.contains(" T sysl_net_send"), all)
+    lbr_drop([p, out])
+end nhk_send_file_unsupported_links_the_loop
+
+// A hosted program whose own `sysl_net_send_file` answers UNSUPPORTED, so every call below goes through
+// the library's read-and-send loop: the same cells as `library/sysl/net/sendfile_tests.sysl`'s, which
+// the kernel's `sendfile` answers.
+private val nhk_loop_program: string = raw"""
+    import sysl.fs.{create, create_update, make_temp_dir, open, remove_dir_all}
+    import sysl.net.{resolve, socket, would_block}
+    import sysl.path.join
+    import sysl.sys.UNSUPPORTED
+    import sysl.text.from_utf8
+
+    @export("sysl_net_send_file")
+    no_send_file(fd: int, file: int, offset: i64, count: usize) -> isize = isize(UNSUPPORTED)
+
+    val dir = make_temp_dir("sysl-nhk-loop-").unwrap()
+    var w = create(join(dir, "a")).unwrap()
+
+    w.write("abcdefghijklmnopqrstuvwxyz".bytes)
+    w.close().unwrap()
+
+    val f = open(join(dir, "a")).unwrap()
+    val here = resolve("127.0.0.1", 0).unwrap()[0]
+    var l = socket(here).unwrap()
+
+    l.bind(here).unwrap()
+    l.listen().unwrap()
+
+    var c = socket(l.local().unwrap()).unwrap()
+
+    c.connect(l.local().unwrap()).unwrap()
+
+    var (a, _) = l.accept().unwrap()
+
+    print(a.send_file(f, 0, 26).unwrap(), a.send_file(f, 20, 100).unwrap(), a.send_file(f, 10, 4).unwrap())
+    print(a.send_file(f, 26, 5).unwrap(), a.send_file(f, 1000, 5).unwrap(), a.send_file(f, 3, 0).unwrap())
+
+    var into: []u8 = [0; 36]
+    var got = 0
+
+    while got < 36
+        got += c.recv(into[got..<36]).unwrap()
+
+    print(from_utf8(into).unwrap())
+
+    // Bytes still buffered for writing are sent, and the position stays where it was.
+    var u = create_update(join(dir, "b")).unwrap()
+
+    u.write("hello world".bytes)
+    print(a.send_file(u, 6, 5).unwrap(), u.tell().unwrap())
+    got = c.recv(into[0..<5]).unwrap()
+    print(from_utf8(into[0..<got]).unwrap())
+
+    // A write-only file and a closed one answer NotOpen.
+    var wo = create(join(dir, "c")).unwrap()
+
+    print(a.send_file(wo, 0, 1).unwrap_err(), a.send_file(w, 0, 1).unwrap_err())
+
+    // A big file to a full non-blocking socket: part of it, then would_block.
+    var big = create_update(join(dir, "big")).unwrap()
+
+    val size = 16777216
+
+    big.truncate(long(size)).unwrap()
+    a.set_send_buffer(65536).unwrap()
+    c.set_recv_buffer(65536).unwrap()
+    a.non_blocking().unwrap()
+
+    val first = a.send_file(big, 0, size).unwrap()
+    var next = a.send_file(big, u64(first), size - first)
+    var sent = first
+
+    while next.is_ok() && sent < size
+        sent += next.unwrap()
+        next = a.send_file(big, u64(sent), size - sent)
+
+    print(first > 0 && first < size, sent < size, next.is_err() && would_block(next.unwrap_err()))
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    remove_dir_all(dir).unwrap()
+    """
+
+@test("where the system has no sendfile, send_file reads and sends, and answers as sendfile does")
+nhk_send_file_falls_back_to_the_loop()
+    if !lbr_ready() then return
+
+    val p = lbr_program(nhk_loop_program)
+    val said = lbr_run(p, [])
+
+    lbr_drop([p])
+    assert_eq(said, "26 6 4\n0 0 0\nabcdefghijklmnopqrstuvwxyzuvwxyzklmn\n5 11\nworld\n" +
+        "the file is not open the file is not open\ntrue true true\n")
+end nhk_send_file_falls_back_to_the_loop
