@@ -2,7 +2,6 @@ module sh.sysl.compiler
 @tests
 
 import sysl.text.Search
-import sysl.text.split
 
 // What a `string` lowers to across a whole program: the three words it is, the immortal owner a
 // literal carries, and the runtime pieces its content needs -- emitted only where the program
@@ -40,8 +39,6 @@ private scg_define_of(ir: string, name: string) -> string
 
         rest = rest[eol..<rest.len]
 end scg_define_of
-
-private scg_main_of(ir: string) -> string = scg_define_of(ir, "main")
 
 private scg_is_digit(b: u8) -> bool = b >= u8('0') && b <= u8('9')
 
@@ -82,6 +79,7 @@ private scg_has(hay: string, pattern: string) -> bool
         from = at + 1
 end scg_has
 
+// guards: a string is the same three words as a slice
 @test("a string is the same three words a slice is")
 scg_a_string_is_the_same_three_words_a_slice_is()
     if xvr_no_library() then return
@@ -90,6 +88,7 @@ scg_a_string_is_the_same_three_words_a_slice_is()
 
     assert(out.contains("%s.addr = alloca { ptr, ptr, i64 }"), out)
 
+// guards: a string literal is constant interned bytes, length excluding NUL
 @test("a literal is a constant: no owner, the interned bytes, and a length that leaves out the NUL")
 scg_a_literal_is_a_constant()
     if xvr_no_library() then return
@@ -103,10 +102,9 @@ scg_a_literal_is_a_constant()
 scg_a_length_is_a_word_of_the_value()
     if xvr_no_library() then return
 
-    val out = scg_ir("var s = \"hi\"\nprint(s.len)\n")
+    assert_eq(cgb_ran("var s = \"h\\u{e9}llo\"\nvar e = \"\"\nprint(s.len, e.len, s[1..<3].len)\n"), "6 0 2\n")
 
-    assert(scg_has(out, "extractvalue { ptr, ptr, i64 } %t#, 2"), out)
-
+// guards: taking a string's bytes emits no conversion
 @test("the bytes of a string are the string, with nothing emitted to convert them")
 scg_the_bytes_of_a_string_are_the_string()
     if xvr_no_library() then return
@@ -132,46 +130,21 @@ scg_a_literals_owner_is_null()
 scg_printing_goes_by_length()
     if xvr_no_library() then return
 
-    val out = scg_ir("print(\"hi\")\n")
-    val sink = scg_define_of(out, "sysl$putbytes")
-
-    assert(scg_main_of(out).contains("call void @sysl$prints({ ptr, ptr, i64 } "), out)
-    assert(scg_has(sink, "extractvalue { ptr, ptr, i64 } %t#, 2"), sink)
-    assert(sink.contains("call i64 @sysl_stdout_write(ptr %"), sink)
-    assert(!sink.contains("@putchar"), sink)
-
-    for line in split(out, "\n")
-        if line.starts_with("@.str") then assert(!line.contains("%s"), line)
+    // A NUL in the middle and a `%s` are written as the bytes they are.
+    assert_eq(cgb_ran("var s = \"a\\0b\"\nprint(s, \"100%s\", s[0..<1])\n"), "a\0b 100%s a\n")
 end scg_printing_goes_by_length
 
-// Every value is its own call to the renderer its type reaches, with a space between and a newline
-// at the end -- and the separators go out as characters rather than one-character strings, so
-// printing a number never reaches the string runtime at all.
+// Every value is rendered by the renderer its type reaches, with a space between and a newline at
+// the end.
 @test("each argument is rendered by its own call")
 scg_each_argument_is_rendered_by_its_own_call()
     if xvr_no_library() then return
 
-    val main = scg_main_of(scg_ir("print(1, 2, \"x\", 3, 4)\n"))
-    val renderers = ["printi", "printu", "printr", "printb", "printc", "prints"]
-    var called = ""
-
-    for line in split(main, "\n")
-        val l = line.trim()
-
-        if l.starts_with("call void @sysl$")
-            val rest = l["call void @sysl$".len..<l.len]
-
-            rest.index_of("(") match
-                None -> ()
-                Some(open) ->
-                    for r in renderers
-                        if rest[0..<open] == r then called = called + " " + r
-
-    assert_eq(called, " printi printc printi printc prints printc printi printc printi printc")
-    assert(main.contains("call void @sysl$printc(i32 32)"), main)
-    assert(main.contains("call void @sysl$printc(i32 10)"), main)
+    assert_eq(cgb_ran("val u: u8 = 200\nval w: u64 = 18446744073709551615\nprint(1, -2, \"x\", u, w, 2.5, true, 'c')\n"),
+              "1 -2 x 200 18446744073709551615 2.5 true c\n")
 end scg_each_argument_is_rendered_by_its_own_call
 
+// guards: string comparison is one call, every operator reads its answer
 @test("comparison is a call, and every operator reads its answer")
 scg_comparison_is_a_call()
     if xvr_no_library() then return
@@ -198,13 +171,18 @@ scg_a_substring_is_checked_at_both_ends()
     force_short_strings(true)
     defer unforce_short_strings()
 
-    val out = scg_ir("var s = \"hi\"\nvar t = s[0..<1]\nprint(t.len)\n")
-
     // With the short form on, as these tests pin it, the source is read as its two words as they stand.
-    assert(scg_has(out, "call i1 @sysl.str.boundary.words(ptr %t#, i64 %t#, i64 %t#, i64 0)"), out)
-    assert(scg_has(out, "call i1 @sysl.str.boundary.words(ptr %t#, i64 %t#, i64 %t#, i64 1)"), out)
-    assert(out.contains("%cont = icmp eq i8 %top, -128"), out)
+    assert_eq(cgb_ran("var s = \"h\\u{e9}llo\"\nprint(s[0..<1], s[1..<3], s[3..<6])\n"), "h \u{e9} llo\n")
 
+    if !enm_ready() then return
+
+    val end_inside = enm_panic_text("var s = \"h\\u{e9}llo\"\nprint(s[0..<2])\n")
+    val start_inside = enm_panic_text("var s = \"h\\u{e9}llo\"\nprint(s[2..<4])\n")
+
+    assert(end_inside.contains("range end 2 is not on a character boundary"), end_inside)
+    assert(start_inside.contains("range start 2 is not on a character boundary"), start_inside)
+
+// guards: slicing a string is checked, slicing bytes is not
 @test("slicing a string yields a string, so it is checked; slicing bytes is not")
 scg_slicing_bytes_is_not_checked()
     if xvr_no_library() then return
@@ -217,13 +195,11 @@ scg_slicing_bytes_is_not_checked()
 scg_concatenation_is_one_call()
     if xvr_no_library() then return
 
-    val out = scg_ir("print(\"a\" + \"b\")\n")
-
-    assert(scg_has(out, "call { ptr, ptr, i64 } @sysl.str.concat(ptr %t#, i64 %t#, ptr %t#, i64 %t#)"), out)
-    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.concat"), out)
+    assert_eq(cgb_ran("var a = \"a\"\nval e = \"\"\nprint(a + \"b\", (a + e) + \"yz\", (e + e).len)\n"), "ab ayz 0\n")
 
 // The buffer a join builds is an ARC box, so it carries a header and a hook like any other -- the
 // hook that frees and does nothing else, raw bytes holding no references.
+// guards: a joined string owns a heap buffer, linking the allocator
 @test("a joined string owns a heap buffer, so the module links an allocator and counts references")
 scg_a_joined_string_owns_a_heap_buffer()
     if xvr_no_library() then return
@@ -235,6 +211,7 @@ scg_a_joined_string_owns_a_heap_buffer()
     assert(out.contains("define private void @arc.drop.plain(ptr %p, i1 %storage, ptr %slot) {"), out)
     assert(out.contains("define private void @arc.release_maybe(ptr %p) {"), out)
 
+// guards: a module that never joins strings emits no concat helper
 @test("a module that never joins strings emits no concatenation helper")
 scg_no_join_no_concatenation_helper()
     if xvr_no_library() then return
@@ -243,6 +220,7 @@ scg_no_join_no_concatenation_helper()
 
     assert(!out.contains("@sysl.str.concat"), out)
 
+// guards: rendering an integer is one call allocating a buffer
 @test("rendering an integer is one call that allocates a buffer")
 scg_rendering_an_integer_is_one_call()
     if xvr_no_library() then return
@@ -253,6 +231,7 @@ scg_rendering_an_integer_is_one_call()
     assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.from_bytes"), out)
     assert(out.contains("declare ptr @malloc(i64)"), out)
 
+// guards: rendering a string is the identity, no call or allocation
 @test("rendering a string is the identity: no call, no allocation of its own")
 scg_rendering_a_string_is_the_identity()
     if xvr_no_library() then return
@@ -262,6 +241,7 @@ scg_rendering_a_string_is_the_identity()
     assert(!out.contains("@sysl.str.int"), out)
     assert(!out.contains("@sysl.str.from_bytes"), out)
 
+// guards: rendering a bool selects an immortal word, no allocation
 @test("rendering a bool selects an immortal word rather than allocating")
 scg_rendering_a_bool_selects_a_word()
     if xvr_no_library() then return
@@ -276,12 +256,11 @@ scg_rendering_a_bool_selects_a_word()
 scg_rendering_a_char_goes_through_the_encoder()
     if xvr_no_library() then return
 
-    val out = scg_ir("print('A'.to_string())\n")
+    assert_eq(cgb_ran("print('A'.to_string(), '\\u{e9}'.to_string().len, '\\u{20ac}'.to_string().len, " +
+                      "'\\u{1f600}'.to_string().len, '\\u{e9}'.to_string() == \"\\u{e9}\")\n"),
+              "A 2 3 4 true\n")
 
-    assert(out.contains("define private { ptr, ptr, i64 } @sysl.str.char"), out)
-    assert(out.contains("call ptr @sysl.utf8(i32 %cp, ptr %buf)"), out)
-    assert(out.contains("define private ptr @sysl.utf8"), out)
-
+// guards: str of a float is format_real_plain, no snprintf
 @test("str of a float is the library's format_real_plain, with no specifier and no snprintf")
 scg_rendering_a_float_goes_through_format_real()
     if xvr_no_library() then return
@@ -293,6 +272,7 @@ scg_rendering_a_float_goes_through_format_real()
     assert(!out.contains("@sysl.str.float"), out)
     assert(!out.contains("@snprintf"), out)
 
+// guards: a module that never renders emits no str helpers
 @test("a module that never renders a value emits no str helpers")
 scg_no_rendering_no_str_helpers()
     if xvr_no_library() then return
@@ -326,6 +306,7 @@ scg_integer_hole_widens_by_its_own_signedness()
     assert(scg_has(unsigned, "zext i32 %t# to i128"), unsigned)
     assert(signed.contains("i32 32"), signed)
 
+// guards: a float format passes the double and specifier to format_real
 @test("a float format is the library's format_real, the double and the specifier handed straight over")
 scg_a_float_format_passes_the_double_through()
     if xvr_no_library() then return
@@ -347,6 +328,7 @@ scg_an_f32_hole_stays_single()
     assert(!out.contains("fpext"), out)
     assert(!out.contains("@snprintf"), out)
 
+// guards: a string format is the library's format_str, no snprintf
 @test("a string format is the library's format_str, not a copy handed to snprintf")
 scg_a_string_format_is_format_str()
     if xvr_no_library() then return

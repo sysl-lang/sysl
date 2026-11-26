@@ -1,0 +1,532 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+
+// `--explain-checks`: which run-time checks survive LLVM's optimization, where each was written,
+// what it checks, the function it survives in, and why the hoist left it (`explain_checks.sysl`).
+//
+// The axes these cells cross: the level (`-O0`, `-O1`, `-O2`); a check removed against one kept; the
+// kind (an index, a range, a division, an overflow, a contract, an `unwrap`); what the hoist made of
+// a subscript (no counted loop, a loop it refused, a subscript it could not prove, a loop it copied);
+// where the check survives (its own function, a caller it was inlined into, a helper LLVM handed the
+// record on to, a `@track_caller` call left standing); the command (`build`, `emit-llvm`, `run`); and
+// the report's own edges (no checks at all, no locations to key on, no flag). Every input goes
+// through `black_box`, or LLVM would fold a whole program's constants and every check with them.
+//
+// Skipped: a `--lib` root and a package (a check in them is not in the program's own files, which is
+// what the report is about, and `is_own` is the one test); codegen units above one (they start at
+// half a megabyte of text, and each unit's text is read the same way as one); and `--lto` (the
+// report says it cannot see the link's optimization, which no program here could show).
+
+// What one command line came to: the status, what the command said on its output channel, and each
+// line said beside it. The program is written to a directory of its own, which is removed. `None`
+// without the library.
+private xck_run(command: string, text: string, flags: []const string) -> Option[(int, Buf[string], Buf[string], string)]
+    if xvr_no_library() then return None
+
+    val root = make_temp_dir("sysl-xck").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var notes: Buf[string] = buf()
+    val noted = &notes
+    val file = s"$root/main.sysl"
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+
+    for flag in flags
+        args.push(flag)
+
+    if command == "build"
+        args.push("-o")
+        args.push(s"$root/main")
+    end if
+
+    args.push(file)
+
+    val code = run_cli_noted(args.view(), (line) -> sink.push(line), (line) -> noted.push(line))
+
+    remove_dir_all(root).unwrap_or(())
+    Some((code, lines, notes, file))
+end xck_run
+
+// The report on `text` built at `level` with `--explain-checks`: its first line, and the lines about
+// checks with the directory taken out, so each starts `main.sysl:`. `None` without the library.
+private xck_report(text: string, level: string, extra: []const string = []) -> Option[(string, Buf[string])]
+    var flags: Buf[string] = buf()
+
+    flags.push("--explain-checks")
+    flags.push(s"-O$level")
+
+    for item in extra
+        flags.push(item)
+
+    xck_run("build", text, flags.view()) match
+        None -> None
+        Some((code, _, notes, file)) ->
+            assert_eq(code, Fine)
+
+            val said = xck_said(notes)
+
+            assert(!said.is_empty())
+
+            var lines: Buf[string] = buf()
+            val dir = file[0..<file.len - 9]
+
+            for i in 1..<said.len()
+                assert(said[i].starts_with(file), said[i])
+                lines.push(said[i][dir.len..<said[i].len])
+
+            Some((said[0], lines))
+end xck_report
+
+// The report's lines among what a command said beside its output: not the build's own notes, which
+// say where the standard module was built and where the executable was written.
+private xck_said(notes: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for line in notes
+        if !line.starts_with("wrote ") && !line.starts_with("building the standard module") then out.push(line)
+
+    out
+end xck_said
+
+// Whether a line of the report starts with `want`.
+private xck_has(lines: Buf[string], want: string) -> bool
+    for line in lines
+        if line.starts_with(want) then return true
+
+    false
+end xck_has
+
+// Every line, for a failure to show.
+private xck_all(lines: Buf[string]) -> string
+    var out = ""
+
+    for line in lines
+        out = out + line + "\n"
+
+    out
+end xck_all
+
+// A program that sums a view: `xs[i]` with `i` below `xs.len` is proved by the loop's condition.
+private xck_summing() -> string = raw"""
+    import sysl.hint.black_box
+
+    sum(xs: []int) -> int
+        var t = 0
+
+        for i in 0..<xs.len
+            t += xs[i]
+
+        t
+    end sum
+
+    var data = [3, 1, 2, 0]
+
+    print(sum(black_box(data[..])))
+    """
+
+// A program indexing one view by another's elements, which nothing can prove.
+private xck_indirect() -> string = raw"""
+    import sysl.hint.black_box
+
+    pick(xs: []int, ys: []int) -> int
+        var t = 0
+
+        for i in 0..<xs.len
+            t += ys[xs[i]]
+
+        t
+    end pick
+
+    var data = [3, 1, 2, 0]
+
+    print(pick(black_box(data[..]), black_box(data[..])))
+    """
+
+// Why the hoist could not prove `ys[xs[i]]`.
+private xck_not_affine() -> string =
+    "the hoist could not prove it in the loop at line 6: its index is not built with '+' and '-' from " +
+    "the loop's variable, literals, locals the loop leaves alone and the lengths of views it leaves alone"
+
+@test("a loop whose check the optimizer removes lists nothing, and says none survives")
+xck_removed_check_is_not_listed()
+    xck_report(xck_summing(), "2") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "none of the 2 run-time checks in this program's files survives -O2")
+            assert_eq(lines.len(), 0)
+end xck_removed_check_is_not_listed
+
+@test("one check is said in the singular, kept or taken out")
+xck_one_check()
+    val kept = raw"""
+        import sysl.hint.black_box
+
+        @noinline
+        halve(a: u64, b: u64) -> u64 = a / b
+
+        print(halve(black_box(9u64), black_box(2u64)))
+        """
+
+    xck_report(kept, "2") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "the one run-time check in this program's files survives -O2")
+            assert_eq(xck_all(lines), "main.sysl:4:32: division by zero survives in 'halve'\n")
+
+    val taken = raw"""
+        import sysl.hint.black_box
+
+        @noinline
+        low(xs: [4]int, i: usize) -> int = xs[i & 3]
+
+        print(low(black_box([5, 6, 7, 8]), black_box(6usize)))
+        """
+
+    xck_report(taken, "2") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "the one run-time check in this program's files is taken out at -O2")
+            assert_eq(lines.len(), 0)
+end xck_one_check
+
+@test("a check that stays is listed with its kind, its line, its function and why the hoist left it")
+xck_kept_check_is_listed()
+    xck_report(xck_indirect(), "2") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "1 of the 4 run-time checks in this program's files survive -O2")
+            assert_eq(xck_all(lines), s"main.sysl:7:16: bounds (index) survives in 'main', inlined from 'pick'; " +
+                      s"${xck_not_affine()}\n")
+end xck_kept_check_is_listed
+
+@test("-O0 says every check survives and lists each, the one -O2 removes among them")
+xck_o0_lists_every_check()
+    xck_report(xck_summing(), "0") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "-O0 optimizes nothing, so every one of the 2 run-time checks in this program's files survives")
+            assert_eq(xck_all(lines), "main.sysl:14:25: bounds (range start past the length) survives in 'main'\n" +
+                      "main.sysl:7:16: bounds (index) survives in 'sum'; the hoist did not copy " +
+                      "the loop at line 6: every subscript it could prove is one the loop's own condition " +
+                      "proves, so nothing was copied\n")
+end xck_o0_lists_every_check
+
+@test("-O1 answers for its own level")
+xck_o1_is_its_own()
+    xck_report(xck_indirect(), "1") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "1 of the 4 run-time checks in this program's files survive -O1")
+            assert_eq(lines.len(), 1)
+            assert(lines[0].starts_with("main.sysl:7:16: bounds (index) survives in '"), lines[0])
+            assert(lines[0].ends_with(xck_not_affine()), lines[0])
+end xck_o1_is_its_own
+
+@test("a program with no checks says so")
+xck_no_checks()
+    xck_report("print(1 + 2)\n", "2") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "this program's files have no run-time checks")
+            assert_eq(lines.len(), 0)
+end xck_no_checks
+
+@test("each kind is named, in its own function: a division, a range, an unwrap, a contract, an overflow")
+xck_each_kind()
+    val text = raw"""
+        import sysl.hint.black_box
+
+        @noinline
+        halve(a: int, b: int) -> int = a / b
+
+        @noinline
+        middle(xs: []int, a: usize, b: usize) -> []int = xs[a..<b]
+
+        @noinline
+        first(o: Option[int]) -> int = o.unwrap()
+
+        @noinline
+        root(n: int) -> int
+            require n >= 0
+            n
+        end root
+
+        @noinline
+        grow(a: i32, b: i32) -> i32 = a + b
+
+        var data = [3, 1, 2, 0]
+
+        print(halve(black_box(9), black_box(data[1])), middle(black_box(data[..]), black_box(1usize),
+              black_box(3usize)).len, first(black_box(Some(data[2]))), root(black_box(data[0])),
+              grow(black_box(i32(3)), black_box(i32(1))))
+        """
+
+    xck_report(text, "2", ["--debug"]) match
+        None -> ()
+        Some((head, lines)) ->
+            assert(head.ends_with("survive -O2"), head)
+            assert_eq(xck_all(lines),
+                      "main.sysl:10:34: call to 'sysl.Option.unwrap.int' survives in 'first'\n" +
+                      "main.sysl:19:31: overflow (i32 + i32) survives in 'grow'\n" +
+                      "main.sysl:4:32: division by zero survives in 'halve'\n" +
+                      "main.sysl:4:32: overflow (the least value divided by -1) survives in 'halve'\n" +
+                      "main.sysl:7:52: bounds (range start past its end) survives in 'middle'\n" +
+                      "main.sysl:7:52: bounds (range) survives in 'middle'\n" +
+                      "main.sysl:14:13: contract (require) survives in 'root'\n")
+end xck_each_kind
+
+@test("two checks written at one place are told apart: a signed division's zero and its overflow")
+xck_one_place_two_checks()
+    val text = raw"""
+        import sysl.hint.black_box
+
+        @noinline
+        div(a: int, b: int) -> int = a / b
+
+        print(div(black_box(7), black_box(2)))
+        """
+
+    xck_report(text, "2", ["--debug"]) match
+        None -> ()
+        Some((_, lines)) ->
+            assert(xck_has(lines, "main.sysl:4:30: division by zero survives in 'div'"), xck_all(lines))
+            assert(xck_has(lines, "main.sysl:4:30: overflow"), xck_all(lines))
+end xck_one_place_two_checks
+
+@test("the hoist's verdict: no counted loop, a refused loop, a copied loop's fallback")
+xck_hoist_verdicts()
+    val text = raw"""
+        import sysl.hint.black_box
+
+        @noinline
+        at(xs: []int, k: usize) -> int = xs[k]
+
+        @noinline
+        upto(xs: []int, n: usize) -> int
+            var t = 0
+
+            for i in 0..<n
+                if xs[i] < 0 then return -1
+                t += xs[i]
+
+            t
+        end upto
+
+        @noinline
+        shifted(xs: []int, n: usize, k: usize) -> int
+            var t = 0
+
+            for i in 0..<n
+                t += xs[i + k]
+
+            t
+        end shifted
+
+        var data = [3, 1, 2, 0]
+
+        print(at(black_box(data[..]), black_box(2usize)), upto(black_box(data[..]), black_box(3usize)),
+              shifted(black_box(data[..]), black_box(2usize), black_box(1usize)))
+        """
+
+    xck_report(text, "2") match
+        None -> ()
+        Some((_, lines)) ->
+            assert_eq(xck_all(lines),
+                      "main.sysl:4:36: bounds (index) survives in 'at'; no counted loop holds it, and the hoist " +
+                      "considers no other\n" +
+                      "main.sysl:22:16: bounds (index) survives in 'shifted'; the loop at line 21 is hoisted, and " +
+                      "this is its copy as written, which runs only where the test in front of the loop fails\n" +
+                      "main.sysl:11:14: bounds (index) survives in 'upto'; the hoist did not copy the loop at " +
+                      "line 10: its body can return\n")
+end xck_hoist_verdicts
+
+@test("a hoisted subscript read or written through a field keeps its check only in the copy as written")
+xck_hoisted_places()
+    val text = raw"""
+        import sysl.hint.black_box
+
+        struct P
+            x: int
+            y: int
+
+        @noinline
+        fields(ps: []P, n: usize, k: usize) -> int
+            var t = 0
+
+            for i in 0..<n
+                t += ps[i + k].x
+
+            t
+        end fields
+
+        @noinline
+        writes(ps: []P, n: usize, k: usize)
+            for i in 0..<n
+                ps[i + k].y = 1
+
+        var data = [P(1, 2), P(3, 4), P(5, 6), P(7, 8)]
+
+        writes(black_box(data[..]), black_box(2usize), black_box(1usize))
+        print(fields(black_box(data[..]), black_box(2usize), black_box(1usize)))
+        """
+
+    xck_report(text, "2") match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "2 of the 4 run-time checks in this program's files survive -O2")
+            assert_eq(xck_all(lines),
+                      "main.sysl:12:16: bounds (index) survives in 'fields'; the loop at line 11 is hoisted, and " +
+                      "this is its copy as written, which runs only where the test in front of the loop fails\n" +
+                      "main.sysl:20:11: bounds (index) survives in 'writes'; the loop at line 19 is hoisted, and " +
+                      "this is its copy as written, which runs only where the test in front of the loop fails\n")
+end xck_hoisted_places
+
+@test("a call into a @track_caller body that is not inlined says the check is made inside it")
+xck_call_not_inlined()
+    val text = raw"""
+        import sysl.hint.black_box
+
+        @noinline
+        @track_caller
+        must(o: Option[int]) -> int = o.unwrap()
+
+        var data = [3, 1, 2, 0]
+        val o: Option[int] = if black_box(data[0]) > 2 then Some(data[1]) else None
+
+        print(must(o))
+        """
+
+    xck_report(text, "2") match
+        None -> ()
+        Some((_, lines)) ->
+            assert_eq(xck_all(lines), "main.sysl:10:7: call to 'must' survives in 'main'; the call was not " +
+                      "inlined, so the check is made inside it\n")
+end xck_call_not_inlined
+
+@test("without locations there is nothing to key on, and the report says so")
+xck_no_locations()
+    xck_report(xck_indirect(), "2", ["--no-bounds-locations"]) match
+        None -> ()
+        Some((head, lines)) ->
+            assert_eq(head, "--explain-checks finds a check by the location it reports, and this build lays " +
+                      "down none (--no-bounds-locations)")
+            assert_eq(lines.len(), 0)
+end xck_no_locations
+
+@test("no flag, no report; emit-llvm and run say it on the report channel and leave the output alone")
+xck_channels()
+    xck_run("build", xck_indirect(), ["-O2"]) match
+        None -> ()
+        Some((code, _, notes, _)) ->
+            assert_eq(code, Fine)
+            assert_eq(xck_said(notes).len(), 0)
+
+    xck_run("emit-llvm", xck_indirect(), ["--explain-checks", "-O2"]) match
+        None -> ()
+        Some((code, lines, notes, _)) ->
+            assert_eq(code, Fine)
+            assert(lines[0].starts_with("target triple"), lines[0])
+            assert_eq(xck_said(notes)[0], "1 of the 4 run-time checks in this program's files survive -O2")
+
+    xck_run("run", xck_indirect(), ["--explain-checks", "-O1"]) match
+        None -> ()
+        Some((code, _, notes, _)) ->
+            // The program's own output goes to the shell's stream, which the child shares.
+            assert_eq(code, Fine)
+
+            val said = xck_said(notes)
+
+            // A run is a debug build, so `t +=` is checked too, and survives beside the subscript.
+            assert_eq(said[0], "2 of the 5 run-time checks in this program's files survive -O1")
+            assert_eq(said.len(), 3)
+            assert(said[1].ends_with("main.sysl:7:9: overflow (int += int) survives in 'main', inlined from 'pick'"),
+                   said[1])
+end xck_channels
+
+@test("the scan keys on the record, whatever names it: a phi, a shared stub, a split-off cold part")
+xck_scan_keys_on_the_record()
+    var records: Buf[CheckRecord] = buf()
+
+    records.push(CheckRecord(".loc0", "bounds (index)", "m.sysl", 1, 1, "f", "", ""))
+    records.push(CheckRecord(".loc1", "overflow", "m.sysl", 2, 1, "f", "", ""))
+    records.push(CheckRecord(".loc2", "division by zero", "m.sysl", 3, 1, "g", "", ""))
+    records.push(CheckRecord(".loc3", "bounds (index)", "m.sysl", 4, 1, "h", "", ""))
+
+    val ir = raw"""
+        @.loc0 = private constant [9 x i8] c"m.sysl:1\00"
+        define void @"f$$sysl"(i1 %c) {
+        entry:
+          %p = phi ptr [ @.loc0, %a ], [ @.loc1, %b ]
+          tail call void @sysl.fail.index(ptr %p)
+          ret void
+        }
+        define void @"g$$sysl.cold.1"() {
+          call void @sysl.check.division(ptr @"sysl.cgu:.loc2")
+          ret void
+        }
+        define void @"h$$sysl"() {
+          ret void
+        }
+        """
+
+    val got = surviving_checks(ir, records)
+
+    assert_eq(got.len(), 3)
+    assert_eq(got[0], ("f", ".loc0"))
+    assert_eq(got[1], ("f", ".loc1"))
+    assert_eq(got[2], ("g", ".loc2"))
+end xck_scan_keys_on_the_record
+
+@test("a record LLVM handed on into a helper or a @track_caller body is credited to their callers")
+xck_scan_credits_callers()
+    var records: Buf[CheckRecord] = buf()
+
+    records.push(CheckRecord(".loc0", "division by zero", "m.sysl", 1, 1, "halve", "", ""))
+    records.push(CheckRecord(".loc1", "call to 'must'", "m.sysl", 2, 1, "main", "", "must$$sysl"))
+    records.push(CheckRecord(".loc2", "bounds (index)", "m.sysl", 3, 1, "pick", "", ""))
+
+    val ir = raw"""
+        define void @"sysl.check.20.integer_division_by_zero"() {
+          call void @sysl_trap(i32 20, i64 0, i64 0, i64 0, ptr @.loc0)
+          ret void
+        }
+        define i64 @"halve$$sysl"(i64 %a, i64 %b) {
+          call void @"sysl.check.20.integer_division_by_zero"()
+          ret i64 0
+        }
+        define i64 @"must$$sysl-place"(ptr %o) {
+          call void @sysl.bounds.fail(i32 12, i64 0, i64 0, i64 0, ptr @.loc1)
+          ret i64 0
+        }
+        define i64 @"pick$$sysl"(ptr %o) {
+          call void @"pick.helper$$sysl"(ptr @.loc2)
+          ret i64 0
+        }
+        define i32 @main() {
+          %r = call i64 @"must$$sysl-place"(ptr %o)
+          %s = call i64 @"pick$$sysl"(ptr %o)
+          ret i32 0
+        }
+        """
+
+    note_check_helpers(["sysl.check.20.integer_division_by_zero"])
+
+    val got = surviving_checks(ir, records)
+
+    note_check_helpers([])
+    assert_eq(got.len(), 3)
+    assert_eq(got[0], ("halve", ".loc0"))
+    assert_eq(got[1], ("main", ".loc1"))
+    assert_eq(got[2], ("pick", ".loc2"))
+end xck_scan_credits_callers

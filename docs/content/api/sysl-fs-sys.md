@@ -9,7 +9,7 @@ requires: "requires { os }"
 
 ## Index
 
-[`access_execute`](#access_execute) [`access_exists`](#access_exists) [`access_read`](#access_read) [`access_write`](#access_write) [`lock_exclusive`](#lock_exclusive) [`lock_release`](#lock_release) [`lock_shared`](#lock_shared) [`open_append`](#open_append) [`open_create`](#open_create) [`open_read`](#open_read) [`open_truncate`](#open_truncate) [`open_uncached`](#open_uncached) [`open_write`](#open_write) [`seek_current`](#seek_current) [`seek_end`](#seek_end) [`seek_start`](#seek_start) [`Stat`](#stat)
+[`access_execute`](#access_execute) [`access_exists`](#access_exists) [`access_read`](#access_read) [`access_write`](#access_write) [`open_append`](#open_append) [`open_create`](#open_create) [`open_dsync`](#open_dsync) [`open_exclusive`](#open_exclusive) [`open_nofollow`](#open_nofollow) [`open_read`](#open_read) [`open_sync`](#open_sync) [`open_truncate`](#open_truncate) [`open_uncached`](#open_uncached) [`open_write`](#open_write) [`seek_current`](#seek_current) [`seek_end`](#seek_end) [`seek_start`](#seek_start) [`Stat`](#stat)
 
 ## Constants
 
@@ -40,29 +40,6 @@ const access_read: int = 4
 const access_write: int = 2
 ```
 
-### `lock_exclusive`
-
-```sysl
-const lock_exclusive: int = 2
-```
-
-### `lock_release`
-
-```sysl
-const lock_release: int = 8
-```
-
-### `lock_shared`
-
-```sysl
-const lock_shared: int = 1
-```
-
-The bits of `sysl_fs_lock`'s and `sysl_fs_lock_now`'s `how`: a lock others may share, one nobody
-else may hold, or giving up whichever this descriptor holds. They are this interface's own numbers,
-and happen to be `flock`'s `LOCK_SH`, `LOCK_EX` and `LOCK_UN` on Linux, Android and every BSD,
-so a supplier over `flock` passes them through.
-
 ### `open_append`
 
 ```sysl
@@ -74,6 +51,33 @@ const open_append: u32 = 16
 ```sysl
 const open_create: u32 = 4
 ```
+
+### `open_dsync`
+
+```sysl
+const open_dsync: u32 = 256
+```
+
+Every write returns once the data is on the device, and the metadata only where reading the data
+back needs it: `O_DSYNC`. A supplier without it gives `O_SYNC`, which promises more.
+
+### `open_exclusive`
+
+```sysl
+const open_exclusive: u32 = 64
+```
+
+Fail with `EEXIST` where the file is already there rather than open it: `O_EXCL`, and only ever
+set together with `open_create`, which is the one combination POSIX defines.
+
+### `open_nofollow`
+
+```sysl
+const open_nofollow: u32 = 512
+```
+
+Refuse a symbolic link at the last component of the path with `ELOOP`: `O_NOFOLLOW`. A supplier
+without it answers `UNSUPPORTED` rather than follow the link.
 
 ### `open_read`
 
@@ -87,6 +91,15 @@ platform's `O_*`, which differ between C libraries; a supplier translates them o
 `open_read` and `open_write` may both be set, for a file opened for update. `open_create` makes the
 file where it is missing, `open_truncate` empties it where it is not, and `open_append` puts every
 write at the end of whatever the file holds at that moment.
+
+### `open_sync`
+
+```sysl
+const open_sync: u32 = 128
+```
+
+Every write returns once the data and the metadata needed to read it back are on the device:
+`O_SYNC`.
 
 ### `open_truncate`
 

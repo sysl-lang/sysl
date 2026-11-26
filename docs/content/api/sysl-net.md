@@ -49,7 +49,7 @@ so leaving them out costs a later release nothing.
 
 ## Index
 
-[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`PeerCredentials`](#peercredentials) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress) [Drop for SocketState](#drop-for-socketstate)
+[`max_unix_path`](#max_unix_path) [`ipv4`](#ipv4) [`ipv6`](#ipv6) [`peer_closed`](#peer_closed) [`resolve`](#resolve) [`resolve_passive`](#resolve_passive) [`socket`](#socket) [`timed_out`](#timed_out) [`udp_socket`](#udp_socket) [`unix`](#unix) [`unix_connect`](#unix_connect) [`unix_listen`](#unix_listen) [`would_block`](#would_block) [`Address`](#address) [`Family`](#family) [`PeerCredentials`](#peercredentials) [`Shutdown`](#shutdown) [`Socket`](#socket-1) [`UdpSocket`](#udpsocket) [`UnixAddress`](#unixaddress) [`UnixListener`](#unixlistener) [Display for Address](#display-for-address) [Display for UnixAddress](#display-for-unixaddress)
 
 ## Constants
 
@@ -306,6 +306,8 @@ reached through a `&sync` is used through its members like a lock is: `@unchecke
 | `no_delay` | `no_delay(self) -> Result[bool, IoError]` | Whether `set_no_delay` is on. |
 | `set_reuse_port` | `set_reuse_port(self, on: bool = true) -> Result[unit, IoError]` | Let several sockets bind one port (`SO_REUSEPORT`), the kernel spreading incoming connections among them -- how a server runs one listener per thread or process. |
 | `reuse_port` | `reuse_port(self) -> Result[bool, IoError]` | Whether `set_reuse_port` is on. |
+| `set_v6_only` | `set_v6_only(self, on: bool = true) -> Result[unit, IoError]` | Make an IPv6 socket take IPv6 only (`IPV6_V6ONLY`). |
+| `v6_only` | `v6_only(self) -> Result[bool, IoError]` | Whether `set_v6_only` is on. |
 | `set_keepalive` | `set_keepalive(self, on: bool = true) -> Result[unit, IoError]` | Probe an idle connection (`SO_KEEPALIVE`), so one whose peer vanished without a word is found out rather than held for ever. |
 | `keepalive` | `keepalive(self) -> Result[bool, IoError]` | Whether `set_keepalive` is on. |
 | `set_keepalive_idle` | `set_keepalive_idle(self, seconds: int) -> Result[unit, IoError]` | How many `seconds` a connection idles before the first keepalive probe (`TCP_KEEPIDLE`, which Darwin spells `TCP_KEEPALIVE`). |
@@ -350,6 +352,8 @@ It closes itself when its last copy goes, exactly as `Socket` does, and is share
 | `recv_buffer` | `recv_buffer(self) -> Result[int, IoError]` | The receive buffer the kernel gave this socket, in bytes. |
 | `set_reuse_port` | `set_reuse_port(self, on: bool = true) -> Result[unit, IoError]` | Let several datagram sockets bind one port; see `Socket.set_reuse_port`. |
 | `reuse_port` | `reuse_port(self) -> Result[bool, IoError]` | Whether `set_reuse_port` is on. |
+| `set_v6_only` | `set_v6_only(self, on: bool = true) -> Result[unit, IoError]` | Make an IPv6 datagram socket take IPv6 only (`IPV6_V6ONLY`). |
+| `v6_only` | `v6_only(self) -> Result[bool, IoError]` | Whether `set_v6_only` is on. |
 | `close` | `close(self) -> Result[unit, IoError]` | Give the descriptor back now, closing every copy; a second `close` answers `NotOpen` and closes nothing. |
 | `fd` | `fd(self) -> Result[int, IoError]` | The descriptor, lent; see `Socket.fd`. |
 | `into_raw_fd` | `into_raw_fd(self) -> Result[int, IoError]` | The descriptor, given rather than lent; see `Socket.into_raw_fd`. |
@@ -409,12 +413,3 @@ impl Display for UnixAddress
 ```
 
 So that printing one prints the path.
-
-### Drop for SocketState
-
-```sysl
-impl Drop for SocketState
-```
-
-The descriptor closed when the last copy of the socket goes, unless it was already given up. A
-failure is not reported, there being nobody to report it to (`sysl.Drop`).
