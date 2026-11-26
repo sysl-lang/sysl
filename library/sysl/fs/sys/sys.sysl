@@ -88,9 +88,10 @@ const seek_current: int = 1
 const seek_end: int = 2
 
 /** What `sysl_fs_access` is asked: whether anything is at the path at all, or whether the program may
- * read it or write it. They are POSIX's numbers for the same questions.
+ * read it, write it or execute it. They are POSIX's numbers for the same questions.
  */
 const access_exists: int = 0
+const access_execute: int = 1
 const access_write: int = 2
 const access_read: int = 4
 
@@ -254,6 +255,22 @@ private[fs] extern "sysl_fs_fchmod" fchmod(fd: int, mode: u32) -> int
 @needs(os)
 private[fs] extern "sysl_fs_chown" chown(path: *u8, len: usize, owner: u32, group: u32) -> int
 
+/** The owner and group of `path` itself set to `owner` and `group`: a symbolic link is changed and what
+ * it names is not, as POSIX's `lchown`. Anything else at `path` is changed as `sysl_fs_chown` changes
+ * it. The privilege rule is `sysl_fs_chown`'s. A filesystem with no owners answers `UNSUPPORTED`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_lchown" lchown(path: *u8, len: usize, owner: u32, group: u32) -> int
+
+/** The size of the filesystem holding `path` and how much of it is unused, in bytes, written to
+ * `total`, `free` and `available`, answering zero or the failure's code negated. `free` counts every
+ * unused byte; `available` the ones a program not acting as user 0 may take, which is `free` less the
+ * filesystem's reserve. POSIX's `statvfs` gives each as a count of `f_frsize` blocks. A target that
+ * cannot say answers `UNSUPPORTED`.
+ */
+@needs(os)
+private[fs] extern "sysl_fs_space" space(path: *u8, len: usize, total: *u64, free: *u64, available: *u64) -> int
+
 /** The modification time of what `path` names set to `micros` microseconds since the Unix epoch, and
  * its access time with it, following a symbolic link. A filesystem that cannot be told a time answers
  * `UNSUPPORTED`.
@@ -346,6 +363,47 @@ private[fs] extern "sysl_fs_stat_beneath" stat_beneath(dir: int, path: *u8, len:
 /** Removes the name `path` beneath `dir` -- a link there is the link removed, not what it names. */
 @needs(os)
 private[fs] extern "sysl_fs_unlink_beneath" unlink_beneath(dir: int, path: *u8, len: usize) -> int
+
+// -- watching for changes ----------------------------------------------------------------------------
+//
+// What `sysl.fs.watch` is written over: a watcher is the kernel's descriptor -- readable while there
+// is something to read -- and a `handle` the supplier keeps its own state behind, handed back to every
+// other call. A watch is a number the supplier chose, zero or more.
+//
+// **What `watch_read` writes is a run of records**, each a 16-byte head and then its paths' bytes with
+// no terminator: the change as one byte (1 created, 2 removed, 3 modified, 4 renamed, 5 attributes, 6
+// overflow), one byte that is 1 where a second path follows, two zero bytes, the watch's number, and
+// the lengths of the first and the second path -- each of the three a 32-bit little-endian number. A
+// record is written whole or not at all.
+
+/** Makes a watcher watching nothing, answering the descriptor to wait on and writing what the other
+ * calls are handed to `handle`.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_open" watch_open(handle: *usize) -> int
+
+/** Starts watching the file or directory at `path`, answering the watch's number. A path this watcher
+ * already watches -- under that name or another -- answers the watch it has.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_add" watch_add(handle: usize, path: *u8, len: usize) -> int
+
+/** Stops the watch `id`: no event for it is read afterwards. One that is not watched -- never was, was
+ * removed, or ended as what it watched went -- is `ENOENT`.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_remove" watch_remove(handle: usize, id: int) -> int
+
+/** Writes at most `room` bytes of records at `into` without waiting, answering how many bytes, and
+ * writing to `more` one where records are still held for the next call -- zero where it gave them
+ * all. Where not even the first fits it answers the code of `ERANGE`, negated.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_read" watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> isize
+
+/** Closes the watcher's descriptor and lets go of everything behind `handle`. */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_close" watch_close(handle: usize) -> int
 
 // -- words -------------------------------------------------------------------------------------------
 

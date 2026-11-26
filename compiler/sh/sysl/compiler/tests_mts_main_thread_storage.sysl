@@ -345,7 +345,21 @@ mts_only_the_other_domain_checks()
     assert(ir[first.unwrap() + call.bytes.len..<ir.bytes.len].index_of(call).is_none(), ir)
     assert(!mts_body(ir, "@peek(").contains("sysl_on_main_thread"), ir)
     assert(!mts_body(ir, "define i32 @main(").contains("sysl_on_main_thread"), ir)
-    assert(ir.contains("call void @sysl_main_thread_fail(ptr @.loc"), ir)
+    // The failure block is one call to the cold stub and `unreachable`; the stub reports, then stops.
+    assert(ir.contains("main_thread.bad"), ir)
+
+    val site = "  call void @sysl.main_thread.fail(ptr @.loc"
+    val at = ir.index_of(site)
+
+    assert(at.is_some(), ir)
+
+    val after = ir[at.unwrap()..<ir.bytes.len]
+    val line_end = after.index_of("\n").unwrap()
+
+    assert(after[line_end..<after.bytes.len].starts_with("\n  unreachable\n"), ir)
+    assert(ir.contains("define private void @sysl.main_thread.fail(ptr %name) cold noinline noreturn"), ir)
+    assert(ir.contains("  call void @sysl_main_thread_fail(ptr %name)\n  call void @sysl.trap()\n  unreachable\n}"), ir)
+    assert(!mts_body(ir, "define i32 @main(").contains("sysl_main_thread_fail"), ir)
 end mts_only_the_other_domain_checks
 
 @test("storage nothing marked is reached with no check at all")
@@ -376,5 +390,5 @@ mts_another_thread_traps()
         val (state, _, err) = mts_run(mts_program(true), level)
 
         assert_eq(err, "'cell' is @main_thread storage and was reached from another thread\n")
-        assert(state != Status.Exited(0), s"-O$level exited zero")
+        assert(state == Status.Signalled(5), s"-O$level stopped with $state")
 end mts_another_thread_traps

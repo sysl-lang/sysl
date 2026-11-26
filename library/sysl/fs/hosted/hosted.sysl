@@ -69,16 +69,24 @@ private const name_too_long: int = -36
  */
 private const path_room: usize = 4096
 
-/** The path `p` of `n` bytes copied into `into` with a zero after it, which is the shape C wants and
- * a sysl `string` does not carry. False where it does not fit.
+/** `EINVAL`, 22 on every platform: what a path holding a zero byte is answered with, before C is
+ * called -- a terminated copy would end at that byte and name another file.
  */
-private terminated(p: *u8, n: usize, into: []u8) -> bool
-    if n >= into.len then return false
+private const invalid_path: int = -22
 
-    for i in 0..<n do into[i] = p[i]
+/** The path `p` of `n` bytes copied into `into` with a zero after it, which is the shape C wants and
+ * a sysl `string` does not carry. Zero where it was copied; `invalid_path` where a byte of it is zero,
+ * and `name_too_long` where it does not fit.
+ */
+private terminated(p: *u8, n: usize, into: []u8) -> int
+    if n >= into.len then return name_too_long
+
+    for i in 0..<n
+        if p[i] == 0 then return invalid_path
+        into[i] = p[i]
 
     into[n] = 0
-    true
+    0
 end terminated
 
 // -- the C library, by symbol ------------------------------------------------------------------------
@@ -133,6 +141,11 @@ private changed_mode(p: *u8, mode: u32) -> int = c_chmod(p, mode & 0o7777)
 // `mode_t`, so `chown` needs no gate of its own.
 #if posix
 private extern "chown" c_chown(path: *u8, owner: u32, group: u32) -> int
+private extern "lchown" c_lchown(path: *u8, owner: u32, group: u32) -> int
+
+// `struct statvfs` is laid out by each C library and its counts are `fsblkcnt_t`, whose width is the
+// platform's, so the shim beside this file reads one and hands back three byte counts.
+private extern "sysl_fs_host_space" c_space(path: *u8, out: *u64) -> int
 #endif
 
 // `utimensat` takes a pair of `struct timespec`, which is two 64-bit integers on every 64-bit POSIX C
@@ -185,7 +198,9 @@ private extern "sysl_fs_host_page_size" c_page_size() -> usize
 supply_open(path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     val opened = c_open(&c[0], flags, mode)
 
@@ -333,7 +348,9 @@ end supply_page_size
 supply_stat(path: *u8, len: usize, follow: int, out: *Stat) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_stat(&c[0], follow, ptr_cast(out)))
 end supply_stat
@@ -342,7 +359,9 @@ end supply_stat
 supply_truncate(path: *u8, len: usize, length: long) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_truncate(&c[0], length))
 end supply_truncate
@@ -351,7 +370,9 @@ end supply_truncate
 supply_mkdir(path: *u8, len: usize, mode: u32) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(made_dir(&c[0], mode))
 end supply_mkdir
@@ -360,7 +381,9 @@ end supply_mkdir
 supply_rmdir(path: *u8, len: usize) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_rmdir(&c[0]))
 end supply_rmdir
@@ -369,7 +392,9 @@ end supply_rmdir
 supply_unlink(path: *u8, len: usize) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_unlink(&c[0]))
 end supply_unlink
@@ -379,7 +404,11 @@ supply_rename(from: *u8, from_len: usize, to: *u8, to_len: usize) -> int
     var a: [path_room]u8
     var b: [path_room]u8
 
-    if !terminated(from, from_len, a[..]) || !terminated(to, to_len, b[..]) then return name_too_long
+    val bad_from = terminated(from, from_len, a[..])
+    if bad_from != 0 then return bad_from
+
+    val bad_to = terminated(to, to_len, b[..])
+    if bad_to != 0 then return bad_to
 
     status(c_rename(&a[0], &b[0]))
 end supply_rename
@@ -388,7 +417,9 @@ end supply_rename
 supply_access(path: *u8, len: usize, how: int) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_access(&c[0], how))
 end supply_access
@@ -407,7 +438,9 @@ supply_chmod(path: *u8, len: usize, mode: u32) -> int
 #if posix
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(changed_mode(&c[0], mode))
 #else
@@ -420,7 +453,9 @@ supply_chown(path: *u8, len: usize, owner: u32, group: u32) -> int
 #if posix
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_chown(&c[0], owner, group))
 #else
@@ -428,12 +463,51 @@ supply_chown(path: *u8, len: usize, owner: u32, group: u32) -> int
 #endif
 end supply_chown
 
+@export("sysl_fs_lchown")
+supply_lchown(path: *u8, len: usize, owner: u32, group: u32) -> int
+#if posix
+    var c: [path_room]u8
+
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
+
+    status(c_lchown(&c[0], owner, group))
+#else
+    UNSUPPORTED
+#endif
+end supply_lchown
+
+@export("sysl_fs_space")
+supply_space(path: *u8, len: usize, total: *u64, free: *u64, available: *u64) -> int
+#if posix
+    var c: [path_room]u8
+
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
+
+    var out: [3]u64 = [0; 3]
+
+    if c_space(&c[0], &out[0]) != 0 then return failed()
+
+    total[0] = out[0]
+    free[0] = out[1]
+    available[0] = out[2]
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_space
+
 @export("sysl_fs_set_modified")
 supply_set_modified(path: *u8, len: usize, micros: long) -> int
 #if posix
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     var secs = micros / 1000000
     var rest = micros % 1000000
@@ -457,7 +531,9 @@ end supply_set_modified
 supply_opendir(path: *u8, len: usize, dir: *usize) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     val d = c_opendir(&c[0])
 
@@ -515,7 +591,9 @@ end supply_getcwd
 supply_chdir(path: *u8, len: usize) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_chdir(&c[0]))
 end supply_chdir
@@ -525,7 +603,9 @@ supply_temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) ->
 #if posix
     var c: [path_room]u8
 
-    if !terminated(prefix, len, c[..]) then return name_too_long
+    val bad = terminated(prefix, len, c[..])
+
+    if bad != 0 then return bad
 
     val code = c_temp_dir(&c[0], into, room)
 
@@ -549,7 +629,9 @@ end supply_temp_dir
 supply_dir_open(path: *u8, len: usize, fd: *int) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     val opened = c_dir_open(&c[0])
 
@@ -563,7 +645,9 @@ end supply_dir_open
 supply_open_beneath(dir: int, path: *u8, len: usize, flags: u32, mode: u32, fd: *int) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     val opened = c_open_beneath(dir, &c[0], flags, mode)
 
@@ -577,7 +661,9 @@ end supply_open_beneath
 supply_stat_beneath(dir: int, path: *u8, len: usize, out: *Stat) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_stat_beneath(dir, &c[0], ptr_cast(out)))
 end supply_stat_beneath
@@ -586,7 +672,9 @@ end supply_stat_beneath
 supply_unlink_beneath(dir: int, path: *u8, len: usize) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     status(c_unlink_beneath(dir, &c[0]))
 end supply_unlink_beneath
@@ -598,7 +686,11 @@ supply_symlink(target: *u8, target_len: usize, link: *u8, link_len: usize) -> in
     var a: [path_room]u8
     var b: [path_room]u8
 
-    if !terminated(target, target_len, a[..]) || !terminated(link, link_len, b[..]) then return name_too_long
+    val bad_target = terminated(target, target_len, a[..])
+    if bad_target != 0 then return bad_target
+
+    val bad_link = terminated(link, link_len, b[..])
+    if bad_link != 0 then return bad_link
 
     status(c_symlink(&a[0], &b[0]))
 end supply_symlink
@@ -608,8 +700,11 @@ supply_link(existing: *u8, existing_len: usize, fresh: *u8, fresh_len: usize) ->
     var a: [path_room]u8
     var b: [path_room]u8
 
-    if !terminated(existing, existing_len, a[..]) || !terminated(fresh, fresh_len, b[..])
-        return name_too_long
+    val bad_existing = terminated(existing, existing_len, a[..])
+    if bad_existing != 0 then return bad_existing
+
+    val bad_fresh = terminated(fresh, fresh_len, b[..])
+    if bad_fresh != 0 then return bad_fresh
 
     status(c_link(&a[0], &b[0]))
 end supply_link
@@ -618,7 +713,9 @@ end supply_link
 supply_readlink(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     val n = c_readlink(&c[0], into, room)
 
@@ -633,7 +730,9 @@ supply_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> i
 #if posix
     var c: [path_room]u8
 
-    if !terminated(path, len, c[..]) then return name_too_long
+    val bad = terminated(path, len, c[..])
+
+    if bad != 0 then return bad
 
     val n = c_realpath(&c[0], into, u64(room))
 
@@ -645,3 +744,62 @@ supply_realpath(path: *u8, len: usize, into: *u8, room: usize, got: *usize) -> i
     UNSUPPORTED
 #endif
 end supply_realpath
+
+// -- watching for changes ----------------------------------------------------------------------------
+//
+// **The watcher is C, in `__posix__/watch.c`**: kqueue on Darwin and the BSDs, inotify on Linux, and
+// "no such call" on a POSIX system with neither. Each shim answers a count, a number or zero, or an
+// `errno` negated, which the hook here turns into the contract's status.
+
+#if posix
+private extern "sysl_fs_host_watch_open" c_watch_open(handle: *usize) -> int
+private extern "sysl_fs_host_watch_add" c_watch_add(handle: usize, path: *u8, len: usize) -> int
+private extern "sysl_fs_host_watch_remove" c_watch_remove(handle: usize, id: int) -> int
+private extern "sysl_fs_host_watch_read" c_watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> long
+private extern "sysl_fs_host_watch_close" c_watch_close(handle: usize) -> int
+
+/** A shim's answer as a hook's: what it answered, or the failure's status. */
+private watched(k: int) -> int = if k < 0 then host_status(-k) else k
+#endif
+
+@export("sysl_fs_watch_open")
+supply_watch_open(handle: *usize) -> int
+#if posix
+    watched(c_watch_open(handle))
+#else
+    UNSUPPORTED
+#endif
+
+@export("sysl_fs_watch_add")
+supply_watch_add(handle: usize, path: *u8, len: usize) -> int
+#if posix
+    watched(c_watch_add(handle, path, len))
+#else
+    UNSUPPORTED
+#endif
+
+@export("sysl_fs_watch_remove")
+supply_watch_remove(handle: usize, id: int) -> int
+#if posix
+    watched(c_watch_remove(handle, id))
+#else
+    UNSUPPORTED
+#endif
+
+@export("sysl_fs_watch_read")
+supply_watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> isize
+#if posix
+    val k = c_watch_read(handle, into, room, more)
+
+    if k < 0 then isize(host_status(int(-k))) else isize(k)
+#else
+    isize(UNSUPPORTED)
+#endif
+
+@export("sysl_fs_watch_close")
+supply_watch_close(handle: usize) -> int
+#if posix
+    watched(c_watch_close(handle))
+#else
+    UNSUPPORTED
+#endif

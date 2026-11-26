@@ -81,16 +81,22 @@ private pvl_shares(text: string, name: string, want: bool)
     if !pvl_ready() then return
 
     for short in [false, true]
-        force_short_strings(short)
+        pvl_shares_in(text, name, short, want)
 
-        val f = pvl_body(pvl_ir(text, "0"), name)
+// The same, asked with the short form as given.
+private pvl_shares_in(text: string, name: string, short: bool, want: bool)
+    if !pvl_ready() then return
 
-        unforce_short_strings()
-        assert(f.starts_with("define"), f)
-        assert_eq(f.contains("call void @arc.retain_maybe"), want, s"short strings $short:\n$f")
+    force_short_strings(short)
 
-        if !want then assert(!f.contains("call void @arc.release_maybe"), s"short strings $short:\n$f")
-end pvl_shares
+    val f = pvl_body(pvl_ir(text, "0"), name)
+
+    unforce_short_strings()
+    assert(f.starts_with("define"), f)
+    assert_eq(f.contains("call void @arc.retain_maybe"), want, s"short strings $short:\n$f")
+
+    if !want then assert(!f.contains("call void @arc.release_maybe"), s"short strings $short:\n$f")
+end pvl_shares_in
 
 private pvl_run(text: string, level: string, counted: bool, flags: string) -> PvlRun
     val root = make_temp_dir("sysl-pvl").unwrap()
@@ -266,7 +272,8 @@ pvl_other_roots_take_no_share()
     pvl_shares(pvl_accepted(), "fill", false)
     pvl_shares(pvl_accepted(), "peek", false)
 
-// Each body below breaks the rule once; its local keeps its count, and the program still runs clean.
+// Each body below breaks the rule once (`handed` only with the short form on); its local keeps its
+// count, and the program still runs clean.
 // Each is `@pinned(thread)`, so the fiber-switch check lets it hold that count across the switch that
 // keeps the share from being cancelled against its release.
 private pvl_counted() -> string = pvl_drive("""
@@ -345,10 +352,139 @@ pvl_parameter_moves_keeps_share()
     pvl_shares(pvl_counted(), "reassigned", true)
     pvl_shares(pvl_counted(), "whole", true)
 
-@test("a view returned, stored, captured, named in a 'defer', or of bytes handed to a call keeps its share")
+@test("a view returned, stored, captured, or named in a 'defer' keeps its share")
 pvl_local_escapes_keeps_share()
     pvl_shares(pvl_counted(), "returned", true)
     pvl_shares(pvl_counted(), "stored", true)
     pvl_shares(pvl_counted(), "captured", true)
-    pvl_shares(pvl_counted(), "handed", true)
     pvl_shares(pvl_counted(), "deferred", true)
+
+@test("a string parameter's bytes handed to a call keep their share only with the short form on")
+pvl_bytes_handed_shares_only_short()
+    pvl_shares_in(pvl_counted(), "handed", false, false)
+    pvl_shares_in(pvl_counted(), "handed", true, true)
+
+// A string parameter's bytes, or a cut's, handed to a call -- avin's `viaString`, the view dead after
+// the call or read after the switch -- and the shapes that keep their count whatever the form: the
+// bytes of a string field behind a `&T`, and of a parameter the body reassigns. Each is
+// `@pinned(thread)`, as the short form on keeps a count the fiber-switch check would refuse.
+private pvl_bytes_handed() -> string = pvl_drive("""
+    struct Named
+        name: string
+
+    measure(b: []const u8) -> usize = b.len
+
+    first(b: []const u8) -> usize = usize(b[0])
+
+    @pinned(thread)
+    via_string(s: string) -> usize
+        val said = s.bytes
+        val n = first(said) + measure(said)
+        park()
+        n
+
+    @pinned(thread)
+    read_after(s: string) -> usize
+        val said = s.bytes
+        val n = measure(said)
+        park()
+        n + measure(said)
+
+    @pinned(thread)
+    cut_handed(s: string) -> usize
+        val c = s[1..<3].bytes
+        park()
+        measure(c)
+
+    gen[T](b: []const T) -> usize = b.len
+
+    @pinned(thread)
+    generic_handed(s: string) -> usize
+        val said = s.bytes
+        park()
+        gen(said)
+
+    @pinned(thread)
+    method_handed(s: string) -> usize
+        val said = s.bytes
+        park()
+        if said.starts_with(said[0..<2]) then 1 else 0
+
+    @pinned(thread)
+    walked_handed(s: string) -> usize
+        val said = s.bytes
+        var n: usize = 0
+
+        for c in said
+            n += measure(said[0..<1]) + usize(c) % 2
+            park()
+
+        n
+
+    @pinned(thread)
+    sliced_handed(s: string) -> usize
+        val said = s.bytes
+        val part = said[1..<3]
+        park()
+        measure(part) + measure(said)
+
+    @pinned(thread)
+    looped_handed(s: string) -> usize
+        var n: usize = 0
+
+        for _ in 0..<3
+            val said = s.bytes
+            n += measure(said)
+            park()
+
+        n
+
+    @pinned(thread)
+    field_bytes(h: &Named) -> usize
+        val b = h.name.bytes
+        park()
+        measure(b)
+
+    @pinned(thread)
+    reassigned_bytes(s: string, t: string) -> usize
+        val b = s.bytes
+        park()
+        s = t
+        measure(b) + s.len
+
+    @pinned(thread)
+    work()
+        val text = "pi" + "ng! and more than fifteen bytes"
+        val h: &Named = Named("na" + "me")
+
+        print(via_string(text))
+        print(via_string("pi" + "ng"))
+        print(read_after(text))
+        print(read_after("pi" + "ng"))
+        print(cut_handed(text))
+        print(cut_handed("pi" + "ng"))
+        print(generic_handed(text))
+        print(method_handed("pi" + "ng"))
+        print(walked_handed("pi" + "ng"))
+        print(sliced_handed(text))
+        print(looped_handed("pi" + "ng"))
+        print(field_bytes(h))
+        print(reassigned_bytes(text, "ab"))
+        print(reassigned_bytes("pi" + "ng", "ab"))
+    """)
+
+@test("a string parameter's bytes handed to a call, held across real switches, run clean, short strings off and on")
+pvl_bytes_handed_runs()
+    pvl_prints(pvl_bytes_handed(), "145\n116\n66\n8\n2\n2\n33\n1\n6\n35\n12\n4\n35\n6\n")
+
+@test("a string parameter's bytes, or a cut's, handed to a call take no share with the short form off")
+pvl_bytes_handed_take_no_share()
+    for name in ["via_string", "read_after", "cut_handed", "generic_handed", "method_handed", "walked_handed",
+                 "sliced_handed", "looped_handed"]
+        pvl_shares_in(pvl_bytes_handed(), name, false, false)
+        pvl_shares_in(pvl_bytes_handed(), name, true, true)
+
+@test("the bytes of a string field behind a '&T', or of a reassigned string parameter, keep their share")
+pvl_bytes_field_or_reassigned_keeps_share()
+    pvl_shares(pvl_bytes_handed(), "field_bytes", true)
+    pvl_shares(pvl_bytes_handed(), "reassigned_bytes", true)
