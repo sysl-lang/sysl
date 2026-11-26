@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { os }"
 
 ## Index
 
-[`supply_access`](#supply_access) [`supply_advise`](#supply_advise) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_dir_open`](#supply_dir_open) [`supply_fchmod`](#supply_fchmod) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_full_sync`](#supply_full_sync) [`supply_getcwd`](#supply_getcwd) [`supply_link`](#supply_link) [`supply_map`](#supply_map) [`supply_map_shared`](#supply_map_shared) [`supply_mkdir`](#supply_mkdir) [`supply_msync`](#supply_msync) [`supply_open`](#supply_open) [`supply_open_beneath`](#supply_open_beneath) [`supply_opendir`](#supply_opendir) [`supply_page_size`](#supply_page_size) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_stat`](#supply_stat) [`supply_stat_beneath`](#supply_stat_beneath) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_sync_data`](#supply_sync_data) [`supply_temp_dir`](#supply_temp_dir) [`supply_temp_file`](#supply_temp_file) [`supply_temp_root`](#supply_temp_root) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unlink_beneath`](#supply_unlink_beneath) [`supply_unmap`](#supply_unmap) [`supply_write`](#supply_write)
+[`supply_access`](#supply_access) [`supply_advise`](#supply_advise) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_dir_open`](#supply_dir_open) [`supply_fchmod`](#supply_fchmod) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_full_sync`](#supply_full_sync) [`supply_getcwd`](#supply_getcwd) [`supply_lchown`](#supply_lchown) [`supply_link`](#supply_link) [`supply_map`](#supply_map) [`supply_map_shared`](#supply_map_shared) [`supply_mkdir`](#supply_mkdir) [`supply_msync`](#supply_msync) [`supply_open`](#supply_open) [`supply_open_beneath`](#supply_open_beneath) [`supply_opendir`](#supply_opendir) [`supply_page_size`](#supply_page_size) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_space`](#supply_space) [`supply_stat`](#supply_stat) [`supply_stat_beneath`](#supply_stat_beneath) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_sync_data`](#supply_sync_data) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unlink_beneath`](#supply_unlink_beneath) [`supply_unmap`](#supply_unmap) [`supply_write`](#supply_write)
 
 ## Functions
 
@@ -89,6 +89,12 @@ supply_full_sync(fd: int) -> int
 
 ```sysl
 supply_getcwd(into: *u8, room: usize, got: *usize) -> int
+```
+
+### `supply_lchown`
+
+```sysl
+supply_lchown(path: *u8, len: usize, owner: u32, group: u32) -> int
 ```
 
 ### `supply_link`
@@ -205,6 +211,12 @@ supply_seek(fd: int, offset: long, whence: int, at: *long) -> int
 supply_set_modified(path: *u8, len: usize, micros: long) -> int
 ```
 
+### `supply_space`
+
+```sysl
+supply_space(path: *u8, len: usize, total: *u64, free: *u64, available: *u64) -> int
+```
+
 ### `supply_stat`
 
 ```sysl
@@ -239,18 +251,6 @@ supply_sync_data(fd: int) -> int
 
 ```sysl
 supply_temp_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int
-```
-
-### `supply_temp_file`
-
-```sysl
-supply_temp_file(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize, fd: *int) -> int
-```
-
-### `supply_temp_root`
-
-```sysl
-supply_temp_root(into: *u8, room: usize, got: *usize) -> int
 ```
 
 ### `supply_truncate`

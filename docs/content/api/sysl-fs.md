@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`symlink`](#symlink) [`temp_dir`](#temp_dir) [`temp_file`](#temp_file) [`temp_root`](#temp_root) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Functions
 
@@ -217,6 +217,18 @@ make, on a filesystem that stores whatever bytes it was given. It never answers 
 caller decodes each name itself with `sysl.text.from_utf8`, and decides what a name that does not
 decode should become. The bytes are a copy, so they outlive the listing.
 
+### `executable`
+
+```sysl
+executable(path: string) -> bool
+```
+
+Whether this program may execute what `path` names, as POSIX's `access` with `X_OK` answers it for
+the program's own user and groups. It is the system's answer rather than the bits', so it can differ
+from `Meta.executable`: a file whose only execute bit is another user's answers `false` here, and on
+a directory it is whether the program may search it. A program acting as user 0 may execute a file
+with any execute bit set. A path that is not there answers `false`.
+
 ### `exists`
 
 ```sysl
@@ -355,7 +367,16 @@ file) reports `AlreadyExists`. Neither is silently accepted.
 make_temp_dir(prefix: string) -> Result[string, IoError]
 ```
 
-`temp_dir` under the name it had first; the two are one call.
+A directory that did not exist a moment ago and that nobody else can take, made inside whatever
+`TMPDIR` names -- or `/tmp` where it names nothing.
+
+**It is created, not merely named**, which is the whole point: inventing a path and then making it
+leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
+somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
+not what makes the name unique.
+
+**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
+a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
 
 ### `map_file`
 
@@ -606,6 +627,18 @@ in the program, and puts it back only if it remembers to.
 Prefer building an absolute path. This exists because a program that drives a build, or that is
 the shell-like thing at the top, genuinely needs it.
 
+### `set_link_owner`
+
+```sysl
+set_link_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError]
+```
+
+The owner and group of `path` **itself** set to `owner` and `group`, as `lchown(2)`: a symbolic link
+is given the ids and what it names keeps its own, which is the writing half of `link_metadata`'s
+reading. Anything at `path` that is not a link is changed exactly as `set_owner` changes it, with
+`set_owner`'s privilege rule: giving it away is `NotPermitted` to a program not acting as user 0. A
+path that is not there is `NotFound`; a target whose filesystem has no owners reports `unsupported()`.
+
 ### `set_modified`
 
 ```sysl
@@ -654,6 +687,20 @@ How many bytes the file holds. It opens the file to ask, so it reports the same 
 does -- a missing file answers `NotFound` rather than zero, which is the distinction a caller
 sizing a buffer needs and the one a bare number could not carry.
 
+### `space`
+
+```sysl
+space(path: string) -> Result[Space, IoError]
+```
+
+The size and the unused bytes of the filesystem that holds `path`, which may name a file or a
+directory anywhere on it and is followed through a symbolic link. Each number is a block count of
+POSIX's `statvfs` times its fragment size, `f_frsize`, which is the unit those counts are in.
+
+**It is a reading, not a reservation**: another program can take what was free before the next write
+lands, so a program that must not run out still handles the write's own `NoSpaceLeft`. A
+path that is not there is `NotFound`; a target that cannot say reports `unsupported()`.
+
 ### `symlink`
 
 ```sysl
@@ -667,69 +714,6 @@ and is sometimes the point -- a package manager writes one before what it names 
 unpacked. It is also stored **as written**: a relative target is resolved against the directory
 the link is in, every time it is followed, rather than against wherever the program was when it
 made the link.
-
-### `temp_dir`
-
-```sysl
-temp_dir(prefix: string = "") -> Result[string, IoError]
-```
-
-A directory that did not exist a moment ago and that nobody else can take, made with mode `0700`
-inside `temp_root()`. Its name is `prefix` followed by six characters chosen to make it unique.
-
-**It is created, not merely named**, which is the whole point: inventing a path and then making it
-leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
-somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
-not what makes the name unique.
-
-**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
-a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
-
-A root that is not there answers `NotFound`, and one this process may not write in
-`PermissionDenied`.
-
-### `temp_file`
-
-```sysl
-temp_file(prefix: string = "") -> Result[(File, string), IoError]
-```
-
-A regular file that did not exist a moment ago and that nobody else can take, made inside
-`temp_root()` and answered open for reading and writing, with its path. Its name is `prefix`
-followed by six characters chosen to make it unique.
-
-**It is created and opened in one step** -- `O_CREAT | O_EXCL`, as `mkstemp` does -- **with mode
-`0600`**, so there is no moment at which the name is somebody else's file or is readable by
-anyone but this user. Naming a file and then `create`-ing it would be the race `temp_dir`
-describes, with the added hazard that `create` follows a symbolic link somebody planted at the
-name. The process umask can narrow the mode further and never widens it.
-
-The `File` closes when the last copy of it goes, like any other. **The file itself stays**:
-removing it is the caller's, and `defer remove_file(p)` is the idiom -- written after the binding,
-so it runs after the `File` is closed or dropped.
-
-A root that is not there answers `NotFound`, and one this process may not write in
-`PermissionDenied`.
-
-### `temp_root`
-
-```sysl
-temp_root() -> string
-```
-
-The directory temporary files go in, which `temp_dir` and `temp_file` make things inside.
-
-**The rule, in order:** `TMPDIR` where it is set and not empty; otherwise, on macOS, the per-user
-directory `confstr(_CS_DARWIN_USER_TEMP_DIR)` names (`/var/folders/…/T`), which is where Apple's
-own `NSTemporaryDirectory` points and which only this user can write in; otherwise `/tmp`.
-Trailing slashes are dropped, so `s"${temp_root()}/name"` is the path the system will report back;
-`/` itself stays `/`.
-
-It is read afresh at every call rather than once, so a program that sets `TMPDIR` for itself is
-answered with what it set. It is not checked: a `TMPDIR` naming nothing is answered as it is, and
-the failure is `temp_dir`'s or `temp_file`'s, where there is something to fail. A target whose
-hooks cannot answer, and a root whose name is not UTF-8 and so cannot be a `string`, are answered
-`/tmp`; `temp_dir` and `temp_file` report the second as `InvalidUtf8` and leave nothing behind.
 
 ### `truncate`
 
@@ -1098,7 +1082,24 @@ the library's resolution everywhere and is finer than any filesystem here record
 | `is_file` | `is_file(self) -> bool` |  |
 | `is_dir` | `is_dir(self) -> bool` |  |
 | `is_link` | `is_link(self) -> bool` | Whether the entry **itself** is a symbolic link, which only `link_metadata` can ever answer `true` to: `metadata` follows links, so what it describes is never one. |
+| `executable` | `executable(self) -> bool` | Whether the entry is a regular file with any of its three execute bits set -- the owner's, the group's or everyone else's. |
 | `same_file` | `same_file(self, other: Meta) -> bool` | Whether two readings name the same file, which is the inode and the device together and is not the path. |
+
+### `Space`
+
+```sysl
+struct Space
+    total: u64
+    free: u64
+    available: u64
+```
+
+How big a filesystem is and how much of it is unused, in bytes -- one `statvfs` reading.
+
+**`free` and `available` are two answers because a filesystem keeps a reserve**: `free` is every
+unused byte, and `available` is the part of it a program not acting as user 0 may take, which is
+the one a program checking whether its write will fit compares against. So `available <= free <=
+total` on every filesystem, and the two are equal where nothing is held back.
 
 ### `Walk`
 

@@ -134,6 +134,11 @@ private changed_mode(p: *u8, mode: u32) -> int = c_chmod(p, mode & 0o7777)
 // `mode_t`, so `chown` needs no gate of its own.
 #if posix
 private extern "chown" c_chown(path: *u8, owner: u32, group: u32) -> int
+private extern "lchown" c_lchown(path: *u8, owner: u32, group: u32) -> int
+
+// `struct statvfs` is laid out by each C library and its counts are `fsblkcnt_t`, whose width is the
+// platform's, so the shim beside this file reads one and hands back three byte counts.
+private extern "sysl_fs_host_space" c_space(path: *u8, out: *u64) -> int
 #endif
 
 // `utimensat` takes a pair of `struct timespec`, which is two 64-bit integers on every 64-bit POSIX C
@@ -430,6 +435,39 @@ supply_chown(path: *u8, len: usize, owner: u32, group: u32) -> int
     UNSUPPORTED
 #endif
 end supply_chown
+
+@export("sysl_fs_lchown")
+supply_lchown(path: *u8, len: usize, owner: u32, group: u32) -> int
+#if posix
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    status(c_lchown(&c[0], owner, group))
+#else
+    UNSUPPORTED
+#endif
+end supply_lchown
+
+@export("sysl_fs_space")
+supply_space(path: *u8, len: usize, total: *u64, free: *u64, available: *u64) -> int
+#if posix
+    var c: [path_room]u8
+
+    if !terminated(path, len, c[..]) then return name_too_long
+
+    var out: [3]u64 = [0; 3]
+
+    if c_space(&c[0], &out[0]) != 0 then return failed()
+
+    total[0] = out[0]
+    free[0] = out[1]
+    available[0] = out[2]
+    0
+#else
+    UNSUPPORTED
+#endif
+end supply_space
 
 @export("sysl_fs_set_modified")
 supply_set_modified(path: *u8, len: usize, micros: long) -> int
