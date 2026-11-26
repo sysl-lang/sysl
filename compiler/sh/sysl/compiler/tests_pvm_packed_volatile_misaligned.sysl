@@ -1,0 +1,251 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+
+// **A volatile value off its type's boundary is refused** (`volatile_offset.sysl`; `reference/attributes.md
+// § @packed`). A volatile access is one access of its width -- one `ldr`/`str` on ARM -- and `@packed`
+// is what puts a field at an offset that is not a multiple of its alignment, where that access faults
+// on an M0+ always and on any core's device memory. The offset is counted from the start of the struct
+// whose field is selected, through every struct and array holding the value there by value.
+//
+// The axes: where the misplacement comes from (the field's own offset; a packed struct held in a packed
+// one; an ordinary struct held in a packed one; a packed struct held in an ordinary one; an array's
+// first element; an array's second element, a stride on), what is volatile (a scalar, an array of them, a
+// bitfield struct's container, a C bitfield's unit), how it is reached (a read, a write, through a
+// method, through a generic instantiation), and the target (ptr16, ptr32 and ptr64, where a `usize`'s
+// alignment differs). The controls: the same shapes on their boundaries are accepted, and an ordinary
+// field at the same misaligned offset is accepted.
+//
+// Skipped cells, and why: a union's fields all begin at its first byte, so its own field is never off a
+// boundary (held in a packed struct it is the nested-struct cell); a field reached through an anonymous
+// member takes the same check on the member that holds it, which the nested cells exercise; a top-level
+// array of packed structs is not a struct's field, and the offset is counted from the struct selected.
+
+private var pvm_libraries: Map[string, Buf[Program]] = map()
+
+// The standard library's units for the target, read once each.
+private pvm_library(t: Target) -> Buf[Program]
+    pvm_libraries.get(t.name) match
+        Some(units) -> return units
+        None -> ()
+
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    pvm_libraries.put(t.name, out)
+    out
+end pvm_library
+
+// Every message analysing `text` for `machine` gives, one to a line; `""` where it is accepted.
+private pvm_said(machine: string, text: string) -> Option[string]
+    val t = target_named(machine).unwrap()
+    val library = pvm_library(t)
+
+    if library.is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+    end if
+
+    var units: Buf[Program] = buf()
+
+    for item in library
+        units.push(item)
+
+    val parsed = parse(source_of("main.sysl", text))
+
+    if !parsed.ok() then return Some(parsed.report.at(0).message)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, t)
+    var said = ""
+
+    for item in done.reported
+        said = said + item.diag.message + "\n"
+
+    Some(said)
+end pvm_said
+
+// The module `text` lowers to for `machine`, read with every volatile access as the `load volatile` /
+// `store volatile` its `asm` stands for.
+private pvm_ir(machine: string, text: string) -> Option[string]
+    val t = target_named(machine).unwrap()
+    val library = pvm_library(t)
+
+    if library.is_empty() then return None
+
+    var units: Buf[Program] = buf()
+
+    for item in library
+        units.push(item)
+
+    units.push(parse(source_of("main.sysl", text)).program)
+
+    val done = analyze_bodies(units, t)
+
+    assert(done.reported.is_empty(), if done.reported.is_empty() then "" else done.reported[0].diag.message)
+
+    val whole = program_of(done, "")
+    val promotions = post_analysis_checks(done.an, whole, buf())
+    val kept = prune(strip_tests(whole), program_own(units))
+
+    Some(volatile_as_llvm(ir_print_module(codegen_with_gaps(kept, t, promotions).0)))
+end pvm_ir
+
+private pvm_accepted(machine: string, text: string)
+    pvm_said(machine, text) match
+        Some(said) -> assert_eq(said, "", s"$machine:\n$text")
+        None -> ()
+
+private pvm_refused(machine: string, text: string, message: string)
+    pvm_said(machine, text) match
+        Some(said) -> assert_eq(said, message + "\n", s"$machine:\n$text")
+        None -> ()
+
+// What the refusal says of the volatile `ty` at `path` in `owner`, `offset` bytes in, needing `align`.
+private pvm_message(owner: string, path: string, ty: string, offset: int, align: int) -> string =
+    s"'$owner.$path' is a 'volatile' $ty at byte $offset of $owner, which is misaligned: $offset is not a " +
+        s"multiple of $align, a $ty's alignment on this target. A volatile access is exactly one access of " +
+        s"its width, and one off that boundary faults on device memory — place it at a multiple of $align " +
+        s"bytes from the start of $owner"
+
+private val pvm_reg: string = "@packed\nstruct Reg\n    tag: u8\n    word: volatile u32\n"
+
+@test("a volatile u32 at byte 1 of a @packed struct is refused where it is read")
+pvm_misaligned_read_refused()
+    for machine in ["aarch64-freestanding", "thumb-freestanding", "thumbv6m-freestanding", "x86_64-freestanding"]
+        pvm_refused(machine, pvm_reg + "@export(\"get\")\nget(r: *Reg) -> u32 = r.word\n",
+                    pvm_message("Reg", "word", "uint", 1, 4))
+
+@test("and where it is written, and through a method")
+pvm_misaligned_write_and_method_refused()
+    pvm_refused("aarch64-freestanding", pvm_reg + "@export(\"put\")\nput(r: *Reg)\n    r.word = 1\n",
+                pvm_message("Reg", "word", "uint", 1, 4))
+    pvm_refused("aarch64-freestanding",
+                pvm_reg + "impl Reg\n    get(*self) -> u32 = self.word\n@export(\"go\")\ngo(r: *Reg) -> u32 = r.get()\n",
+                pvm_message("Reg", "word", "uint", 1, 4))
+
+@test("the same field on its boundary is accepted, and is one access of its width")
+pvm_aligned_accepted()
+    val text = "@packed\nstruct Reg\n    tag: u8\n    pad: [3]u8\n    word: volatile u32\n" +
+        "@export(\"get\")\nget(r: *Reg) -> u32\n    r.word = 1\n    r.word\n"
+
+    for machine in ["aarch64-freestanding", "thumb-freestanding", "thumbv6m-freestanding"]
+        pvm_accepted(machine, text)
+
+    pvm_ir("aarch64-freestanding", text) match
+        Some(ir) ->
+            assert(ir.contains("load volatile i32"), ir)
+            assert(ir.contains("store volatile i32"), ir)
+        None -> ()
+
+@test("an ordinary field at the same offset is accepted")
+pvm_plain_misaligned_accepted()
+    pvm_accepted("thumbv6m-freestanding",
+                 "@packed\nstruct Head\n    tag: u8\n    len: u32\n@export(\"get\")\nget(h: *Head) -> u32\n" +
+                 "    h.len = 2\n    h.len\n")
+
+    // And so is a volatile byte, whose boundary is every byte.
+    pvm_accepted("thumbv6m-freestanding",
+                 "@packed\nstruct Head\n    tag: u8\n    b: volatile u8\n@export(\"get\")\nget(h: *Head) -> u8 = h.b\n")
+
+private val pvm_inner: string = "@packed\nstruct Inner\n    tag: u8\n    pad: [3]u8\n    w: volatile u32\n"
+
+@test("a packed struct held in a packed struct counts its offset from the outer one's start")
+pvm_nested_packed_in_packed()
+    // On its own, `w` is at byte 4 of Inner; one byte into Outer it is at byte 5.
+    pvm_accepted("aarch64-freestanding", pvm_inner + "@export(\"get\")\nget(i: *Inner) -> u32 = i.w\n")
+    pvm_refused("aarch64-freestanding",
+                pvm_inner + "@packed\nstruct Outer\n    tag: u8\n    inner: Inner\n" +
+                "@export(\"get\")\nget(o: *Outer) -> u32 = o.inner.w\n",
+                pvm_message("Outer", "inner.w", "uint", 5, 4))
+    pvm_accepted("aarch64-freestanding",
+                 pvm_inner + "@packed\nstruct Outer\n    tag: u32\n    inner: Inner\n" +
+                 "@export(\"get\")\nget(o: *Outer) -> u32 = o.inner.w\n")
+
+@test("so does an ordinary struct held in a packed one, and a packed one held in an ordinary one")
+pvm_nested_either_way()
+    pvm_refused("aarch64-freestanding",
+                "struct Regs\n    word: volatile u32\n@packed\nstruct Holds\n    tag: u8\n    r: Regs\n" +
+                "@export(\"get\")\nget(h: *Holds) -> u32 = h.r.word\n",
+                pvm_message("Holds", "r.word", "uint", 1, 4))
+    // A packed struct needs no alignment of its own, so an ordinary struct puts it at byte 1.
+    pvm_refused("aarch64-freestanding",
+                "@packed\nstruct Dev\n    w: volatile u32\nstruct Board\n    tag: u8\n    dev: Dev\n" +
+                "@export(\"get\")\nget(b: *Board) -> u32 = b.dev.w\n",
+                pvm_message("Board", "dev.w", "uint", 1, 4))
+
+@test("an array of volatiles is refused where its first element is off the boundary")
+pvm_array_of_volatiles()
+    pvm_refused("aarch64-freestanding",
+                "@packed\nstruct Bank\n    tag: u8\n    regs: [2]volatile u32\n" +
+                "@export(\"get\")\nget(b: *Bank) -> u32 = b.regs[1]\n",
+                pvm_message("Bank", "regs[0]", "uint", 1, 4))
+    pvm_accepted("aarch64-freestanding",
+                 "@packed\nstruct Bank\n    tag: u32\n    regs: [2]volatile u32\n" +
+                 "@export(\"get\")\nget(b: *Bank) -> u32 = b.regs[1]\n")
+
+@test("and an array of packed structs where the second element is, a stride on")
+pvm_array_stride()
+    val e = "@packed\nstruct E\n    w: volatile u32\n    b: u8\n"
+
+    pvm_refused("aarch64-freestanding",
+                e + "@packed\nstruct Bank\n    es: [2]E\n@export(\"get\")\nget(b: *Bank) -> u32 = b.es[0].w\n",
+                pvm_message("Bank", "es[1].w", "uint", 5, 4))
+    pvm_accepted("aarch64-freestanding",
+                 e + "@packed\nstruct Bank\n    es: [1]E\n@export(\"get\")\nget(b: *Bank) -> u32 = b.es[0].w\n")
+
+@test("a volatile bitfield struct is one container, and held off the container's boundary it is refused")
+pvm_bitfield_struct_field()
+    val ctrl = "@packed\nstruct Ctrl\n    en: volatile u1\n    mode: volatile u15\n"
+
+    pvm_accepted("aarch64-freestanding", ctrl + "@export(\"get\")\nget(c: *Ctrl) -> u16 = u16(c.mode)\n")
+    pvm_refused("aarch64-freestanding",
+                ctrl + "@packed\nstruct Dev\n    tag: u8\n    ctrl: Ctrl\n" +
+                "@export(\"get\")\nget(d: *Dev) -> u16 = u16(d.ctrl.mode)\n",
+                pvm_message("Dev", "ctrl", "ushort", 1, 2))
+
+@test("a volatile C bitfield's unit is on its boundary in its struct, and held one byte on it is not")
+pvm_c_bitfield_unit()
+    val cb = "struct Cb\n    x: u4 in u16\n    y: volatile u8 in u16\n"
+
+    pvm_accepted("aarch64-freestanding", cb + "@export(\"get\")\nget(c: *Cb) -> u16 = u16(c.y)\n")
+    pvm_refused("aarch64-freestanding",
+                cb + "@packed\nstruct Dev\n    tag: u8\n    cb: Cb\n@export(\"get\")\nget(d: *Dev) -> u16 = u16(d.cb.y)\n",
+                pvm_message("Dev", "cb.y", "ushort", 1, 2))
+
+private val pvm_generic: string = "@packed\nstruct P[T: Integer]\n    tag: u8\n    w: volatile T\n"
+
+@test("a generic @packed struct is refused at the instantiation that puts its field off the boundary")
+pvm_generic_instantiation()
+    pvm_accepted("aarch64-freestanding", pvm_generic + "@export(\"get\")\nget(p: *P[u8]) -> u8 = p.w\n")
+    pvm_refused("aarch64-freestanding", pvm_generic + "@export(\"get\")\nget(p: *P[u32]) -> u32 = p.w\n",
+                pvm_message("P[uint]", "w", "uint", 1, 4))
+
+    // And so is a generic function's body, at the instantiation that reaches it.
+    val f = pvm_generic + "read[T: Integer](p: *P[T]) -> T = p.w\n"
+
+    pvm_accepted("aarch64-freestanding", f + "@export(\"get\")\nget(p: *P[u8]) -> u8 = read(p)\n")
+    pvm_refused("aarch64-freestanding", f + "@export(\"get\")\nget(p: *P[u32]) -> u32 = read(p)\n",
+                pvm_message("P[uint]", "w", "uint", 1, 4))
+
+@test("a usize's alignment is the target's: at byte 4 only ptr64 refuses it, at byte 2 only ptr16 keeps it")
+pvm_pointer_widths()
+    val at4 = "@packed\nstruct W\n    a: u32\n    p: volatile usize\n@export(\"get\")\nget(w: *W) -> usize = w.p\n"
+    val at2 = "@packed\nstruct W\n    a: u16\n    p: volatile usize\n@export(\"get\")\nget(w: *W) -> usize = w.p\n"
+
+    pvm_refused("aarch64-freestanding", at4, pvm_message("W", "p", "usize", 4, 8))
+    pvm_accepted("thumb-freestanding", at4)
+    pvm_accepted("craft-freestanding", at4)
+
+    pvm_refused("aarch64-freestanding", at2, pvm_message("W", "p", "usize", 2, 8))
+    pvm_refused("thumb-freestanding", at2, pvm_message("W", "p", "usize", 2, 4))
+    pvm_accepted("craft-freestanding", at2)

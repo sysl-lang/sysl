@@ -1,0 +1,605 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.container.{Map, map}
+import sysl.fs.{make_temp_dir, read_text, remove_dir_all}
+import sysl.text.{split, Search}
+
+// `--explain-checks`: which of the run-time checks the lowering laid down are still in the program
+// once LLVM has optimized it -- where each was written, what it checks, the function it survives in,
+// and, where the compiler can tell, why it was not taken out.
+//
+// **A check is known by its location record, never by the call that reports it.** Every check names
+// where it was written with the address of a constant `file:line:column` text (`bounds_fail.sysl`'s
+// `check_site`), and a check LLVM removes takes its failure block with it, and with the block the one
+// operand that named the record. So "which checks survive" is "which records does the optimized text
+// still name, and in which function's body". What the failure block calls, and with what else, does
+// not enter into it: a record that is an operand of anything at all in a body is a check that
+// survives there -- the call to a shared stub, a phi LLVM sank two failure calls into, a call into a
+// `@track_caller` body that was not inlined.
+//
+// **Under the flag each check gets a record of its own.** An ordinary build lays down one record per
+// place and every check written there shares it; two checks at one place -- an index's sign and its
+// length, a division's zero and its overflow -- could then not be told apart. The text of a record is
+// the same either way, so the program prints exactly what it did; only the number of constants
+// differs. **Without locations there is nothing to key on** (`--no-bounds-locations`), and the report
+// says so rather than listing nothing.
+//
+// **The ledger is filled as the program is lowered**: for each record, the check's kind, where it was
+// written, the function it was written in and -- for a subscript -- what the hoist in front of
+// counted loops (`bounds_hoist.sysl`) made of it. It is armed only for the lowering of the program a
+// command builds (`emit_llvm_text`), never for the standard module's artifact or a second lowering
+// made to answer another question.
+//
+// **The optimized text is the one the build makes**: the program's text at the build's level, cut
+// into the same codegen units the build cuts it into (`codegen_units.sysl`), each compiled by clang to
+// LLVM text rather than an object. At `-O0` nothing is optimized, so the lowered text itself is read
+// and every check survives. Under `--lto` the link optimizes once more, which this cannot see.
+
+// One check the lowering laid down: the record it names, what it checks, where it was written and in
+// which function, why the hoist left it (for a subscript), and -- for a call into a `@track_caller`
+// body -- the symbol called, whose surviving call means the check is made inside it.
+struct CheckRecord
+    record: string
+    kind: string
+    file: string
+    line: usize
+    col: usize
+    func: string
+    why: string
+    callee: string
+
+// What the hoist made of one counted loop whose body is being lowered: the function and line it is
+// in, why the whole loop was refused (or nothing), why each subscript it could not prove was refused,
+// the subscripts it proved, and whether the copy being lowered is the one as written.
+struct HoistLoop
+    func: string
+    line: usize
+    refused: string
+    subs: Map[usize, string]
+    plan: Map[usize, bool]
+    checked: bool
+
+private var xc_armed: bool = false
+private var xc_records: Buf[CheckRecord] = buf()
+private var xc_loops: Buf[&HoistLoop] = buf()
+private var xc_pending: string = ""
+
+// -- the ledger ------------------------------------------------------------------------------------
+
+// Arms the ledger for the lowering about to run, emptied, or leaves it off.
+arm_check_ledger(on: bool)
+    xc_armed = on
+    xc_records = buf()
+    xc_loops = buf()
+    xc_pending = ""
+end arm_check_ledger
+
+// Stops recording, keeping what was recorded for the report.
+disarm_check_ledger()
+    xc_armed = false
+
+// Whether the lowering being run records its checks.
+check_ledger_armed() -> bool = xc_armed
+
+// The checks the last armed lowering recorded.
+check_ledger() -> Buf[CheckRecord] = xc_records
+
+// Records one check under the record `record`. A subscript's check takes the reason its subscript
+// was given (`subscript_open`).
+note_check(record: string, kind: string, file: string, line: usize, col: usize, func: string,
+           callee: string)
+    xc_records.push(CheckRecord(record, kind, file, line, col, func, xc_pending, callee))
+
+// The key of the function whose body is being lowered, or nothing outside one.
+lowered_func(e: *Emit) -> string = e.body_func match
+    Some(f) -> f.name
+    None -> ""
+
+// What each form of a failed bounds check (`bounds_fail.sysl`'s `Bounds*`) is called in the report.
+bounds_form_kind(form: int) -> string = (form % 256) match
+    0 -> "bounds (index)"
+    1 -> "bounds (range)"
+    2 -> "bounds (range)"
+    3 -> "bounds (range start past its end)"
+    4 -> "bounds (range start past its end)"
+    5 -> "bounds (range start past the length)"
+    6 -> "bounds (range start inside a character)"
+    7 -> "bounds (range end inside a character)"
+    8 -> "bounds (index wider than usize)"
+    9 -> "bounds (run)"
+    10 -> "bounds (count wider than usize)"
+    11 -> "enum value"
+    12 -> "variant"
+    13 -> "bounds (negative index)"
+    14 -> "bounds (insertion index)"
+    15 -> "partial value"
+    16 -> "overflow"
+    _ -> "check"
+
+// What a check `trap_unless` makes is called, by the word it labels its blocks with and the sentence
+// it fails with.
+check_word_kind(what: string, said: string) -> string
+    if what == "div" then return "division by zero"
+
+    val family = what match
+        "variant" -> "contract"
+        "within" -> "range"
+        "succ" -> "range"
+        "pred" -> "range"
+        "where" -> "predicate"
+        "overflow" -> "overflow"
+        "alloc" -> "allocation"
+        "size" -> "allocation"
+        "slot" -> "bounds"
+        "bounds" -> "bounds"
+        "view_align" -> "bounds"
+        "view_tail" -> "bounds"
+        "char" -> "conversion"
+        "enum" -> "conversion"
+        "val" -> "conversion"
+        "value" -> "conversion"
+        "union" -> "conversion"
+        "c_string" -> "conversion"
+        _ -> "check"
+
+    s"$family ($said)"
+end check_word_kind
+
+// -- what the hoist made of a subscript ------------------------------------------------------------
+
+// A counted loop's body is about to be lowered: the hoist's verdict on it is recorded from here to
+// `hoist_loop_close`. `at` is where the loop's range is written.
+hoist_loop_open(e: *Emit, at: Span)
+    if !xc_armed then return
+
+    val line = e.src match
+        Some(s) -> s.locate(at.start).line
+        None -> usize(0)
+
+    xc_loops.push(HoistLoop(lowered_func(e), line, "", map(), map(), true))
+end hoist_loop_open
+
+// The loop's body has been lowered.
+hoist_loop_close()
+    if xc_armed && !xc_loops.is_empty() then _ = xc_loops.pop()
+
+// The hoist will not copy the loop, and why. The first reason found is the one kept.
+hoist_refused(why: string)
+    if !xc_armed || xc_loops.is_empty() then return
+
+    val l = xc_loops[xc_loops.len() - 1]
+
+    if l.refused.is_empty() then l.refused = why
+end hoist_refused
+
+// The test in front of the loop cannot prove this subscript, and why.
+hoist_sub_refused(index: TExpr, why: string)
+    if !xc_armed || xc_loops.is_empty() then return
+
+    val l = xc_loops[xc_loops.len() - 1]
+
+    if !l.subs.has(node_id(index)) then l.subs.put(node_id(index), why)
+end hoist_sub_refused
+
+// The subscripts the test in front of the loop proves.
+hoist_planned(plan: Buf[HoistSub])
+    if !xc_armed || xc_loops.is_empty() then return
+
+    val l = xc_loops[xc_loops.len() - 1]
+
+    for sub in plan
+        l.plan.put(node_id(sub.index), true)
+end hoist_planned
+
+// Which copy of the loop is being lowered: the one as written, or the one the test proved.
+hoist_copy(checked: bool)
+    if !xc_armed || xc_loops.is_empty() then return
+
+    val l = xc_loops[xc_loops.len() - 1]
+
+    l.checked = checked
+end hoist_copy
+
+// A subscript's bounds check is about to be made: what the hoist made of it is what the check's
+// record says, until `subscript_close`.
+subscript_open(e: *Emit, index: TExpr)
+    if xc_armed then xc_pending = subscript_why(e, index)
+
+subscript_close()
+    xc_pending = ""
+
+// Why the hoist left a subscript's check where it is.
+private subscript_why(e: *Emit, index: TExpr) -> string
+    if xc_loops.is_empty() then return "no counted loop holds it, and the hoist considers no other"
+
+    val l = xc_loops[xc_loops.len() - 1]
+
+    if l.func != lowered_func(e) then return "no counted loop holds it, and the hoist considers no other"
+
+    val id = node_id(index)
+    val at = s"the loop at line ${l.line}"
+
+    if l.plan.has(id)
+        if l.checked then return s"$at is hoisted, and this is its copy as written, which runs only " +
+            "where the test in front of the loop fails"
+
+        return s"$at proved this subscript, and this form of it is checked all the same"
+    end if
+
+    l.subs.get(id) match
+        Some(why) -> return s"the hoist could not prove it in $at: $why"
+        None -> ()
+
+    if !l.refused.is_empty() then return s"the hoist did not copy $at: ${l.refused}"
+
+    ""
+end subscript_why
+
+// -- the report ------------------------------------------------------------------------------------
+
+// One line of the report before it is sorted: the function a check survives in, as a reader names
+// it, and the check.
+private struct Survivor
+    func: string
+    rec: CheckRecord
+    not_inlined: bool
+
+// The report on a lowered text, at `level`, for the checks written in `own` -- the program's own
+// files. One line saying how many survive, then one per check and function it survives in, sorted
+// by the function, then by where it was written.
+explain_checks_report(ir: string, t: Target, level: string, own: Buf[string]) -> Buf[string]
+    var lines: Buf[string] = buf()
+
+    if !bounds_locations()
+        lines.push("--explain-checks finds a check by the location it reports, and this build lays " +
+                   "down none (--no-bounds-locations)")
+        return lines
+    end if
+
+    val records = check_ledger()
+    var known: Map[string, usize] = map()
+    var total = 0
+
+    for i in 0..<records.len()
+        if is_own(records[i].file, own)
+            known.put(records[i].record, i)
+            total += 1
+    end for
+
+    if total == 0
+        lines.push("this program's files have no run-time checks")
+        return lines
+    end if
+
+    val texts = if level == "0" then Ok(single_text(ir)) else optimized_texts(ir, t, level)
+
+    val optimized = texts match
+        Ok(ts) -> ts
+        Err(why) ->
+            lines.push(s"--explain-checks could not optimize the program: $why")
+            return lines
+
+    var found: Buf[Survivor] = buf()
+    var seen: Map[string, bool] = map()
+
+    for text in optimized
+        records_named(text, records, known, &found, &seen)
+
+    var distinct: Map[string, bool] = map()
+
+    for item in found
+        distinct.put(item.rec.record, true)
+
+    val n = distinct.len()
+
+    lines.push(if level == "0" then every_one(total) else surviving(n, total, level))
+
+    for item in sorted(found)
+        lines.push(survivor_line(item))
+
+    if level != "0" && settled_lto().is_some()
+        lines.push("the link optimizes the program again under --lto, which may take out more of these")
+
+    lines
+end explain_checks_report
+
+private single_text(ir: string) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    out.push(ir)
+    out
+end single_text
+
+private is_own(file: string, own: Buf[string]) -> bool
+    for f in own
+        if f == file then return true
+
+    false
+end is_own
+
+private every_one(total: int) -> string =
+    if total == 1 then "-O0 optimizes nothing, so the one run-time check in this program's files survives"
+    else s"-O0 optimizes nothing, so every one of the $total run-time checks in this program's files survives"
+
+private surviving(n: usize, total: int, level: string) -> string
+    if n == 0
+        return if total == 1 then s"the one run-time check in this program's files is taken out at -O$level"
+        else s"none of the $total run-time checks in this program's files survives -O$level"
+
+    if total == 1 then return s"the one run-time check in this program's files survives -O$level"
+
+    s"$n of the $total run-time checks in this program's files survive -O$level"
+end surviving
+
+private survivor_line(item: Survivor) -> string
+    val r = item.rec
+    var line = s"${r.file}:${r.line}:${r.col}: ${r.kind} survives in '${item.func}'"
+    val written = qualified_name(r.func)
+
+    if !r.func.is_empty() && written != item.func then line = line + s", inlined from '$written'"
+
+    if item.not_inlined
+        line = line + s"; the call was not inlined, so the check is made inside it"
+    else if !r.why.is_empty()
+        line = line + s"; ${r.why}"
+
+    line
+end survivor_line
+
+// The survivors by function, then by where each was written.
+private sorted(found: Buf[Survivor]) -> Buf[Survivor]
+    var out: Buf[Survivor] = buf()
+
+    for item in found
+        var k = out.len()
+
+        while k > 0 && after(out[k - 1], item)
+            k -= 1
+
+        out.insert(k, item)
+    end for
+
+    out
+end sorted
+
+private after(a: Survivor, b: Survivor) -> bool
+    if a.func != b.func then return a.func > b.func
+    if a.rec.file != b.rec.file then return a.rec.file > b.rec.file
+    if a.rec.line != b.rec.line then return a.rec.line > b.rec.line
+    if a.rec.col != b.rec.col then return a.rec.col > b.rec.col
+
+    a.rec.kind > b.rec.kind
+end after
+
+// Each function of `ir` that names one of `records`, with the record, once for each pair, in the
+// order the text names them.
+surviving_checks(ir: string, records: Buf[CheckRecord]) -> Buf[(string, string)]
+    var known: Map[string, usize] = map()
+
+    for i in 0..<records.len()
+        known.put(records[i].record, i)
+
+    var found: Buf[Survivor] = buf()
+    var seen: Map[string, bool] = map()
+
+    records_named(ir, records, known, &found, &seen)
+
+    var out: Buf[(string, string)] = buf()
+
+    for item in found
+        out.push((item.func, item.rec.record))
+
+    out
+end surviving_checks
+
+// The functions the lowering made rather than the program wrote -- the stubs and helpers a failure
+// block calls (`request_helper`) -- by symbol, noted once the armed lowering is done.
+private var xc_helpers: Map[string, bool] = map()
+
+note_check_helpers(names: []const string)
+    xc_helpers = map()
+
+    for name in names
+        xc_helpers.put(name, true)
+end note_check_helpers
+
+// One function's reference to a record: the function, the record, and whether it is an argument of a
+// call to the `@track_caller` body the record is handed to.
+private struct RecordRef
+    func: string
+    index: usize
+    called: bool
+
+// Every own record a function of `ir` names, once for each function, added to `found`.
+//
+// **A record is found in the function its check is in**, which is where it was written or where that
+// body was inlined -- except where LLVM handed a constant argument on into the one function called
+// with it (interprocedural constant propagation): a helper a failure block calls (`sysl.check.<n>`,
+// `sysl.contract`), or a `@track_caller` body called from one place. There the record is named by a
+// callee, and the check is its caller's: the reference is credited to each function calling that
+// callee, through any chain of such callees. Into a `@track_caller` body it says the call was left
+// standing -- the check is made inside it.
+private records_named(ir: string, records: Buf[CheckRecord], known: Map[string, usize],
+                      found: *Buf[Survivor], seen: *Map[string, bool])
+    var func = ""
+    var refs: Buf[RecordRef] = buf()
+    var callers: Map[string, Buf[string]] = map()
+
+    for line in split(ir, "\n")
+        if line.starts_with("define ")
+            func = defined_symbol(line)
+            continue
+        end if
+
+        if line == "}"
+            func = ""
+            continue
+        end if
+
+        if func.is_empty() then continue
+
+        val calling = line.contains("call ") || line.contains("invoke ")
+        var at: usize = 0
+
+        loop
+            val sigil = line.index_of_byte_from(u8('@'), at)
+
+            if sigil.is_none() then break
+
+            val (name, next) = name_at(line, sigil.unwrap() + 1)
+
+            at = next
+
+            val bare = if name.starts_with("sysl.cgu:") then name[9..<name.len] else name
+
+            known.get(bare) match
+                Some(i) ->
+                    val r = records[i]
+
+                    refs.push(RecordRef(func, i, !r.callee.is_empty() && calling && calls(line, r.callee)))
+                None ->
+                    if calling && next < line.len && line.bytes[next] == u8('(')
+                        var list = callers.get(name).unwrap_or(buf())
+
+                        list.push(func)
+                        callers.put(name, list)
+        end loop
+    end for
+
+    for item in refs
+        val r = records[item.index]
+        var credited: Buf[(string, bool)] = buf()
+        var visited: Map[string, bool] = map()
+
+        credit(item.func, r, item.called, callers, &credited, &visited)
+
+        for c in credited
+            val shown = shown_function(c.0)
+            val key = s"$shown\n${r.record}"
+
+            if !seen.has(key)
+                seen.put(key, true)
+                found.push(Survivor(shown, r, c.1))
+            else if c.1
+                for j in 0..<found.len()
+                    if found[j].func == shown && found[j].rec.record == r.record
+                        found[j] = Survivor(shown, r, true)
+    end for
+end records_named
+
+// The functions a reference in `func` is credited to, each with whether the check is made inside a
+// call left standing.
+private credit(func: string, r: CheckRecord, called: bool, callers: Map[string, Buf[string]],
+               out: *Buf[(string, bool)], visited: *Map[string, bool])
+    if visited.has(func) then return
+
+    visited.put(func, true)
+
+    val tracked = !r.callee.is_empty() && is_body_of(func, r.callee)
+    val receiving = xc_helpers.has(func) || tracked
+    val from = callers.get(func).unwrap_or(buf())
+
+    if !receiving || from.is_empty()
+        out.push((func, called))
+        return
+    end if
+
+    for caller in from
+        credit(caller, r, called || tracked, callers, out, visited)
+end credit
+
+// Whether `symbol` is the function `callee` names, or one of its entries (`f.owned`, `f-place`).
+private is_body_of(symbol: string, callee: string) -> bool
+    if symbol == callee then return true
+    if !symbol.starts_with(callee) || symbol.len == callee.len then return false
+
+    val b = symbol.bytes[callee.len]
+
+    b == u8('.') || b == u8('-')
+end is_body_of
+
+// Whether a line calls `symbol` by name.
+private calls(line: string, symbol: string) -> bool =
+    line.contains(s"@$symbol(") || line.contains(s"@\"$symbol\"(")
+
+// The symbol a `define` line defines.
+private defined_symbol(line: string) -> string = line.index_of_byte(u8('@')) match
+    Some(at) -> name_at(line, at + 1).0
+    None -> ""
+
+// The name a sigil introduces at `at` -- quoted or bare -- and where the text after it begins.
+private name_at(line: string, at: usize) -> (string, usize)
+    if at < line.len && line.bytes[at] == u8('"')
+        var end = at + 1
+
+        while end < line.len && line.bytes[end] != u8('"')
+            end += 1
+
+        return (line[at + 1..<end], if end < line.len then end + 1 else end)
+    end if
+
+    var end = at
+
+    while end < line.len && name_byte(line.bytes[end])
+        end += 1
+
+    (line[at..<end], end)
+end name_at
+
+private name_byte(b: u8) -> bool =
+    (b >= u8('a') && b <= u8('z')) || (b >= u8('A') && b <= u8('Z')) || (b >= u8('0') && b <= u8('9')) ||
+        b == u8('.') || b == u8('_') || b == u8('$') || b == u8('-')
+
+// A function of the optimized text as a reader names it: the part LLVM split off a body
+// (`f.cold.1`) is the body's, and so is each further entry the lowering gives one -- owned
+// (`f.owned`), a place entry (`f-place`), a +0 entry (`f-zero`).
+private shown_function(symbol: string) -> string
+    var cut = symbol.index_of(".cold.") match
+        Some(at) -> symbol[0..<at]
+        None -> symbol
+
+    if cut.ends_with("-place") then cut = cut[0..<cut.len - 6]
+    if cut.ends_with("-zero") then cut = cut[0..<cut.len - 5]
+
+    ir_display(assumed_key(cut))
+end shown_function
+
+// The program's text optimized at `level`, one text per codegen unit the build compiles it as.
+private optimized_texts(ir: string, t: Target, level: string) -> Result[Buf[string], string]
+    val cc = find_clang(t, None)?
+    val dir = make_temp_dir("sysl-checks").map_err(_ -> "cannot make a scratch directory")?
+    val units = codegen_units(ir.len, t)
+    val parts = if units > 1 then split_module(ir, units).unwrap_or(single_text(ir)) else single_text(ir)
+    var flags: Buf[string] = buf()
+
+    flags.push("-S")
+    flags.push("-emit-llvm")
+    flags.push("-Wno-unused-command-line-argument")
+
+    var out: Buf[string] = buf()
+    var failed: Option[string] = None
+
+    for i in 0..<parts.len()
+        val shown = s"$dir/unit$i.ll"
+
+        compile_object(cc, parts[i], shown, t, level, false, flags) match
+            Err(why) ->
+                failed = Some(why)
+                break
+            Ok(_) -> ()
+
+        read_text(shown) match
+            Ok(text) -> out.push(text)
+            Err(_) ->
+                failed = Some(s"$cc wrote no optimized text")
+                break
+    end for
+
+    remove_dir_all(dir).unwrap_or(())
+
+    failed match
+        Some(why) -> Err(why)
+        None -> Ok(out)
+end optimized_texts

@@ -2,32 +2,51 @@ module sh.sysl.compiler
 
 import sh.sysl.parsing.*
 import sysl.buf.{Buf, buf}
-import sysl.math.bigint.{BigInt, abs as big_abs, div_rem, from_int, mul as big_mul, negate, to_string}
+import sysl.math.bigint.{BigInt, abs as big_abs, cmp as big_cmp, div_rem, from_int, mul as big_mul, negate,
+                         to_string}
 
 // What a value parameter IS while its own declaration is read: a symbol, and an argument computed
 // over symbols is a polynomial in them (`docs/content/reference/generics.md § What may be written
-// with N`).
+// with N`, `docs/design/type-level-consts.md § 5.1`).
 //
 // **The stand-in zero answers numbers and the term answers identity.** A layout, a `sizeof` or a
 // loop bound in a generic body still reads `N` as zero, as it always has, and every instantiation
 // reads the body again with `N` bound; what the term adds is that `Buf[N]` and `Buf[M]` are two
 // types at the definition, and `Buf[N + M]` and `Buf[M + N]` one.
 //
-// **The form is canonical**: a sum of monomials with non-zero integer coefficients, each a sorted
-// product of factors, the monomials sorted by their factors, so two arguments are equal exactly when
-// their forms are. `+`, `-`, unary `-` and `*` are the ring operations over ℤ; `/` and `%` by a
-// constant that divides every coefficient are exact division (`(2 * N + 4) / 2` is `N + 2`, and its
-// `%` is `0`); any other operator over a parameter is an ATOM, a factor compared by its structure.
-// An argument the form cannot describe (a call, an `if`) carries no term, and is compared as before.
+// **The form is canonical**: a sum of monomials with non-zero integer coefficients over unbounded ℤ,
+// each a sorted product of factors, the monomials sorted by their factors, so two arguments are equal
+// exactly when their forms are. A factor is a value parameter, numbered by its place in the
+// declaration -- so the form does not depend on how the parameter is spelled -- or an ATOM: an
+// operation the ring does not see into, held as its operator and its operands' own forms. `+`, `-`,
+// unary `-` and `*` are the ring operations; `/` and `%` by a constant that divides every coefficient
+// are exact division (`(2 * N + 4) / 2` is `N + 2`, and its `%` is `0`); a comparison whose two sides
+// differ by a constant is that constant's truth (`N + 1 > N` is `true`); `!`, `&&`, `||` and `if`
+// fold a constant operand; `min` and `max` sort, flatten and deduplicate their operands; a call to a
+// `const` function is an atom keyed by the function, not by how the call spells it. Anything else
+// over a parameter (`N / 2`, `N << 1`, `!B`) is an atom compared by its structure. An argument the
+// form cannot describe at all (a `match`, a call to what is not a `const` function) carries no term,
+// and is compared as before.
 
-// One monomial: a coefficient times a product of factors. A factor is a value parameter's name, or
-// an atom's text in parentheses; a factor repeated is a power. The constant monomial has no factors.
+// One factor of a monomial: a value parameter (`param` its place in the declaration, `shown` its
+// name), or an atom (`param` -1, `op` its operator -- `/`, `<`, `!`, `&&`, `min`, `if`, `call` --
+// `key` the function a `call` runs, `shown` how the call names it, `args` its operands' forms).
+// What `shown` holds is for a reader only; two factors are one by everything else.
+struct Factor
+    param: int
+    op: string
+    key: string
+    shown: string
+    args: Buf[Buf[Mono]]
+
+// One monomial: a coefficient times a product of factors, sorted; a factor repeated is a power. The
+// constant monomial has no factors.
 struct Mono
     coeff: BigInt
-    factors: Buf[string]
+    factors: Buf[Factor]
 
-// The most monomials, and the highest degree, a form is built to. Past either, the argument carries
-// no term, and is compared as it was before value parameters were symbols.
+// The most monomials, and the highest degree, a form is built to. Past either, the argument is
+// refused where it arises (`value_term`).
 private const MaxMonos: usize = 64
 private const MaxDegree: usize = 8
 
@@ -65,30 +84,68 @@ extent_text(n: int, term: Buf[Mono]) -> string = if term.is_empty() then s"$n" e
 private extent_arg(n: int, term: Buf[Mono]) -> Type =
     ConstArg(from_int(long(n)), int_type(), !term.is_empty(), term)
 
-terms_eq(p: Buf[Mono], q: Buf[Mono]) -> bool
-    if p.len() != q.len() then return false
+terms_eq(p: Buf[Mono], q: Buf[Mono]) -> bool = term_cmp(p, q) == 0
 
+// -- the order ---------------------------------------------------------------------------------------
+
+// The total order the form is sorted by: parameters by their place, before atoms; atoms by operator,
+// then the function a call runs, then their operands. What a factor is shown as takes no part.
+factor_cmp(x: Factor, y: Factor) -> int
+    if x.param >= 0 || y.param >= 0
+        if x.param < 0 then return 1
+        if y.param < 0 then return -1
+
+        return int_order(x.param, y.param)
+    end if
+
+    if x.op != y.op then return if x.op < y.op then -1 else 1
+    if x.key != y.key then return if x.key < y.key then -1 else 1
+    if x.args.len() != y.args.len() then return int_order(int(x.args.len()), int(y.args.len()))
+
+    for i in 0..<x.args.len()
+        val c = term_cmp(x.args[i], y.args[i])
+
+        if c != 0 then return c
+
+    0
+end factor_cmp
+
+// Two sorted products, factor by factor; a product that is the other's beginning comes first.
+factors_cmp(xs: Buf[Factor], ys: Buf[Factor]) -> int
+    for i in 0..<xs.len()
+        if i == ys.len() then return 1
+
+        val c = factor_cmp(xs[i], ys[i])
+
+        if c != 0 then return c
+
+    if xs.len() < ys.len() then -1 else 0
+end factors_cmp
+
+// Two forms, monomial by monomial: by factors, then coefficient; a form that is the other's
+// beginning comes first. Zero exactly when the two are one.
+term_cmp(p: Buf[Mono], q: Buf[Mono]) -> int
     for i in 0..<p.len()
-        if p[i].coeff != q[i].coeff || mono_key(p[i]) != mono_key(q[i]) then return false
+        if i == q.len() then return 1
 
-    true
-end terms_eq
+        val f = factors_cmp(p[i].factors, q[i].factors)
+
+        if f != 0 then return f
+
+        val c = big_cmp(p[i].coeff, q[i].coeff)
+
+        if c != 0 then return c
+    end for
+
+    if p.len() < q.len() then -1 else 0
+end term_cmp
+
+private int_order(x: int, y: int) -> int = if x < y then -1 else if x > y then 1 else 0
 
 // -- the ring --------------------------------------------------------------------------------------
 
-private mono_key(m: Mono) -> string = factors_text(m.factors)
-
-private factors_text(fs: Buf[string]) -> string
-    var out = ""
-
-    for i in 0..<fs.len()
-        out = if i == 0 then fs[i] else s"$out * ${fs[i]}"
-
-    out
-end factors_text
-
 // A constant as a form: no monomials for zero.
-private term_const(c: BigInt) -> Buf[Mono]
+term_const(c: BigInt) -> Buf[Mono]
     var out: Buf[Mono] = buf()
 
     if !c.is_zero() then out.push(Mono(c, buf()))
@@ -96,26 +153,30 @@ private term_const(c: BigInt) -> Buf[Mono]
     out
 end term_const
 
-// A value parameter, or an atom, as a form of its own.
-term_symbol(name: string) -> Buf[Mono]
-    var fs: Buf[string] = buf()
+private one_factor(f: Factor) -> Buf[Mono]
+    var fs: Buf[Factor] = buf()
 
-    fs.push(name)
+    fs.push(f)
 
     var out: Buf[Mono] = buf()
 
     out.push(Mono(from_int(1), fs))
     out
-end term_symbol
+end one_factor
+
+// The declaration's value parameter at `index`, spelled `name`, as a form of its own.
+term_param(index: int, name: string) -> Buf[Mono] = one_factor(Factor(index, "", "", name, buf()))
+
+// An atom as a form of its own: `op` over `args`, for a call the function `key`, spelled `shown`.
+term_atom(op: string, key: string, shown: string, args: Buf[Buf[Mono]]) -> Buf[Mono] =
+    one_factor(Factor(-1, op, key, shown, args))
 
 // `m` added into the sorted `out`, merged with the monomial of the same factors.
 private add_mono(out: *Buf[Mono], m: Mono)
-    val key = mono_key(m)
-
     for i in 0..<out.len()
-        val here = mono_key(out[i])
+        val c = factors_cmp(m.factors, out[i].factors)
 
-        if here == key
+        if c == 0
             val sum = out[i].coeff + m.coeff
 
             if sum.is_zero()
@@ -126,7 +187,7 @@ private add_mono(out: *Buf[Mono], m: Mono)
             return
         end if
 
-        if key < here
+        if c < 0
             out.insert(i, m)
             return
         end if
@@ -135,7 +196,7 @@ private add_mono(out: *Buf[Mono], m: Mono)
     out.push(m)
 end add_mono
 
-private term_add(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+term_add(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
     var out: Buf[Mono] = buf()
 
     for m in p
@@ -147,7 +208,7 @@ private term_add(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
     out
 end term_add
 
-private term_neg(p: Buf[Mono]) -> Buf[Mono]
+term_neg(p: Buf[Mono]) -> Buf[Mono]
     var out: Buf[Mono] = buf()
 
     for m in p
@@ -156,7 +217,7 @@ private term_neg(p: Buf[Mono]) -> Buf[Mono]
     out
 end term_neg
 
-private term_mul(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+term_mul(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
     var out: Buf[Mono] = buf()
 
     for x in p
@@ -166,13 +227,13 @@ private term_mul(p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
     out
 end term_mul
 
-private merged_factors(xs: Buf[string], ys: Buf[string]) -> Buf[string]
-    var out: Buf[string] = buf()
+private merged_factors(xs: Buf[Factor], ys: Buf[Factor]) -> Buf[Factor]
+    var out: Buf[Factor] = buf()
     var i: usize = 0
     var j: usize = 0
 
     while i < xs.len() || j < ys.len()
-        if j == ys.len() || (i < xs.len() && xs[i] <= ys[j])
+        if j == ys.len() || (i < xs.len() && factor_cmp(xs[i], ys[j]) <= 0)
             out.push(xs[i])
             i += 1
         else
@@ -184,8 +245,8 @@ private merged_factors(xs: Buf[string], ys: Buf[string]) -> Buf[string]
     out
 end merged_factors
 
-// `p / c` where `c` divides every coefficient -- exact, so it agrees with the truncating division
-// an instantiation evaluates at every argument -- or nothing.
+// `p / c` where `c` divides every coefficient, the constant one included -- exact, so it agrees with
+// the truncating division an instantiation evaluates at every argument -- or nothing.
 private term_div_exact(p: Buf[Mono], c: BigInt) -> Option[Buf[Mono]]
     if c.is_zero() then return None
 
@@ -201,15 +262,153 @@ private term_div_exact(p: Buf[Mono], c: BigInt) -> Option[Buf[Mono]]
     Some(out)
 end term_div_exact
 
-private term_constant(p: Buf[Mono]) -> Option[BigInt]
+// `p / q` or `p % q`: two constants divide as an instantiation would, truncating; a constant divisor
+// that divides every coefficient divides exactly; anything else is an atom.
+term_div(op: string, p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+    val divisor = term_constant(q)
+
+    if divisor.is_some() && !divisor.unwrap().is_zero()
+        val dividend = term_constant(p)
+
+        if dividend.is_some()
+            val qr = div_rem(dividend.unwrap(), divisor.unwrap())
+
+            return term_const(if op == "/" then qr.0 else qr.1)
+        end if
+
+        val exact = term_div_exact(p, divisor.unwrap())
+
+        if exact.is_some() then return if op == "/" then exact.unwrap() else term_const(from_int(0))
+    end if
+
+    term_atom(op, "", "", pair(p, q))
+end term_div
+
+// A comparison of two forms: the truth of their difference where it is a constant -- `N + 1 > N` is
+// `true` over ℤ -- and an atom otherwise.
+term_compare(op: string, p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+    val gap = term_constant(term_add(p, term_neg(q)))
+
+    if gap.is_none() then return term_atom(op, "", "", pair(p, q))
+
+    val s = gap.unwrap().sign()
+    val holds = op match
+        "<" -> s < 0
+        "<=" -> s <= 0
+        ">" -> s > 0
+        ">=" -> s >= 0
+        "==" -> s == 0
+        _ -> s != 0
+
+    truth(holds)
+end term_compare
+
+// `!p`, `p && q`, `p || q`: a constant operand folds, and anything else is an atom over the operands
+// as written.
+term_not(p: Buf[Mono]) -> Buf[Mono]
+    val c = term_constant(p)
+
+    if c.is_some() then return truth(c.unwrap().is_zero())
+
+    var args: Buf[Buf[Mono]] = buf()
+
+    args.push(p)
+    term_atom("!", "", "", args)
+end term_not
+
+term_logic(op: string, p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+    val l = term_constant(p)
+    val r = term_constant(q)
+    val both = op == "&&"
+
+    // `false && x` is false and `true && x` is x; `||` the other way about; either side.
+    if l.is_some() then return if l.unwrap().is_zero() == both then truth(!both) else q
+    if r.is_some() then return if r.unwrap().is_zero() == both then truth(!both) else p
+
+    term_atom(op, "", "", pair(p, q))
+end term_logic
+
+// `if c then p else q`: the branch a constant condition chooses, an atom otherwise.
+term_if(c: Buf[Mono], p: Buf[Mono], q: Buf[Mono]) -> Buf[Mono]
+    val k = term_constant(c)
+
+    if k.is_some() then return if k.unwrap().is_zero() then q else p
+
+    var args: Buf[Buf[Mono]] = buf()
+
+    args.push(c)
+    args.push(p)
+    args.push(q)
+    term_atom("if", "", "", args)
+end term_if
+
+// `min(…)` or `max(…)`: commutative and idempotent, so the operands are flattened through a nested
+// call of the same operator, sorted and deduplicated, and one operand left is that operand.
+term_min_max(op: string, args: Buf[Buf[Mono]]) -> Buf[Mono]
+    var flat: Buf[Buf[Mono]] = buf()
+
+    for arg in args
+        val inner = lone_atom(arg)
+
+        if inner.is_some() && inner.unwrap().op == op
+            for x in inner.unwrap().args
+                add_operand(&flat, x)
+        else
+            add_operand(&flat, arg)
+        end if
+    end for
+
+    if flat.len() == 1 then return flat[0]
+
+    term_atom(op, "", op, flat)
+end term_min_max
+
+// `x` added into the sorted, duplicate-free `out`.
+private add_operand(out: *Buf[Buf[Mono]], x: Buf[Mono])
+    for i in 0..<out.len()
+        val c = term_cmp(x, out[i])
+
+        if c == 0 then return
+
+        if c < 0
+            out.insert(i, x)
+            return
+        end if
+    end for
+
+    out.push(x)
+end add_operand
+
+// A call to the `const` function `key`, named `shown` where it was written.
+term_call(key: string, shown: string, args: Buf[Buf[Mono]]) -> Buf[Mono] =
+    term_atom("call", key, shown, args)
+
+private truth(b: bool) -> Buf[Mono] = term_const(from_int(if b then 1 else 0))
+
+private pair(p: Buf[Mono], q: Buf[Mono]) -> Buf[Buf[Mono]]
+    var out: Buf[Buf[Mono]] = buf()
+
+    out.push(p)
+    out.push(q)
+    out
+end pair
+
+term_constant(p: Buf[Mono]) -> Option[BigInt]
     if p.is_empty() then return Some(from_int(0))
     if p.len() == 1 && p[0].factors.is_empty() then return Some(p[0].coeff)
 
     None
 end term_constant
 
+// The one atom a form is, with a coefficient of one, where it is that.
+private lone_atom(p: Buf[Mono]) -> Option[Factor] =
+    if p.len() == 1 && p[0].coeff == from_int(1) && p[0].factors.len() == 1 && p[0].factors[0].param < 0 then
+        Some(p[0].factors[0])
+    else
+        None
+
 // Whether a form is within the cap.
-private term_fits(p: Buf[Mono]) -> bool
+term_fits(p: Buf[Mono]) -> bool
     if p.len() > MaxMonos then return false
 
     for m in p
@@ -218,20 +417,50 @@ private term_fits(p: Buf[Mono]) -> bool
     true
 end term_fits
 
+// What the cap says of a form past it, or nothing within it.
+term_cap_text(p: Buf[Mono]) -> Option[string]
+    if p.len() > MaxMonos then return Some(s"over $MaxMonos terms")
+
+    for m in p
+        if m.factors.len() > MaxDegree then return Some(s"of degree over $MaxDegree")
+
+    None
+end term_cap_text
+
 // -- reading one ------------------------------------------------------------------------------------
 
 // The form of a written value argument over the stand-ins `subst` binds, or nothing where it names
 // none, comes to a constant, or holds something the form cannot describe.
+//
+// **A form past the cap is refused here, where it arises**: the argument is too large to compare,
+// and leaving it to be compared by value would accept at the declaration what nothing showed equal.
+// A form is read only while a declaration is read in its own terms, which no instantiation reads
+// again, so the refusal is one the walk at a definition KEEPS (`bound_fault`).
 value_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Buf[Mono]
-    val read = term_of(a, scope, e, subst)
+    var over = ""
+    val read = term_of(a, scope, e, subst, &over)
 
-    if read.is_none() || !term_fits(read.unwrap()) || term_constant(read.unwrap()).is_some() then
+    if over != ""
+        a.bound_fault(scope, e.span, s"the type argument '${doc_expr_text(e)}' is too large to compare ($over)")
         return buf()
+    end if
+
+    if read.is_none() || term_constant(read.unwrap()).is_some() then return buf()
 
     read.unwrap()
 end value_term
 
-private term_of(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[Buf[Mono]]
+// `p` where it is within the cap; nothing, with what the cap says in `over`, where it is not.
+private capped(p: Buf[Mono], over: *string) -> Option[Buf[Mono]]
+    val said = term_cap_text(p)
+
+    if said.is_none() then return Some(p)
+    if *over == "" then *over = said.unwrap()
+
+    None
+end capped
+
+private term_of(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding], over: *string) -> Option[Buf[Mono]]
     if !names_stand_in(e, subst) then return folded_term(a, scope, e, subst)
 
     *e.kind match
@@ -239,45 +468,115 @@ private term_of(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Opt
             Some(ConstArg(_, _, _, term)) -> if term.is_empty() then None else Some(term)
             _ -> None
         Unary(op, x) ->
-            val inner = term_of(a, scope, x, subst)
+            val inner = term_of(a, scope, x, subst, over)
 
             if inner.is_none() then return None
             if op == "-" then return Some(term_neg(inner.unwrap()))
+            if op == "!" then return Some(term_not(inner.unwrap()))
 
-            // `!B` stays as written; an operand of more than one symbol keeps its parentheses.
-            val shown = term_text(inner.unwrap())
+            var args: Buf[Buf[Mono]] = buf()
 
-            Some(term_symbol(if bare_symbol(inner.unwrap()) then s"$op$shown" else s"$op($shown)"))
-        Binary(op, l, r) -> binary_term(a, scope, op, l, r, subst)
+            args.push(inner.unwrap())
+            Some(term_atom(op, "", "", args))
+        Binary(op, l, r) -> binary_term(a, scope, op, l, r, subst, over)
+        Compare(operands, ops) -> compare_term(a, scope, operands, ops, subst, over)
+        Call(callee, args) -> call_term(a, scope, e, callee, args, subst, over)
+        IfExpr(cond, then_body, else_body, _) ->
+            if else_body.is_none() then return None
+
+            val c = term_of(a, scope, cond, subst, over)
+            val p = branch_term(a, scope, then_body, subst, over)
+            val q = branch_term(a, scope, else_body.unwrap(), subst, over)
+
+            if c.is_none() || p.is_none() || q.is_none() then return None
+
+            Some(term_if(c.unwrap(), p.unwrap(), q.unwrap()))
         _ -> None
 end term_of
 
-private binary_term(a: &Analysis, scope: Scope, op: string, l: Expr, r: Expr,
-                    subst: Buf[Binding]) -> Option[Buf[Mono]]
-    val lt = term_of(a, scope, l, subst)
-    val rt = term_of(a, scope, r, subst)
+private binary_term(a: &Analysis, scope: Scope, op: string, l: Expr, r: Expr, subst: Buf[Binding],
+                    over: *string) -> Option[Buf[Mono]]
+    val lt = term_of(a, scope, l, subst, over)
+    val rt = term_of(a, scope, r, subst, over)
 
     if lt.is_none() || rt.is_none() then return None
 
     val p = lt.unwrap()
     val q = rt.unwrap()
+    val made = op match
+        "+" -> term_add(p, q)
+        "-" -> term_add(p, term_neg(q))
+        "*" -> term_mul(p, q)
+        "/" | "%" -> term_div(op, p, q)
+        "&&" | "||" -> term_logic(op, p, q)
+        _ -> term_atom(op, "", "", pair(p, q))
 
-    if !term_fits(p) || !term_fits(q) then return None
-
-    if op == "+" then return Some(term_add(p, q))
-    if op == "-" then return Some(term_add(p, term_neg(q)))
-    if op == "*" then return Some(term_mul(p, q))
-
-    val divisor = term_constant(q)
-
-    if divisor.is_some() && (op == "/" || op == "%")
-        val exact = term_div_exact(p, divisor.unwrap())
-
-        if exact.is_some() then return if op == "/" then exact else Some(term_const(from_int(0)))
-    end if
-
-    Some(term_symbol(s"(${term_text(p)} $op ${term_text(q)})"))
+    capped(made, over)
 end binary_term
+
+// A comparison chain, `a < b < c`, is each link's comparison, joined by `&&`.
+private compare_term(a: &Analysis, scope: Scope, operands: Buf[Expr], ops: Buf[string], subst: Buf[Binding],
+                     over: *string) -> Option[Buf[Mono]]
+    var forms: Buf[Buf[Mono]] = buf()
+
+    for x in operands
+        val t = term_of(a, scope, x, subst, over)
+
+        if t.is_none() then return None
+
+        forms.push(t.unwrap())
+    end for
+
+    if ops.is_empty() || forms.len() != ops.len() + 1 then return None
+
+    var out = term_compare(ops[0], forms[0], forms[1])
+
+    for i in 1..<ops.len()
+        out = term_logic("&&", out, term_compare(ops[i], forms[i], forms[i + 1]))
+
+    Some(out)
+end compare_term
+
+// A call: an atom keyed by the `const` function it runs, or, where the name is no function, `min`
+// and `max` -- their form is ready for the day a type position may call them.
+private call_term(a: &Analysis, scope: Scope, e: Expr, callee: Expr, args: Buf[Expr], subst: Buf[Binding],
+                  over: *string) -> Option[Buf[Mono]]
+    var forms: Buf[Buf[Mono]] = buf()
+
+    for x in args
+        *x.kind match
+            NamedArg(_, _) -> return None
+            _ -> ()
+
+        val t = term_of(a, scope, x, subst, over)
+
+        if t.is_none() then return None
+
+        forms.push(t.unwrap())
+    end for
+
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val key = const_callee_key(inner, e)
+
+    if key.is_some() then return Some(term_call(key.unwrap(), doc_expr_text(callee), forms))
+
+    *callee.kind match
+        Ident(n) -> if (n == "min" || n == "max") && !forms.is_empty() then Some(term_min_max(n, forms)) else None
+        _ -> None
+end call_term
+
+// The form of a branch that is one expression; nothing for any other.
+private branch_term(a: &Analysis, scope: Scope, body: Buf[Stmt], subst: Buf[Binding],
+                    over: *string) -> Option[Buf[Mono]]
+    if body.len() != 1 then return None
+
+    *body[0].kind match
+        ExprStmt(inner) -> term_of(a, scope, inner, subst, over)
+        _ -> None
+end branch_term
 
 // A part naming no stand-in, folded as the constant it is.
 private folded_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[Buf[Mono]]
@@ -292,19 +591,20 @@ private folded_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) ->
 
     folded match
         Some(ConstInt(v)) -> Some(term_const(v))
-        Some(ConstBool(b)) -> Some(term_const(from_int(if b then 1 else 0)))
+        Some(ConstBool(b)) -> Some(truth(b))
         _ -> None
 end folded_term
 
 // -- showing one ------------------------------------------------------------------------------------
 
-// A form as a reader writes it: the monomials in order, the constant last -- `N + 1`, `M + N`,
-// `2 * N - 3`.
+// A form as a reader writes it: the monomials in order, the constant last -- `N + 1`, `N + M`,
+// `2 * N - 3`, `2 * (N / 2)`. An infix atom keeps its parentheses wherever it is not the whole form.
 term_text(p: Buf[Mono]) -> string
     if p.is_empty() then return "0"
 
     var out = ""
     var first = true
+    val whole = p.len() == 1 && p[0].coeff == from_int(1) && p[0].factors.len() == 1
 
     for pass in 0..<2
         for m in p
@@ -314,8 +614,8 @@ term_text(p: Buf[Mono]) -> string
             val size = big_abs(m.coeff)
             val one = size == from_int(1) && !m.factors.is_empty()
             val shown = if m.factors.is_empty() then to_string(size)
-                        else if one then factors_text(m.factors)
-                        else s"${to_string(size)} * ${factors_text(m.factors)}"
+                        else if one then factors_text(m.factors, whole)
+                        else s"${to_string(size)} * ${factors_text(m.factors, false)}"
 
             out = if first then (if negative then s"-$shown" else shown)
                   else s"$out ${if negative then "-" else "+"} $shown"
@@ -325,18 +625,100 @@ term_text(p: Buf[Mono]) -> string
     out
 end term_text
 
-// The value parameters a form names, each once, in order.
-private term_params(p: Buf[Mono], out: *Buf[string])
+private factors_text(fs: Buf[Factor], whole: bool) -> string
+    var out = ""
+
+    for i in 0..<fs.len()
+        val f = fs[i]
+        val one = if infix(f) && !whole then s"(${factor_text(f)})" else factor_text(f)
+
+        out = if i == 0 then one else s"$out * $one"
+
+    out
+end factors_text
+
+// Whether an atom is written between or before its operands, and so needs parentheses inside a
+// product or an operand.
+private infix(f: Factor) -> bool = f.param < 0 && f.op != "call" && f.op != "min" && f.op != "max"
+
+private factor_text(f: Factor) -> string
+    if f.param >= 0 then return f.shown
+
+    if f.op == "call" || f.op == "min" || f.op == "max"
+        var inside = ""
+
+        for i in 0..<f.args.len()
+            inside = if i == 0 then term_text(f.args[i]) else s"$inside, ${term_text(f.args[i])}"
+
+        return s"${f.shown}($inside)"
+    end if
+
+    if f.args.len() == 1 then return s"${f.op}${operand_text(f.args[0])}"
+
+    if f.op == "if" then
+        return s"if ${term_text(f.args[0])} then ${term_text(f.args[1])} else ${term_text(f.args[2])}"
+
+    s"${operand_text(f.args[0])} ${f.op} ${operand_text(f.args[1])}"
+end factor_text
+
+// An atom's operand: bare where it is a constant, a parameter or a call, parenthesized otherwise.
+private operand_text(p: Buf[Mono]) -> string
+    if term_constant(p).is_some() || bare_symbol(p) then return term_text(p)
+
+    val inner = lone_atom(p)
+
+    if inner.is_some() && !infix(inner.unwrap()) then return term_text(p)
+
+    s"(${term_text(p)})"
+end operand_text
+
+// A form as the identity a stand-in's tag carries: parameters by their place, so two forms have one
+// key exactly when they are one.
+term_key(p: Buf[Mono]) -> string
+    var out = ""
+
+    for m in p
+        out = s"$out+${to_string(m.coeff)}"
+
+        for f in m.factors
+            out = s"$out*${factor_key(f)}"
+    end for
+
+    if out == "" then "0" else out
+end term_key
+
+private factor_key(f: Factor) -> string
+    if f.param >= 0 then return s"#${f.param}"
+
+    var out = s"(${f.op}${f.key}"
+
+    for x in f.args
+        out = s"$out;${term_key(x)}"
+
+    s"$out)"
+end factor_key
+
+// The value parameters a form names, inside its atoms too, each once, in their declaration's order.
+private term_params(p: Buf[Mono], out: *Buf[Factor])
     for m in p
         for f in m.factors
-            if !names_a_param(f) then continue
+            if f.param < 0
+                for x in f.args
+                    term_params(x, out)
 
+                continue
+            end if
+
+            var at = out.len()
             var seen = false
 
             for i in 0..<out.len()
-                if out[i] == f then seen = true
+                if out[i].param == f.param then seen = true
+                if out[i].param > f.param && at == out.len() then at = i
 
-            if !seen then out.push(f)
+            if !seen then out.insert(at, f)
+        end for
+    end for
 end term_params
 
 // What tells two value arguments apart, said after a refusal that quotes both: they differ by a
@@ -345,10 +727,15 @@ end term_params
 term_difference(want: Type, got: Type) -> string
     val w = term_of_arg(want)
     val g = term_of_arg(got)
+    var params: Buf[Factor] = buf()
+
+    term_params(w, &params)
+    term_params(g, &params)
+
     var names: Buf[string] = buf()
 
-    term_params(w, &names)
-    term_params(g, &names)
+    for f in params
+        names.push(f.shown)
 
     val every = if names.is_empty() then "at every instantiation" else s"for every ${spoken_list(names)}"
 
@@ -375,17 +762,7 @@ private term_of_arg(t: Type) -> Buf[Mono] = t match
     _ -> buf()
 
 private bare_symbol(p: Buf[Mono]) -> bool =
-    p.len() == 1 && p[0].factors.len() == 1 && p[0].coeff == from_int(1) && names_a_param(p[0].factors[0])
-
-// Whether a factor is a value parameter rather than an atom: an atom begins with an operator or a
-// parenthesis, a parameter with a letter or an underscore.
-private names_a_param(f: string) -> bool
-    if f.bytes.len == 0 then return false
-
-    val c = f.bytes[0]
-
-    c == u8('_') || (c >= u8('a') && c <= u8('z')) || (c >= u8('A') && c <= u8('Z'))
-end names_a_param
+    p.len() == 1 && p[0].factors.len() == 1 && p[0].coeff == from_int(1) && p[0].factors[0].param >= 0
 
 private spoken_list(xs: Buf[string]) -> string
     var out = ""

@@ -203,7 +203,7 @@ bounds_unless(e: *Emit, ok: Val, what: string, kind: int, a: Val, b: Val, n: Val
     args.push(ir_arg(w, a))
     args.push(ir_arg(w, b))
     args.push(ir_arg(w, n))
-    args.push(ir_arg(LPtr, location_of(e, site)))
+    args.push(ir_arg(LPtr, check_site(e, site, bounds_form_kind(kind))))
     bounds_stop(e, args)
     emit_label(e, ok_l)
 end bounds_unless
@@ -255,7 +255,7 @@ report_check(e: *Emit, what: string, subject: string)
 
     var args: Buf[IrArg] = buf()
 
-    args.push(ir_arg(LPtr, check_location(e)))
+    args.push(ir_arg(LPtr, check_location(e, if check_ledger_armed() then check_word_kind(what, said.1) else "")))
     emit(e, ir_call(None, LVoid, VGlobal(name), args))
     emit_term(e, InUnreachable)
 end report_check
@@ -287,8 +287,8 @@ private check_helper_text(name: string, kind: int, text: string, word_bits: int,
 end check_helper_text
 
 // Where a check without a site of its own was made: the expression being lowered, or nowhere.
-private check_location(e: *Emit) -> Val = e.trap_site match
-    Some(s) -> location_of(e, s)
+private check_location(e: *Emit, kind: string) -> Val = e.trap_site match
+    Some(s) -> check_site(e, s, kind)
     None -> if e.in_tracked then caller_param() else VNull
 
 // The form and the sentence for each check `trap_unless` is asked for, by the word it labels its
@@ -407,7 +407,9 @@ overflow_unless(e: *Emit, ok: Val, what: string, site: Span)
         Some(s) -> s.name
         None -> ""
 
-    two_texts_fail(e, BoundsOverflow, c_text_of(e, trap_name(file, site, what)), VNull, site)
+    val said = trap_name(file, site, what)
+
+    two_texts_fail(e, BoundsOverflow, c_text_of(e, said), VNull, site, said)
     emit_label(e, ok_l)
 end overflow_unless
 
@@ -439,7 +441,7 @@ contract_unless(e: *Emit, ok: Val, label: string, kind: string, msg: Option[stri
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(LPtr, c_text_of(e, said)))
-    args.push(ir_arg(LPtr, location_of(e, site)))
+    args.push(ir_arg(LPtr, check_site(e, site, if check_ledger_armed() then s"contract ($kind)" else "")))
     emit(e, ir_call(None, LVoid, VGlobal(contract_helper_symbol()), args))
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
@@ -488,7 +490,7 @@ clause_unless(e: *Emit, ok: Val, kind: string, clause: Val, clause_len: Val, sit
     args.push(ir_arg(w, VInt(from_int(long(head.bytes.len)))))
     args.push(ir_arg(LPtr, clause))
     args.push(ir_arg(w, clause_len))
-    args.push(ir_arg(LPtr, location_of(e, site)))
+    args.push(ir_arg(LPtr, check_site(e, site, kind)))
     emit(e, ir_call(None, LVoid, VGlobal(clause_helper_symbol()), args))
     emit_term(e, InUnreachable)
     emit_label(e, ok_l)
@@ -530,8 +532,9 @@ private clause_helper_text(word_bits: int, stop: string) -> string
         "  unreachable\n}\n"
 end clause_helper_text
 
-// A failure whose two values are the addresses of NUL-terminated texts.
-private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span) -> Val
+// A failure whose two values are the addresses of NUL-terminated texts. `detail` is what
+// `--explain-checks` says of the check beside its form -- an overflow's operation.
+private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span, detail: string = "") -> Val
     e.traps = true
     e.bounds_fails = true
 
@@ -548,7 +551,12 @@ private two_texts_fail(e: *Emit, kind: int, first: Val, second: Val, site: Span)
     args.push(ir_arg(w, a))
     args.push(ir_arg(w, b))
     args.push(ir_arg(w, bounds_none()))
-    args.push(ir_arg(LPtr, location_of(e, site)))
+
+    val shown = if !check_ledger_armed() then ""
+    else if detail.is_empty() then bounds_form_kind(kind)
+    else s"${bounds_form_kind(kind)} ($detail)"
+
+    args.push(ir_arg(LPtr, check_site(e, site, shown)))
     bounds_stop(e, args)
     VNothing
 end two_texts_fail
@@ -606,7 +614,7 @@ check_variant(e: *Emit, en: Type, v: Val, site: Span)
     var args: Buf[IrArg] = buf()
 
     args.push(ir_arg(LInt(bits), v))
-    args.push(ir_arg(LPtr, location_of(e, site)))
+    args.push(ir_arg(LPtr, check_site(e, site, "enum value")))
     emit(e, ir_call(None, LVoid, VGlobal(name), args))
 end check_variant
 
@@ -678,6 +686,25 @@ location_of(e: *Emit, site: Span) -> Val
     val loc = src.locate(site.start)
     c_text_of(e, s"${location_file(src.name)}:${loc.line}:${loc.col}")
 end location_of
+
+// Where a check was written, as `location_of` names it -- and, while `--explain-checks` records the
+// lowering (`explain_checks.sysl`), as a record of the check's own, the same text laid down once more
+// so that no other check shares it, noted with what the check is. `callee` is the symbol a call into a
+// `@track_caller` body names, where the check is one.
+check_site(e: *Emit, site: Span, kind: string, callee: string = "") -> Val
+    if !check_ledger_armed() || e.in_tracked || !locations_on then return location_of(e, site)
+
+    val src = e.src match
+        Some(s) -> s
+        None -> return VNull
+
+    val loc = src.locate(site.start)
+    val name = bounds_location_name(e.locs.len())
+
+    e.locs.push(s"${location_file(src.name)}:${loc.line}:${loc.col}")
+    note_check(name, kind, src.name, loc.line, loc.col, lowered_func(e), callee)
+    VGlobal(name)
+end check_site
 
 // A NUL-terminated constant holding `text`, laid down with the locations and numbered among them, so
 // one text asked for twice is one constant.

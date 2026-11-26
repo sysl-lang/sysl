@@ -1225,8 +1225,10 @@ print(pick(1))
 'errdefer' binds the error 'pick' fails with, and 'pick' returns Option[int], whose 'None' carries none — leave the binder out
 ```
 
-A closure whose result its context does not fix has no result to ask yet, so an `errdefer` in one is
-refused until the result type is stated — as a `?` in one is.
+A closure whose result its context does not fix has no result to ask yet where the `errdefer` is
+read, so an `errdefer` in one is refused until the result type is stated — even where a `?` in the
+same body takes its error from the body ([errors](/reference/errors/)), since that settles only after
+the body is read.
 
 ---
 

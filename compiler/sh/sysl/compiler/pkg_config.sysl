@@ -3,7 +3,7 @@ module sh.sysl.compiler
 import sysl.buf.{Buf, buf}
 import sysl.process.capture
 import sysl.fs.is_file
-import sysl.text.{join, Search}
+import sysl.text.{join, lines, Search}
 
 // The one machine-side question a package is allowed to ask: **where does this library live here?**
 //
@@ -64,13 +64,73 @@ pkg_config_query(pc: string) -> Result[PkgAnswer, string]
     exists.push("--exists")
     exists.push(pc)
 
-    if ran(exists).is_none() then return Err(s"'$PkgTool' knows no '$pc'")
+    if ran(exists).is_none() then return Err(unmet_of(pc).0)
 
     val c = cflags_for_c(flags_of(pc, "--cflags")?)
     val l = flags_of(pc, "--libs")?
 
     Ok(PkgAnswer(c, l, buf()))
 end pkg_config_query
+
+// Why `--exists` refused a module, in the words of the tool that refused it.
+//
+// **Asked again with `--print-errors`, because a `.pc` that is there can still be unusable**: its
+// `Requires` names a package this machine lacks (`sdl3-mixer` needs `fluidsynth`, which needs brew's
+// keg-only `readline`) or a version that is too old, and `--exists` alone answers all of those and a
+// missing module with the same silent failure. Reporting only *knows no 'sdl3-mixer'* sent a reader
+// hunting for an install they already had. **A module that is simply absent keeps the sentence it
+// always had**; a tool that said nothing is treated as absent too.
+//
+// **Answers the reason and the advice that fits it**: for a requirement that is missing or too old
+// the advice names *that* package, since "install it" would send the reader back to the module that
+// was found. The advice is empty where the module itself is absent.
+private unmet_of(pc: string) -> (string, string)
+    var again: Buf[string] = buf()
+
+    again.push("--exists")
+    again.push("--print-errors")
+    again.push(pc)
+
+    val said = capture(PkgTool, again.view(), "", [], true) match
+        Err(_) -> ""
+        Ok(out) -> out.err.unwrap_or("") + out.text
+
+    var last = ""
+
+    for line in lines(said)
+        if !line.trim().is_empty() then last = line.trim()
+
+    if last.is_empty() || last == s"Package '$pc' not found" then return (s"'$PkgTool' knows no '$pc'", "")
+
+    val needed = quoted_after(last, "Package '")
+    val by = quoted_after(last, ", required by '")
+
+    if last.ends_with(", not found") && needed.is_some() && by.is_some()
+        val via = if by.unwrap() == pc then "" else s" (required by '${by.unwrap()}')"
+
+        return (s"'$PkgTool' found '$pc', but its requirement '${needed.unwrap()}'$via is not found",
+                s"Install '${needed.unwrap()}' (its .pc must be on PKG_CONFIG_PATH)")
+
+    val why = s"'$PkgTool' found '$pc', but cannot use it: $last"
+
+    if needed.is_some() && last.contains(" has version ")
+        return (why, s"Install a version of '${needed.unwrap()}' that satisfies it")
+
+    (why, "")
+end unmet_of
+
+// The text between the quote that ends `marker` and the next quote, where `marker` is in the line.
+private quoted_after(line: string, marker: string) -> Option[string]
+    line.index_of(marker) match
+        None -> None
+        Some(at) ->
+            val from = at + marker.bytes.len
+            val rest = line[from..<line.bytes.len]
+
+            rest.index_of("'") match
+                None -> None
+                Some(close) -> Some(rest[0..<close])
+end quoted_after
 
 // A module's `--cflags` less what only a C++ compilation means, since everything sysl hands clang is C.
 //
@@ -231,6 +291,13 @@ probe_libs(needs: Buf[LibNeed], t: Target, mode: LinkMode = LinkDynamic) -> Resu
         val answer = pkg_config_query(need.pc) match
             Ok(found) -> found
             Err(why) ->
+                val advice = unmet_of(need.pc).1
+
+                if !advice.is_empty() && pkg_config_available()
+                    return Err(s"${need.who} needs the '${need.pc}' library and $why — ${need.why}. " +
+                        s"$advice, or say where '${need.pc}' is with " +
+                        s"'--include-path ${need.pc}=<dir>' and '--link-path <dir>'")
+
                 return Err(s"${need.who} needs the '${need.pc}' library and $why — " +
                     s"${need.why}. " +
                     (if pkg_config_available() then "Install it, or say where it is with " +

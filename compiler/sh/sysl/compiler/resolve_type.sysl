@@ -460,13 +460,38 @@ extent_term(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Buf[Mon
 
 // Whether a written count or value argument reads a value parameter that is only standing in --
 // the generic declaration being read in its own terms rather than instantiated.
+//
+// **What the form reads, this looks into**: an operator's operands, a comparison's, a call's
+// arguments and an `if`'s condition and branches (`value_terms.sysl`) -- so `Flag[N > 3]` is a
+// stand-in, not the `Flag[false]` it would fold to at the stand-in zero.
 names_stand_in(e: Expr, subst: Buf[Binding]) -> bool = *e.kind match
     Ident(n) -> bound_type(subst, n) match
         Some(ConstArg(_, _, stood, _)) -> stood
         _ -> false
     Unary(_, operand) -> names_stand_in(operand, subst)
     Binary(_, l, r) -> names_stand_in(l, subst) || names_stand_in(r, subst)
+    Compare(operands, _) -> any_names_stand_in(operands, subst)
+    Call(_, args) -> any_names_stand_in(args, subst)
+    NamedArg(_, value) -> names_stand_in(value, subst)
+    IfExpr(cond, then_body, else_body, _) ->
+        names_stand_in(cond, subst) || branch_names_stand_in(then_body, subst) ||
+            (else_body.is_some() && branch_names_stand_in(else_body.unwrap(), subst))
     _ -> false
+
+private any_names_stand_in(es: Buf[Expr], subst: Buf[Binding]) -> bool
+    for e in es
+        if names_stand_in(e, subst) then return true
+
+    false
+
+private branch_names_stand_in(body: Buf[Stmt], subst: Buf[Binding]) -> bool
+    for s in body
+        *s.kind match
+            ExprStmt(inner) -> if names_stand_in(inner, subst) then return true
+            _ -> ()
+
+    false
+end branch_names_stand_in
 
 // Whether a written lane type may be one: `can_be_lane`, or a type not settled yet. A qualifier is
 // refused here rather than peeled -- `<4>volatile u32` is the qualifier on the wrong side.

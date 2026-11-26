@@ -4663,6 +4663,20 @@ print(half(1.0))
 'x' of the 'extern' 'half' is f128, and C on 'aarch64-macos' has no binary128 type to spell it with
 ```
 
+A [function pointer](#a-function-s-address-extern-a-b-r) whose signature takes or answers one is
+refused on the same machines, wherever the program mentions its type, since C calls through it under
+that signature:
+
+```sysl target=aarch64-macos
+extern "on_tick" on_tick(f: *extern(f128) -> real)
+
+on_tick(null)
+```
+
+```error
+parameter 1 of the function pointer type '*extern(f128) -> real' is f128, and C on 'aarch64-macos' has no binary128 type to spell it with
+```
+
 The `c type` above is the declaration that is right on both kinds of machine.
 
 **A type C does not describe as an integer or a float is refused by name:**

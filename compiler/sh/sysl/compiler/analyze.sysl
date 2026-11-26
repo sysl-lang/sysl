@@ -1112,18 +1112,25 @@ stand_ins(a: &Analysis, scope: Scope, tparams: Buf[string],
           tvalues: Buf[TypeBinding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
+    var values = 0
+
     for tparam in tparams
-        out.push(Binding(tparam, stand_in(a, scope, tparam, tvalues)))
+        out.push(Binding(tparam, stand_in(a, scope, tparam, tvalues, values)))
+
+        if binding_named(tvalues, tparam).is_some() then values += 1
+    end for
 
     out
 end stand_ins
 
-private stand_in(a: &Analysis, scope: Scope, tp: string, tvalues: Buf[TypeBinding]) -> Type
+// A value parameter's symbol is its place among the declaration's value parameters, `index`, so a
+// form does not depend on how the parameter is spelled.
+private stand_in(a: &Analysis, scope: Scope, tp: string, tvalues: Buf[TypeBinding], index: int) -> Type
     val written = binding_named(tvalues, tp)
 
     if written.is_none() then return Abstract(tp, buf())
 
-    ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(), no_bindings()), true, term_symbol(tp))
+    ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(), no_bindings()), true, term_param(index, tp))
 end stand_in
 
 private resolve_func_signature(a: &Analysis, scope: Scope, tparams: Buf[string],
@@ -1462,19 +1469,31 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
 
     a.restore_complaints(mark)
 
+    // A member's own value parameters are numbered after the block's, as `bounded_pass` numbers them.
+    var values = 0
+
     for item in outer
         subst.push(item)
+
+        item.ty match
+            ConstArg(_, _, true, _) -> values += 1
+            _ -> ()
+    end for
 
     for i in 0..<m.tparams.len()
         val tp = m.tparams[i]
 
-        if binding_named(m.tvalues, tp).is_some() || holds_string(m.tpacks, tp) then
-            subst.push(Binding(tp, stand_in(a, scope, tp, m.tvalues)))
+        if binding_named(m.tvalues, tp).is_some() || holds_string(m.tpacks, tp)
+            subst.push(Binding(tp, stand_in(a, scope, tp, m.tvalues, values)))
+
+            if binding_named(m.tvalues, tp).is_some() then values += 1
         else
             val stood = Binding(tp, bounded[outer.len() + i].ty)
 
             subst.push(stood)
             own.push(stood)
+        end if
+    end for
 
     val before = a.settled
 

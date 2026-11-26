@@ -279,7 +279,23 @@ end gen_frame_entry
 // entry handed it first and every argument lent. The answer is the box with the one count the entry
 // built it with, owned by the statement as any call's result is. `None` where the call is not one.
 gen_frame_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span) -> Option[Val]
-    if !laid_in_frame(e.framed_calls, span) || !e.stack.entries.has(name) then return None
+    if !e.stack.entries.has(name) then return None
+
+    // The one site of a factory of a factory's frame entry: the slot its caller handed it is handed on,
+    // and its caller counts the box laid there.
+    if e.frame_site.is_some() && e.frame_site.unwrap() == span
+        var passed: Buf[IrArg] = buf()
+        val lent = written_by(args)
+
+        passed.push(ir_arg(LPtr, VReg(frame_slot_param())))
+
+        for j in 0..<args.len()
+            arg_value(e, args[j], &passed, lent, "")
+
+        return Some(gen_sysl_call(e, VGlobal(frame_symbol(e, name)), passed, ty))
+    end if
+
+    if !laid_in_frame(e.framed_calls, span) then return None
 
     val inner = ref_inner(ty)
     val slot = emit_alloca(e, fresh_reg(e), box_lty(e, inner), box_storage_align(e, inner))
