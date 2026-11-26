@@ -417,7 +417,9 @@ pkc_reason_requirement_present()
 
     assert_eq(pkc_reason("app", ["app.pc", pkc_pc("app", "dep"), "dep.pc", pkc_pc("dep", "")]), "answered")
 
-@test("the build's refusal carries the reason and the same two ways to answer it")
+// The advice names the requirement, not the module that was found: "install it" would send the
+// reader back to a library they already have.
+@test("the build's refusal names the missing requirement in its advice, and the flags that answer")
 pkc_reason_reaches_the_refusal()
     if !pkc_ready() then return
     if !pkg_config_available() then return
@@ -429,5 +431,37 @@ pkc_reason_reaches_the_refusal()
     pkc_drop_pcs(dir)
     remove_dir_all(root).unwrap_or(())
     assert_eq(said, "build failed: sysl: error: this project needs the 'sdl3-mixer' library and 'pkg-config' " +
-              "found 'sdl3-mixer', but its requirement 'readline' is not found — SDL3_mixer. Install it, or " +
-              "say where it is with '--include-path sdl3-mixer=<dir>' and '--link-path <dir>'")
+              "found 'sdl3-mixer', but its requirement 'readline' is not found — SDL3_mixer. Install 'readline' " +
+              "(its .pc must be on PKG_CONFIG_PATH), or say where 'sdl3-mixer' is with " +
+              "'--include-path sdl3-mixer=<dir>' and '--link-path <dir>'")
+
+@test("and for a version that is too old the advice names the package whose version fails")
+pkc_reason_version_reaches_the_refusal()
+    if !pkc_ready() then return
+    if !pkg_config_available() then return
+
+    val dir = pkc_pcs(["app.pc", pkc_pc("app", "dep >= 5"), "dep.pc", pkc_pc("dep", "")])
+    val root = pkc_project("app = \"the app library\"")
+    val said = pkc_ran(root)
+
+    pkc_drop_pcs(dir)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "build failed: sysl: error: this project needs the 'app' library and 'pkg-config' " +
+              "found 'app', but cannot use it: Package 'dep' has version '1.0', required version is '>= 5' — " +
+              "the app library. Install a version of 'dep' that satisfies it, or say where 'app' is with " +
+              "'--include-path app=<dir>' and '--link-path <dir>'")
+
+@test("while a module that is absent keeps 'Install it' for itself")
+pkc_reason_absent_keeps_its_advice()
+    if !pkc_ready() then return
+    if !pkg_config_available() then return
+
+    val dir = pkc_pcs(["other.pc", pkc_pc("other", "")])
+    val root = pkc_project("kayro = \"the Kayro library\"")
+    val said = pkc_ran(root)
+
+    pkc_drop_pcs(dir)
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(said, "build failed: sysl: error: this project needs the 'kayro' library and 'pkg-config' " +
+              "knows no 'kayro' — the Kayro library. Install it, or say where it is with " +
+              "'--include-path kayro=<dir>' and '--link-path <dir>'")
