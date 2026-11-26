@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { os }"
 
 ## Index
 
-[`supply_access`](#supply_access) [`supply_advise`](#supply_advise) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_dir_open`](#supply_dir_open) [`supply_fchmod`](#supply_fchmod) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_full_sync`](#supply_full_sync) [`supply_getcwd`](#supply_getcwd) [`supply_lchown`](#supply_lchown) [`supply_link`](#supply_link) [`supply_lock`](#supply_lock) [`supply_lock_now`](#supply_lock_now) [`supply_map`](#supply_map) [`supply_map_shared`](#supply_map_shared) [`supply_mkdir`](#supply_mkdir) [`supply_msync`](#supply_msync) [`supply_open`](#supply_open) [`supply_open_beneath`](#supply_open_beneath) [`supply_opendir`](#supply_opendir) [`supply_page_size`](#supply_page_size) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_space`](#supply_space) [`supply_stat`](#supply_stat) [`supply_stat_beneath`](#supply_stat_beneath) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_sync_data`](#supply_sync_data) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unlink_beneath`](#supply_unlink_beneath) [`supply_unmap`](#supply_unmap) [`supply_write`](#supply_write)
+[`supply_access`](#supply_access) [`supply_advise`](#supply_advise) [`supply_chdir`](#supply_chdir) [`supply_chmod`](#supply_chmod) [`supply_chown`](#supply_chown) [`supply_close`](#supply_close) [`supply_closedir`](#supply_closedir) [`supply_dir_open`](#supply_dir_open) [`supply_fchmod`](#supply_fchmod) [`supply_fstat`](#supply_fstat) [`supply_ftruncate`](#supply_ftruncate) [`supply_full_sync`](#supply_full_sync) [`supply_getcwd`](#supply_getcwd) [`supply_lchown`](#supply_lchown) [`supply_link`](#supply_link) [`supply_map`](#supply_map) [`supply_map_shared`](#supply_map_shared) [`supply_mkdir`](#supply_mkdir) [`supply_msync`](#supply_msync) [`supply_open`](#supply_open) [`supply_open_beneath`](#supply_open_beneath) [`supply_opendir`](#supply_opendir) [`supply_page_size`](#supply_page_size) [`supply_pread`](#supply_pread) [`supply_pwrite`](#supply_pwrite) [`supply_read`](#supply_read) [`supply_readdir`](#supply_readdir) [`supply_readlink`](#supply_readlink) [`supply_realpath`](#supply_realpath) [`supply_rename`](#supply_rename) [`supply_rmdir`](#supply_rmdir) [`supply_seek`](#supply_seek) [`supply_set_modified`](#supply_set_modified) [`supply_space`](#supply_space) [`supply_stat`](#supply_stat) [`supply_stat_beneath`](#supply_stat_beneath) [`supply_symlink`](#supply_symlink) [`supply_sync`](#supply_sync) [`supply_sync_data`](#supply_sync_data) [`supply_temp_dir`](#supply_temp_dir) [`supply_truncate`](#supply_truncate) [`supply_unlink`](#supply_unlink) [`supply_unlink_beneath`](#supply_unlink_beneath) [`supply_unmap`](#supply_unmap) [`supply_watch_add`](#supply_watch_add) [`supply_watch_close`](#supply_watch_close) [`supply_watch_open`](#supply_watch_open) [`supply_watch_read`](#supply_watch_read) [`supply_watch_remove`](#supply_watch_remove) [`supply_write`](#supply_write)
 
 ## Functions
 
@@ -101,18 +101,6 @@ supply_lchown(path: *u8, len: usize, owner: u32, group: u32) -> int
 
 ```sysl
 supply_link(existing: *u8, existing_len: usize, fresh: *u8, fresh_len: usize) -> int
-```
-
-### `supply_lock`
-
-```sysl
-supply_lock(fd: int, how: int) -> int
-```
-
-### `supply_lock_now`
-
-```sysl
-supply_lock_now(fd: int, how: int) -> int
 ```
 
 ### `supply_map`
@@ -287,6 +275,36 @@ supply_unlink_beneath(dir: int, path: *u8, len: usize) -> int
 
 ```sysl
 supply_unmap(at: *u8, len: usize) -> int
+```
+
+### `supply_watch_add`
+
+```sysl
+supply_watch_add(handle: usize, path: *u8, len: usize) -> int
+```
+
+### `supply_watch_close`
+
+```sysl
+supply_watch_close(handle: usize) -> int
+```
+
+### `supply_watch_open`
+
+```sysl
+supply_watch_open(handle: *usize) -> int
+```
+
+### `supply_watch_read`
+
+```sysl
+supply_watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> isize
+```
+
+### `supply_watch_remove`
+
+```sysl
+supply_watch_remove(handle: usize, id: int) -> int
 ```
 
 ### `supply_write`

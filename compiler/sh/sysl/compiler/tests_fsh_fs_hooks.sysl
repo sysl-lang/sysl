@@ -469,6 +469,113 @@ fsh_mapping_hooks_unanswered_refused()
     lbr_drop([p, out])
 end fsh_mapping_hooks_unanswered_refused
 
+// -- watching for changes ------------------------------------------------------------------------------
+
+// A program using every call of `sysl.fs.watch`, so that each of its five hooks is reached.
+private val fsh_watches: string = raw"""
+    import sysl.fs.watch.Watcher
+    import sysl.fs.sys.Stat
+
+    run() -> int
+        var n = 0
+
+        Watcher.open() match
+            Ok(w) ->
+                w.add("/d") match
+                    Ok(id) -> if w.remove(id).is_ok() then n += 1
+                    Err(_) -> ()
+
+                w.read() match
+                    Ok(got) -> n += int(got.len())
+                    Err(_) -> ()
+
+                if w.close().is_ok() then n += 1
+            Err(_) -> ()
+
+        n
+    end run
+    """
+
+// The five watch hooks, each answering "not supported" through a volatile, as `fsh_hooks` does.
+private val fsh_watch_hooks: string = raw"""
+    @export("sysl_fs_watch_open")
+    @noinline
+    k_watch_open(handle: *usize) -> int
+        var answer = -38
+        val v: *volatile int = ptr_cast(&answer)
+
+        v[0]
+
+    @export("sysl_fs_watch_add")
+    @noinline
+    k_watch_add(handle: usize, path: *u8, len: usize) -> int
+        var answer = -38
+        val v: *volatile int = ptr_cast(&answer)
+
+        v[0]
+
+    @export("sysl_fs_watch_remove")
+    @noinline
+    k_watch_remove(handle: usize, id: int) -> int
+        var answer = -38
+        val v: *volatile int = ptr_cast(&answer)
+
+        v[0]
+
+    @export("sysl_fs_watch_read")
+    @noinline
+    k_watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> isize
+        var answer: isize = -38
+        val v: *volatile isize = ptr_cast(&answer)
+
+        v[0]
+
+    @export("sysl_fs_watch_close")
+    @noinline
+    k_watch_close(handle: usize) -> int
+        var answer = -38
+        val v: *volatile int = ptr_cast(&answer)
+
+        v[0]
+    """
+
+@test("a freestanding program watching for changes links once it answers the five watch hooks, with no libc")
+fsh_watch_hooks_answered_link()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_watches + fsh_runtime + fsh_hooks([]) + fsh_watch_hooks)
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+    assert(all.contains(" T sysl_fs_watch_open"), all)
+    assert(all.contains(" T sysl_fs_watch_read"), all)
+
+    for name in ["kqueue", "kevent", "inotify_init1", "sysl_fs_host_watch_open", "pthread_mutex_lock"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_watch_hooks_answered_link
+
+@test("a freestanding program watching for changes and answering none of the watch hooks is refused naming all five")
+fsh_watch_hooks_unanswered_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_watches + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with the watch hooks unanswered")
+    assert(said.1.contains("define 'sysl_fs_watch_add', 'sysl_fs_watch_close', 'sysl_fs_watch_open', " +
+                           "'sysl_fs_watch_read', 'sysl_fs_watch_remove' with '@export'"), said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+
+    lbr_drop([p, out])
+end fsh_watch_hooks_unanswered_refused
+
 @test("on a hosted target a mapping is unmapped once, when its last reference goes, and an empty one never")
 fsh_hosted_mapping_unmaps_on_drop()
     if !lbr_ready() then return
