@@ -58,6 +58,16 @@ private names_of(p: *u8, into: *u8, room: usize, follow: int) -> isize =
     if follow != 0 then c_listxattr(p, into, room) else c_llistxattr(p, into, room)
 #endif
 
+/** The path and the attribute name each copied with a terminator: zero, or the status the first one
+ * that could not be copied is answered with, as `terminated` gives it.
+ */
+private copied(path: *u8, len: usize, p: []u8, name: *u8, name_len: usize, n: []u8) -> int
+    val bad_path = terminated(path, len, p)
+    if bad_path != 0 then return bad_path
+
+    terminated(name, name_len, n)
+end copied
+
 @export("sysl_fs_getxattr")
 supply_getxattr(path: *u8, len: usize, name: *u8, name_len: usize, follow: int, into: *u8, room: usize,
                 got: *usize) -> int
@@ -65,7 +75,8 @@ supply_getxattr(path: *u8, len: usize, name: *u8, name_len: usize, follow: int, 
     var p: [path_room]u8
     var n: [path_room]u8
 
-    if !terminated(path, len, p[..]) || !terminated(name, name_len, n[..]) then return name_too_long
+    val bad = copied(path, len, p[..], name, name_len, n[..])
+    if bad != 0 then return bad
 
     val size = value_of(&p[0], &n[0], if room == 0 then null else into, room, follow)
 
@@ -85,7 +96,8 @@ supply_setxattr(path: *u8, len: usize, name: *u8, name_len: usize, value: *u8, v
     var p: [path_room]u8
     var n: [path_room]u8
 
-    if !terminated(path, len, p[..]) || !terminated(name, name_len, n[..]) then return name_too_long
+    val bad = copied(path, len, p[..], name, name_len, n[..])
+    if bad != 0 then return bad
 
     status(stored(&p[0], &n[0], value, value_len, follow))
 #else
@@ -99,7 +111,8 @@ supply_removexattr(path: *u8, len: usize, name: *u8, name_len: usize, follow: in
     var p: [path_room]u8
     var n: [path_room]u8
 
-    if !terminated(path, len, p[..]) || !terminated(name, name_len, n[..]) then return name_too_long
+    val bad = copied(path, len, p[..], name, name_len, n[..])
+    if bad != 0 then return bad
 
     status(removed(&p[0], &n[0], follow))
 #else
@@ -112,7 +125,8 @@ supply_listxattr(path: *u8, len: usize, follow: int, into: *u8, room: usize, got
 #if macos || linux || android
     var p: [path_room]u8
 
-    if !terminated(path, len, p[..]) then return name_too_long
+    val bad = terminated(path, len, p[..])
+    if bad != 0 then return bad
 
     val size = names_of(&p[0], if room == 0 then null else into, room, follow)
 

@@ -1,0 +1,288 @@
+module sysl.fs.watch
+@requires(os)
+
+/** Watching files and directories for changes: a `Watcher` holding any number of watches, whose
+ * descriptor is readable while it has something to report, and a `read` that answers what changed.
+ *
+ *     val w = Watcher.open()?
+ *     val site = w.add("site")?
+ *
+ *     loop
+ *         if w.readable(500.ms)?
+ *             for e in w.read()?.view()
+ *                 rebuild(e.path)
+ *
+ * **The descriptor is the kernel's** -- a kqueue on Darwin and the BSDs, an inotify instance on Linux
+ * -- so a watcher is waited on as any descriptor is: `readable` here, `sysl.io.wait.ready` on `fd()`,
+ * or registered with a `sysl.io.poll.Poller` among sockets and pipes, which is how a server or a
+ * fiber runtime waits for a change without a thread of its own. **Readable is "look", not a
+ * promise**: a `read` that follows may answer nothing, a change undone before it was read being no
+ * change (below). `read` itself never waits.
+ *
+ * ## What is reported
+ *
+ * | change | a watched file | a watched directory |
+ * |---|---|---|
+ * | `Created` | -- | an entry appeared in it |
+ * | `Removed` | the file itself went | an entry went from it, or the directory itself went |
+ * | `Modified` | its contents or its length changed | -- |
+ * | `Renamed` | it moved; `to` is `None` | an entry moved, `path` to `to`; or it moved, `to` `None` |
+ * | `Attributes` | its mode, owner, times or link count changed | its own changed |
+ * | `Overflow` | events were lost: what is watched should be looked at again | |
+ *
+ * **A directory watch is of its entries, not their contents.** A file written, truncated or chmod-ed
+ * inside a watched directory is not reported, on either system: inotify would say so, but kqueue
+ * cannot without holding a descriptor for every entry, and a directory of a few hundred files would
+ * use up a process's descriptors. A program following a file's contents watches the file.
+ *
+ * **Nothing is recursive.** A directory's subdirectories are entries like any other: one appearing
+ * is `Created`, and what happens inside it is not seen until it is watched itself. inotify has no
+ * recursive watch, and one built by adding each new subdirectory as it appears misses what is made
+ * in it before the add, so none is offered.
+ *
+ * **The events describe what changed, not every operation.** kqueue folds every change to one
+ * watched object between two reads into one notification, and under it a directory's entries are a
+ * snapshot of names and inode numbers compared with a fresh listing, so a file made and removed
+ * between two reads is no event at all, and three writes may be one `Modified`. inotify queues each
+ * operation, and an event the same as the one before it is folded into it. Where kqueue has folded
+ * several kinds of change to one object into one notification, they come back in one fixed order --
+ * `Modified`, `Attributes`, `Renamed`, `Removed` -- not the order they happened in. Either way a
+ * program reads what is there now when it needs to be sure.
+ *
+ * **A rename is one event where both names are watched** -- within one directory, or between two
+ * directories this watcher watches on one filesystem -- with `path` the old name and `to` the new.
+ * A move out of everything watched is `Removed`, and a move in is `Created`. A watched file or
+ * directory that is itself moved is `Renamed` with `to` `None`, since neither system says where it
+ * went, and **the watch follows it**: later events still name it by the path it was added with.
+ *
+ * **A watch ends when what it watches is removed**, after the `Removed`; `remove` on it then answers
+ * `NotFound`.
+ *
+ * **`Overflow`** is inotify's queue having filled -- 16,384 events by default -- before they were
+ * read; under kqueue, which has no queue to fill, it is a watched directory that could not be listed
+ * again. Either way some changes were not reported, and the program looks at what it watches afresh.
+ *
+ * A target with neither kqueue nor inotify answers every call with the error
+ * `sysl.fs.unsupported()` stands for. It needs an operating system: a freestanding program reaching
+ * it answers the `sysl_fs_watch_*` hooks itself (`sysl.fs.sys`).
+ */
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{File, IoError, NotOpen, from_status, name_text}
+import sysl.fs.sys.{watch_add, watch_close, watch_open, watch_read, watch_remove}
+import sysl.io.wait.{Readable, Wait, Writable, ready}
+import sysl.slices.{as_mut_ptr, as_ptr}
+import sysl.sync.Atomic
+import sysl.time.Duration
+
+/** What happened to a watched file or directory, or to an entry of a watched directory. */
+enum Change derives Display
+    /** An entry appeared in a watched directory -- made, or moved in from somewhere not watched. */
+    Created
+
+    /** An entry went from a watched directory, or what a watch watches went itself -- removed, or
+     * moved somewhere not watched.
+     */
+    Removed
+
+    /** A watched file's contents or length changed. */
+    Modified
+
+    /** Something moved: an entry, from `path` to `to`, or what a watch watches, with `to` `None`. */
+    Renamed
+
+    /** A watched file's or directory's own mode, owner, times or link count changed. */
+    Attributes
+
+    /** Changes were lost before they were read. `path` is empty and `watch` is `None`. */
+    Overflow
+
+/** One path being watched, as `add` answered it: what `remove` takes, and what each `Event` names. */
+struct Watch derives Eq, Hash
+    private[watch] id: int
+
+/** One change: what it was, the path it concerns, the new path of a rename where it is known, and
+ * the watch that saw it.
+ *
+ * `path` is built from the path the watch was added with -- the path itself for a watched object, or
+ * that path joined to an entry's name -- so a relative path added is a relative path reported.
+ */
+struct Event derives Eq
+    change: Change
+    path: string
+    to: Option[string]
+    watch: Option[Watch]
+
+/** A watcher's descriptor and the supplier's state behind it, shared by every copy of the watcher and
+ * let go when the last copy goes, unless `close` let go of it already.
+ *
+ * **It is a `&sync`**, whose count is atomic, so a watcher may be handed to another thread; both
+ * words are `Atomic`, since a field reached through a `&sync` is written only atomically, and
+ * closing is one swap, so two copies closing at once close it once.
+ */
+private[watch] struct WatcherState
+    fd: Atomic[i32]
+    handle: Atomic[usize]
+
+/** The watcher closed, unreported (`sysl.Drop`). */
+impl Drop for WatcherState
+    // The last share going is the only reader left, so the word is read as it lies.
+    drop(self)
+        if self.handle.v != 0 then _ = watch_close(self.handle.v)
+
+/** A set of watches and the descriptor that is readable while any of them has something to report.
+ *
+ * **It closes itself**: every copy shares one watcher, whose descriptor is closed when the last copy
+ * goes. `close` gives it back at a moment of the program's own; every call after it, through any
+ * copy, answers `NotOpen`. A `read`, `add` or `remove` racing a `close` on another thread is the
+ * program's to order, as it is in C.
+ */
+struct Watcher
+    private[watch] state: &sync WatcherState
+
+    /** A watcher watching nothing yet. Fails only as the system's descriptors run out -- or inotify's
+     * instances, 128 per user by default -- or where the target has no way to watch at all.
+     */
+    open() -> Result[Watcher, IoError]
+        var handle: usize = 0
+        val fd = watch_open(&handle)
+
+        if fd < 0 then return Err(from_status(fd))
+
+        val state: &sync WatcherState = WatcherState(Atomic(i32(fd)), Atomic(handle))
+
+        Ok(Watcher(state))
+    end open
+
+    /** Start watching the file or directory at `path`, answering the watch its events will name.
+     *
+     * A symbolic link is followed, and what it names is watched. **A path already watched -- under
+     * that name or another -- answers the watch it already has**, so adding twice costs nothing and a
+     * `remove` of either answer stops both. A path that does not exist is `NotFound`; inotify refuses
+     * a watch past its limit -- 8,192 per user by default on older kernels -- as a lack of space
+     * (`ENOSPC`).
+     */
+    add(self, path: string) -> Result[Watch, IoError]
+        val got = watch_add(self.live()?, as_ptr(path.bytes), path.bytes.len)
+
+        if got < 0 then Err(from_status(got)) else Ok(Watch(got))
+
+    /** Stop a watch: no event of it is read afterwards, including one that happened before the call
+     * and was not yet read. A watch that is not there -- removed already, or ended because what it
+     * watched went -- is `NotFound`.
+     */
+    remove(self, w: Watch) -> Result[unit, IoError]
+        val got = watch_remove(self.live()?, w.id)
+
+        if got < 0 then Err(from_status(got)) else Ok(())
+
+    /** Every change there is to report, in the order it was seen -- or none, at once, where there is
+     * nothing. **It never waits**: wait with `readable`, `sysl.io.wait.ready` or a poller first.
+     *
+     * A path that is not UTF-8 makes the call answer `InvalidUtf8`, as `sysl.fs.entries` does; the
+     * events read with it are gone, and the next `read` goes on from there.
+     */
+    read(self) -> Result[Buf[Event], IoError]
+        val handle = self.live()?
+        var events: Buf[Event] = buf()
+        var size: usize = 16384
+        var room: []u8 = [0; size]
+
+        loop
+            var more: i32 = 0
+            val got = watch_read(handle, as_mut_ptr(room), room.len, &more)
+
+            if got == too_small
+                size *= 2
+                room = [0; size]
+                continue
+            end if
+
+            if got < 0 then return Err(from_status(int(got)))
+
+            decode(room[0..<usize(got)], &events)?
+
+            if more == 0 then break
+
+        Ok(events)
+    end read
+
+    /** The watcher's descriptor, lent: readable while there is something to `read`, for registering
+     * with a `sysl.io.poll.Poller` or waiting on with `sysl.io.wait.ready`. The watcher still closes
+     * it, so a number kept past that names nothing. A closed watcher answers `NotOpen`.
+     */
+    fd(self) -> Result[int, IoError]
+        val fd = self.state.fd.load()
+
+        if fd < 0 then Err(NotOpen) else Ok(int(fd))
+
+    /** Close the descriptor and every watch now, rather than when the last copy goes, and say whether
+     * that worked. A second `close`, through any copy, answers `NotOpen` and closes nothing.
+     */
+    close(self) -> Result[unit, IoError]
+        val handle = self.state.handle.swap(0)
+
+        if handle == 0 then return Err(NotOpen)
+
+        self.state.fd.store(-1)
+
+        val got = watch_close(handle)
+
+        if got < 0 then Err(from_status(got)) else Ok(())
+    end close
+
+    private live(self) -> Result[usize, IoError]
+        val handle = self.state.handle.load()
+
+        if handle == 0 then Err(NotOpen) else Ok(handle)
+
+/** Waiting on a watcher with a time limit: `readable` is whether a `read` would find the kernel
+ * holding something, within `timeout`. A watcher is never written, so `writable` answers whether its
+ * descriptor is open.
+ */
+impl Wait for Watcher
+    @blocks
+    readable(self, timeout: Duration) -> Result[bool, IoError] = ready(self.fd()?, Readable, timeout)
+
+    @blocks
+    writable(self, timeout: Duration) -> Result[bool, IoError] = ready(self.fd()?, Writable, timeout)
+
+/** `ERANGE`, negated -- 34 on every system this builds for: the records held do not fit the room. */
+private const too_small: isize = -34
+
+/** The bytes of a little-endian 32-bit number at `at`. */
+private word(b: []const u8, at: usize) -> u32 =
+    u32(b[at]) | u32(b[at + 1]) << 8 | u32(b[at + 2]) << 16 | u32(b[at + 3]) << 24
+
+/** A path's bytes copied out of the room, which the next read writes over, as text. */
+private text(b: []const u8, at: usize, n: usize) -> Result[string, IoError]
+    var p: []u8 = [0; n]
+
+    for i in 0..<n do p[i] = b[at + i]
+
+    name_text(p)
+
+/** Every record in `b` decoded onto `into` (`sysl.fs.sys § watching for changes`). */
+private decode(b: []const u8, into: *Buf[Event]) -> Result[unit, IoError]
+    var at: usize = 0
+
+    while at + 16 <= b.len
+        val from_len = usize(word(b, at + 8))
+        val to_len = usize(word(b, at + 12))
+        val change = b[at] match
+            1 -> Created
+            2 -> Removed
+            3 -> Modified
+            4 -> Renamed
+            5 -> Attributes
+            _ -> Overflow
+        val path = text(b, at + 16, from_len)?
+        val to = if b[at + 1] == 1 then Some(text(b, at + 16 + from_len, to_len)?) else None
+        val watch = if change == Overflow then None else Some(Watch(int(word(b, at + 4))))
+
+        into.push(Event(change, path, to, watch))
+        at += 16 + from_len + to_len
+    end while
+
+    Ok(())
+end decode
