@@ -179,6 +179,34 @@ wnh_holder_accepted()
     assert(!header.contains("} E;"), header)
     wnh_has(header, "extern O g_o;\n")
 
+// Where in its holder the empty struct sits does not matter: first, last, two deep inside a struct of
+// only empty structs, in a `@packed` struct, and inside a struct another holds. Each is left out, and
+// MSVC lays out the rest as sysl does (clang `--target=x86_64-pc-windows-msvc`: `{ int32_t a; }` 4,
+// `{ int8_t a; }` 1, `{ int32_t a; int32_t b; }` 8 with b at 4, packed `{ int8_t a; int32_t b; }` 5
+// with b at 1; sysl gives each the same).
+@test("an empty struct first, last, two deep, in a packed or a held struct is left out and not refused")
+wnh_holder_positions()
+    if !std_root().is_ok() then return
+
+    val text = s"${wnh_empty()}struct D\n    e: E\nstruct First\n    e: E\n    a: i32\nstruct Last\n    a: i8\n" +
+               "    e: E\nstruct Deep\n    a: i32\n    d: D\n    b: i32\n@packed\nstruct P\n    a: i8\n    e: E\n" +
+               "    b: i32\n@export(\"XMid\")\nstruct Mid\n    a: i32\n    e: E\n    b: i32\nstruct Outer\n" +
+               "    m: Mid\n    c: i32\n@export(\"at_first\")\nat_first(p: *First) -> i32 = 0\n" +
+               "@export(\"at_last\")\nat_last(p: *Last) -> i32 = 0\n@export(\"deep\")\ndeep(p: *Deep) -> i32 = 0\n" +
+               "@export(\"in_packed\")\nin_packed(p: *P) -> i32 = 0\n@export(\"outer\")\nouter(p: *Outer) -> i32 = 0\n" +
+               "@export(\"hook\")\nhook(cb: *extern(*Mid) -> i32) -> i32 = 0\n"
+    val header = wnh_emit_header(text, wnh_win())
+
+    wnh_has(header, "typedef struct {\n\tint32_t a;\n} First;\n")
+    wnh_has(header, "typedef struct {\n\tint8_t a;\n} Last;\n")
+    wnh_has(header, "typedef struct {\n\tint32_t a;\n\tint32_t b;\n} Deep;\n")
+    wnh_has(header, "SYSL_PACK_PUSH\ntypedef struct SYSL_PACKED {\n\tint8_t a;\n\tint32_t b;\n} P;\n")
+    wnh_has(header, "typedef struct {\n\tint32_t a;\n\tint32_t b;\n} XMid;\n")
+    wnh_has(header, "typedef struct {\n\tXMid m;\n\tint32_t c;\n} Outer;\n")
+    wnh_has(header, "int32_t hook(int32_t (*cb)(XMid *));\n")
+    assert(!header.contains("} E;") && !header.contains("} D;"), header)
+    wnh_emit_elsewhere(text)
+
 // `struct E z[0]` is no bytes in either C, and a `[0]E` occupies none in sysl.
 @test("a pointer to, or storage of, no empty structs at all is not refused")
 wnh_zero_length_accepted()

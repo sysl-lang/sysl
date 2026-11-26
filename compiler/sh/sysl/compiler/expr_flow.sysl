@@ -2060,10 +2060,14 @@ end unrolled
 // `if const cond` -- the branch decided **while compiling**. The condition is folded, and only the arm
 // it picks is read: the other is never type-checked, which is what lets one generic body hold an arm
 // that makes sense only for some of its instances. A generic body read before any instance has no
-// value for its parameters, so there neither arm is read; each instance reads the one it takes.
+// value for its parameters, so there no arm is read for its value; each instance reads the one it
+// takes -- except that the first arm of `if const N == c` is read for what it keeps (`refined_arm`).
 const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_body: Option[Buf[Stmt]],
               expected: Option[Type], discarded: bool) -> TExpr
-    if cx.at_definition then return TExpr(span, TZero(Unknown))
+    if cx.at_definition
+        refined_arm(cx, cond, then_body, expected, discarded)
+        return TExpr(span, TZero(Unknown))
+    end if
 
     val mark = cx.an.complaints()
 
@@ -2097,6 +2101,52 @@ const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_
         Some(b) -> TExpr(span, TBlockExpr(type_value_block(cx, b, expected, discarded)))
         None -> TExpr(span, TBlockExpr(TBlock(buf(), None, Unit)))
 end const_if_expr
+
+// **The arm `if const N == c` guards is read at the definition with `N` as `c`** (decision 10 of
+// `docs/design/type-level-consts.md`): it is taken only by the instantiation at `c`, so a value
+// argument computed there is what it is at `c` -- `Buf[0]` is the `Buf[N]` asked for -- and what
+// still disagrees over the other parameters is wrong for every instantiation that takes it. Only what
+// the definition walk keeps (`keep_value_clash`) can come of it; the arm's value is not the
+// expression's, which stays the instances'. Any other condition refines nothing, and no other arm is
+// read: whether an `else` is taken is not a substitution.
+private refined_arm(cx: &Analyzer, cond: Expr, then_body: Buf[Stmt], expected: Option[Type], discarded: bool)
+    val found = refinement_of(cx, cond)
+
+    if found.is_none() then return
+
+    val r = found.unwrap()
+    val saved_subst = cx.subst
+    val saved_refined = cx.refined
+    var subst: Buf[Binding] = buf()
+
+    for b in cx.subst
+        subst.push(if b.name == r.name then Binding(b.name, refined_param(b.ty, r)) else b)
+
+    var refined: Buf[Refinement] = buf()
+
+    for x in cx.refined
+        refined.push(x)
+
+    refined.push(r)
+    cx.subst = subst
+    cx.refined = refined
+
+    val want = expected.map(t -> refine_type(cx.an, t, refined))
+    val arm = type_value_block(cx, then_body, want, discarded)
+
+    if expected.is_some() && arm.result.is_some() && arm.ty != Unknown then
+        keep_value_clash(cx, cond.span, s"the first arm of this 'if const' yields ${type_show(arm.ty)}, but " +
+                         s"${type_show(expected.unwrap())} is expected", expected.unwrap(), arm.ty)
+
+    cx.subst = saved_subst
+    cx.refined = saved_refined
+end refined_arm
+
+// The stand-in a refined parameter is bound to inside its arm: the value the condition names, as an
+// instantiation would have given it.
+private refined_param(stood: Type, r: Refinement) -> Type = stood match
+    ConstArg(_, ty, _, _) -> ConstArg(r.value, *ty, false, buf())
+    _ -> stood
 
 // Files the span of an `if const` read in an instance under the instance's name, once.
 private note_const_arm(a: &Analysis, body: string, span: Span)

@@ -613,7 +613,10 @@ term_text(p: Buf[Mono]) -> string
             val negative = m.coeff.sign() < 0
             val size = big_abs(m.coeff)
             val one = size == from_int(1) && !m.factors.is_empty()
+            val after = divides_alone(m) && !(first && negative)
             val shown = if m.factors.is_empty() then to_string(size)
+                        else if after && one then factor_text(m.factors[0])
+                        else if after then s"${factor_text(m.factors[0])} * ${to_string(size)}"
                         else if one then factors_text(m.factors, whole)
                         else s"${to_string(size)} * ${factors_text(m.factors, false)}"
 
@@ -624,6 +627,14 @@ term_text(p: Buf[Mono]) -> string
 
     out
 end term_text
+
+// Whether a monomial is one `/` or `%` times a constant -- shown with the constant after it, `N / 2 *
+// 2`, the way a rounding down is written, and bare after a `+` or `-`, `N - N % 3`; the two operators
+// bind as `*` does, so no parentheses are needed and none are read in. A leading minus keeps them:
+// `-(N / 2)` is not `-N / 2` under truncation.
+private divides_alone(m: Mono) -> bool =
+    m.factors.len() == 1 && m.factors[0].param < 0 && (m.factors[0].op == "/" || m.factors[0].op == "%") &&
+    m.factors[0].args.len() == 2
 
 private factors_text(fs: Buf[Factor], whole: bool) -> string
     var out = ""
@@ -754,8 +765,42 @@ term_difference(want: Type, got: Type) -> string
 
     if gap.is_some() then return s"the two differ by ${to_string(big_abs(gap.unwrap()))} $every"
 
+    // An atom in the difference is what the form does not see into, so it is named: the two may be
+    // one at every instantiation (`N / 2 * 2` and `N - N % 2`), and the form cannot show it.
+    val atom = first_atom(term_add(g, term_neg(w)))
+
+    if atom.is_some() then
+        return s"${atom_said(atom.unwrap())} is compared as written, and '${term_text(g)}' is not " +
+               s"'${term_text(w)}' $every"
+
     s"'${term_text(g)}' and '${term_text(w)}' are not the same value $every"
 end term_difference
+
+// The atom a difference turns on: the first of the side that was given (a monomial added), else the
+// first of the side asked for, where it holds one at its top.
+private first_atom(p: Buf[Mono]) -> Option[Factor]
+    for pass in 0..<2
+        for m in p
+            if (m.coeff.sign() > 0) != (pass == 0) then continue
+
+            for f in m.factors
+                if f.param < 0 then return Some(f)
+        end for
+    end for
+
+    None
+end first_atom
+
+// An atom as the reason a comparison stops at it: `'/' by 2`, `'%' by 'M'`, `'double'`, `'min'`.
+private atom_said(f: Factor) -> string
+    if (f.op == "/" || f.op == "%") && f.args.len() == 2
+        val k = term_constant(f.args[1])
+
+        return if k.is_some() then s"'${f.op}' by ${to_string(k.unwrap())}" else s"'${f.op}' by '${term_text(f.args[1])}'"
+    end if
+
+    if f.op == "call" then s"'${f.shown}'" else s"'${f.op}'"
+end atom_said
 
 private term_of_arg(t: Type) -> Buf[Mono] = t match
     ConstArg(_, _, _, term) -> term
@@ -801,13 +846,213 @@ end value_clash
 // the two part only at a parameter: inside its declaration a parameter is a symbol, so that is wrong
 // as written, and an instantiation may never be made. Any other mismatch there is left for the
 // instantiations.
+//
+// **Inside an arm an `if const N == c` guards, `N` is `c`** (`refined_arm`), so the two are compared
+// with every refinement in force applied to both: `[0]int` where `[N]int` was asked for agrees there,
+// and what still differs is told with the arm's condition.
 keep_value_clash(cx: &Analyzer, at: Span, refusal: string, want: Type, got: Type)
     if !cx.at_definition then return
 
-    val told = value_clash_told(refusal, want, got, own_type_params(cx.subst))
+    val own = own_type_params(cx.subst)
 
-    if told.is_some() then cx.an.bound_fault(cx.scope, at, told.unwrap())
+    if cx.refined.is_empty()
+        val told = value_clash_told(refusal, want, got, own)
+
+        if told.is_some() then cx.an.bound_fault(cx.scope, at, told.unwrap())
+        return
+    end if
+
+    val w = refine_type(cx.an, want, cx.refined)
+    val g = refine_type(cx.an, got, cx.refined)
+
+    if type_eq(w, g) then return
+
+    val arm = s"the arm is taken only where ${refined_text(cx.refined)}, and there"
+    val still = value_clash(w, g, own)
+
+    if still.is_some()
+        cx.an.bound_fault(cx.scope, at, s"$refusal — $arm ${clash_difference(still.unwrap().0, still.unwrap().1)}")
+        return
+    end if
+
+    // The two parted at a parameter, and the refinement made both sides constants that still differ:
+    // wrong at the one instantiation that takes the arm.
+    if value_clash_told(refusal, want, got, own).is_none() then return
+
+    cx.an.bound_fault(cx.scope, at, s"$refusal — $arm they are ${type_show(w)} and ${type_show(g)}")
 end keep_value_clash
+
+// -- `if const N == c` --------------------------------------------------------------------------------
+
+// What an arm guarded by `if const N == c` knows: the value parameter at `index` (spelled `name`) is
+// `value` there. Decision 10 of `docs/design/type-level-consts.md`: the one refinement that is a
+// substitution.
+struct Refinement
+    index: int
+    name: string
+    value: BigInt
+    said: string
+
+// The refinements, as a reader says them: `N is 0`, `N is 0 and M is 2`.
+private refined_text(rs: Buf[Refinement]) -> string
+    var parts: Buf[string] = buf()
+
+    for r in rs
+        parts.push(s"${r.name} is ${r.said}")
+
+    spoken_list(parts)
+end refined_text
+
+// `p` with the parameter at `index` replaced by `c`, normalised again -- so an atom whose operands
+// all become constants folds where its operator is one the form folds (`/`, `%`, a comparison, `!`,
+// `&&`, `||`, `if`, `min`, `max`), and a call stays the call over its new operands.
+term_refine(p: Buf[Mono], index: int, c: BigInt) -> Buf[Mono]
+    var out: Buf[Mono] = buf()
+
+    for m in p
+        var acc = term_const(m.coeff)
+
+        for f in m.factors
+            val one = if f.param == index then term_const(c)
+                      else if f.param >= 0 then one_factor(f)
+                      else refined_atom(f, index, c)
+
+            acc = term_mul(acc, one)
+        end for
+
+        out = term_add(out, acc)
+    end for
+
+    out
+end term_refine
+
+private refined_atom(f: Factor, index: int, c: BigInt) -> Buf[Mono]
+    var args: Buf[Buf[Mono]] = buf()
+
+    for x in f.args
+        args.push(term_refine(x, index, c))
+
+    if f.op == "/" || f.op == "%" then return term_div(f.op, args[0], args[1])
+    if f.op == "<" || f.op == "<=" || f.op == ">" || f.op == ">=" || f.op == "==" || f.op == "!=" then
+        return term_compare(f.op, args[0], args[1])
+    if f.op == "!" && args.len() == 1 then return term_not(args[0])
+    if f.op == "&&" || f.op == "||" then return term_logic(f.op, args[0], args[1])
+    if f.op == "if" then return term_if(args[0], args[1], args[2])
+    if f.op == "min" || f.op == "max" then return term_min_max(f.op, args)
+
+    term_atom(f.op, f.key, f.shown, args)
+end refined_atom
+
+// `t` with every refinement applied to each value argument, length and lane count it holds. One that
+// comes to a constant becomes that constant, as an instantiation would have written it.
+refine_type(a: &Analysis, t: Type, rs: Buf[Refinement]) -> Type = t match
+    ConstArg(v, ty, stood, term) -> if term.is_empty() then t else refined_arg(v, *ty, stood, refined_term(term, rs))
+    Array(n, elem, term) ->
+        val r = refined_term(term, rs)
+        val k = if term.is_empty() then None else term_constant(r)
+
+        if k.is_some() then Array(int(k.unwrap().to_long().unwrap_or(0)), refine_type(a, *elem, rs), buf())
+        else Array(n, refine_type(a, *elem, rs), r)
+    Vector(n, elem, term) ->
+        val r = refined_term(term, rs)
+        val k = if term.is_empty() then None else term_constant(r)
+
+        if k.is_some() then Vector(int(k.unwrap().to_long().unwrap_or(0)), refine_type(a, *elem, rs), buf())
+        else Vector(n, refine_type(a, *elem, rs), r)
+    Struct(d) ->
+        if d.targs.is_empty() then t
+        else if is_tuple(d) then Struct(registered_tuple(a, refine_list(a, d.targs, rs)))
+        else reinstantiate(a, d.base, refine_list(a, d.targs, rs))
+    Enum(d) -> if d.targs.is_empty() then t else reinstantiate(a, d.base, refine_list(a, d.targs, rs))
+    Ptr(inner, ro) -> Ptr(refine_type(a, *inner, rs), ro)
+    Ref(inner, sync) -> Ref(refine_type(a, *inner, rs), sync)
+    Weak(inner) -> Weak(refine_type(a, *inner, rs))
+    Slice(elem, ro) -> Slice(refine_type(a, *elem, rs), ro)
+    Volatile(inner) -> Volatile(refine_type(a, *inner, rs))
+    Trait(n, args, assocs) -> Trait(n, refine_list(a, args, rs), assocs)
+    _ -> t
+
+private refined_arg(v: BigInt, ty: Type, stood: bool, r: Buf[Mono]) -> Type
+    val k = term_constant(r)
+
+    if k.is_some() then ConstArg(k.unwrap(), ty, false, buf()) else ConstArg(v, ty, stood, r)
+end refined_arg
+
+private refined_term(p: Buf[Mono], rs: Buf[Refinement]) -> Buf[Mono]
+    var out = p
+
+    for r in rs
+        out = term_refine(out, r.index, r.value)
+
+    out
+end refined_term
+
+private refine_list(a: &Analysis, ts: Buf[Type], rs: Buf[Refinement]) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    for t in ts
+        out.push(refine_type(a, t, rs))
+
+    out
+end refine_list
+
+// The refinement `if const cond` gives its first arm, where `cond` is one of the declaration's own
+// value parameters, bare, against a constant (`N == 0`, `0 == N`); nothing for any other condition.
+// The parameter is one whose stand-in is a bare symbol -- an integer, a `bool` or a `char` -- and the
+// constant one it can hold: an arm guarded by a value the parameter's type never takes is never
+// taken, and reading it as if it were would refuse what no instantiation reads.
+refinement_of(cx: &Analyzer, cond: Expr) -> Option[Refinement]
+    val sides = *cond.kind match
+        Compare(operands, ops) -> if ops.len() == 1 && ops[0] == "==" then Some((operands[0], operands[1])) else None
+        Binary(op, l, r) -> if op == "==" then Some((l, r)) else None
+        _ -> None
+
+    if sides.is_none() then return None
+
+    val l = sides.unwrap().0
+    val r = sides.unwrap().1
+    val left = refined_side(cx, l, r)
+
+    if left.is_some() then left else refined_side(cx, r, l)
+end refinement_of
+
+private refined_side(cx: &Analyzer, param: Expr, other: Expr) -> Option[Refinement]
+    val name = *param.kind match
+        Ident(n) -> n
+        _ -> return None
+
+    val bound = bound_type(cx.subst, name)
+
+    if bound.is_none() then return None
+
+    val found = bound.unwrap() match
+        ConstArg(_, ty, true, term) -> if bare_symbol(term) then Some((*ty, term[0].factors[0].param)) else None
+        _ -> None
+
+    if found.is_none() || names_stand_in(other, cx.subst) then return None
+
+    val mark = cx.an.complaints()
+    val folded = const_fold(cx, other)
+
+    cx.an.restore_complaints(mark)
+
+    val ty = found.unwrap().0
+    val value = folded match
+        Some(ConstInt(v)) -> v
+        Some(ConstBool(b)) -> from_int(if b then 1 else 0)
+        Some(ConstChar(c)) -> from_int(long(int(u32(c))))
+        _ -> return None
+
+    val fits = underlying(ty) match
+        Integer(bits, signed, _) -> fits(value, bits, signed)
+        Bool -> value == from_int(0) || value == from_int(1)
+        Char -> value.sign() >= 0
+        _ -> false
+
+    if !fits then return None
+
+    Some(Refinement(found.unwrap().1, name, value, doc_expr_text(other)))
+end refined_side
 
 // The type parameters a definition's walk stands in for themselves: each binding of a name to the
 // stand-in of that same name. A pack's two stand-ins, an associated type's projection and a `some`
