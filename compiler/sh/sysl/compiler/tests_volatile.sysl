@@ -1194,12 +1194,153 @@ vo_arm_whole_words_accepted()
             assert_eq(vo_count(body, "store volatile i32"), usize(words), body)
             assert_eq(vo_count(body, "load volatile") + vo_count(body, "store volatile"), usize(3 * words), body)
 
-@test("a volatile of 32 bits or fewer at an odd width (u24) is accepted on 32-bit ARM, as before")
-vo_arm_narrow_odd_accepted()
+// On 32-bit ARM a volatile of 32 bits or fewer is one `ldr`/`str` of its storage, which must be 1, 2 or
+// 4 bytes: a width of 17 to 24 bits is held in 3, which LLVM moved as an `ldrh` and an `ldrb` (an M33
+// read the high byte first), so it is refused at every place a qualifier goes. A bitfield struct is
+// reached as its one container, so there the container's width decides, not a field's.
+private vo_arm_three_said(out: string, shown: string, bits: string)
+    assert(vo_has(out, s"'volatile $shown' is not a type on "), out)
+    assert(vo_has(out, s"it is $bits bits wide, held in 3 bytes"), out)
+    assert(vo_has(out, "Widen it to 32 bits, as 'volatile u32', or narrow it to 16 bits or fewer"), out)
+end vo_arm_three_said
+
+private vo_arm_container_said(out: string, name: string, field: string, bits: string)
+    assert(vo_has(out, s"'$name.$field' is volatile, and '$name' is a bitfield struct held in one integer of $bits bits on "), out)
+    assert(vo_has(out, s"whole 32-bit words, which $bits bits is not"), out)
+end vo_arm_container_said
+
+@test("a volatile u24 is refused on 32-bit ARM, loaded, stored and compound-assigned through a pointer")
+vo_arm_u24_refused()
     if !vo_ready() then return
 
     for m in vo_arm_machines
-        assert(!vo_has(vo_on(m, "@export(\"w\")\nw(p: *volatile u24) = *p = 1\n"), "whole 32-bit words"))
+        vo_arm_three_said(vo_on(m, "@export(\"r\")\nr(p: *volatile u24) -> u24 = *p\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "@export(\"w\")\nw(p: *volatile u24) = *p = 1\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "@export(\"w\")\nw(p: *volatile u24) = *p += 1\n"), "u24", "24")
+
+@test("so is every width held in 3 bytes -- i17, i20, u21, i24q8 -- and a simple enum over u24")
+vo_arm_three_byte_widths_refused()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        vo_arm_three_said(vo_on(m, "@export(\"r\")\nr(p: *volatile i17) -> i17 = *p\n"), "i17", "17")
+        vo_arm_three_said(vo_on(m, "@export(\"r\")\nr(p: *volatile i20) -> i20 = *p\n"), "i20", "20")
+        vo_arm_three_said(vo_on(m, "@export(\"r\")\nr(p: *volatile u21) -> u21 = *p\n"), "u21", "21")
+        vo_arm_three_said(vo_on(m, "@export(\"r\")\nr(p: *volatile i24q8) -> i24q8 = *p\n"), "i24q8", "24")
+        vo_arm_three_said(vo_on(m, "enum Mode: u24\n    Off\n    On\n@export(\"r\")\nr(p: *volatile Mode) -> bool = *p == Mode.On\n"),
+                          "Mode", "24")
+
+@test("a volatile u24 is refused as a field, a @packed field, an element, a slice's, and module storage")
+vo_arm_u24_places_refused()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        vo_arm_three_said(vo_on(m, "struct R\n    a: volatile u24\n@export(\"w\")\nw(r: *R) = r.a = 1\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "@packed\nstruct P\n    a: volatile u24\n    b: volatile u8\n@export(\"w\")\nw(r: *P) = r.b = 1\n"),
+                          "u24", "24")
+        vo_arm_three_said(vo_on(m, "struct R\n    a: [2]volatile u24\n@export(\"w\")\nw(r: *R) = r.a[0] = 1\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "@export(\"w\")\nw(v: *[4]volatile u24) = v[1] = 3\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "@export(\"w\")\nw(v: []volatile u24) = v[0] = 1\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "static var g: volatile u24 = 0\n@export(\"w\")\nw() = g = 5\n"), "u24", "24")
+        vo_arm_three_said(vo_on(m, "static var x: volatile i20 = 0\n@export(\"w\")\nw() = x = 1\n"), "i20", "20")
+
+@test("a generic over Integer instantiated at u24 is refused on 32-bit ARM, as a pointee and as a field")
+vo_arm_generic_u24_refused()
+    if !vo_ready() then return
+
+    val src = "bump[T: Integer](p: *volatile T) = *p = *p + 1\n@export(\"v\")\nv(p: *u8) = bump[u24](ptr_cast(p))\n"
+    val held = "struct Cell[T]\n    v: volatile T\n@export(\"v\")\nv(c: *Cell[u24]) = c.v = 1\n"
+
+    for m in vo_arm_machines
+        vo_arm_three_said(vo_on(m, src), "u24", "24")
+        vo_arm_three_said(vo_on(m, held), "u24", "24")
+
+@test("a volatile of 1, 2 or 4 bytes at any width -- bool, u1, u3, u8, u12, u16, u25, u32 -- is accepted on 32-bit ARM")
+vo_arm_whole_storage_accepted()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        for ty in ["bool", "u1", "u3", "u8", "u12", "i16", "u25", "u32"]
+            val out = vo_on(m, s"struct R\n    a: volatile $ty\n@export(\"w\")\nw(p: *volatile $ty, r: *R) = r.a = *p\n")
+
+            assert(!vo_has(out, "held in 3 bytes") && vo_has(out, "define"), out)
+
+@test("a bitfield struct whose container is 3 or 5 bytes is refused with a volatile field, whatever the fields' widths")
+vo_arm_bitfield_container_refused()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        // Two u12s are a 24-bit container though neither field is held in 3 bytes on its own.
+        vo_arm_container_said(vo_on(m, "@packed\nstruct H\n    a: volatile u12\n    b: volatile u12\n@export(\"r\")\nr(h: *H) -> u12 = h.b\n"),
+                              "H", "a", "24")
+        vo_arm_container_said(vo_on(m, "@packed\nstruct T\n    a: u3\n    b: volatile u21\n@export(\"r\")\nr(t: *T) -> u21 = t.b\n"),
+                              "T", "b", "24")
+        // Two u20s are a 40-bit container, which the whole-words rule never saw: each field passed it.
+        vo_arm_container_said(vo_on(m, "@packed\nstruct F\n    a: volatile u20\n    b: volatile u20\n@export(\"r\")\nr(f: *F) -> u20 = f.b\n"),
+                              "F", "a", "40")
+
+@test("a bitfield struct of 8, 16, 32 or 64 bits keeps its volatile fields, and a u12 and a u20 are one ldr")
+vo_arm_bitfield_container_accepted()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        val out = vo_on(m, "@packed\nstruct Q\n    a: volatile u12\n    b: volatile u20\n@export(\"r\")\nr(q: *Q) -> u20 = q.b\n")
+
+        assert(!vo_has(out, "bitfield struct held in") && !vo_has(out, "held in 3 bytes"), out)
+        // The one 32-bit container: the suite reads the Thumb asm back as the access it is.
+        assert_eq(vo_count(vo_define(out, "r$$sysl"), "load volatile"), usize(1), out)
+        assert(vo_has(vo_define(out, "r$$sysl"), "load volatile i32"), out)
+
+        for fields in ["a: volatile u3\n    b: volatile u5", "a: volatile u7\n    b: volatile u9",
+                       "a: volatile u20\n    b: u44"]
+            val src = s"@packed\nstruct B\n    $fields\n@export(\"r\")\nr(b: *B) -> bool = b.a == 1\n"
+            val said = vo_on(m, src)
+
+            assert(!vo_has(said, "bitfield struct held in") && vo_has(said, "define"), said)
+
+@test("a bitfield struct with no volatile field is any width on 32-bit ARM, and a C bitfield is its unit")
+vo_arm_container_unqualified_and_c_bits_accepted()
+    if !vo_ready() then return
+
+    for m in vo_arm_machines
+        val plain = vo_on(m, "@packed\nstruct H\n    a: u12\n    b: u12\n@export(\"r\")\nr(h: *H) -> u12 = h.b\n")
+        val c = vo_on(m, "struct C\n    a: volatile u20 in u32\n    b: volatile u12 in u32\n    c: volatile u24 in u32\n" +
+                      "@export(\"r\")\nr(c: *C) -> u20 = c.a\n")
+
+        assert(vo_has(plain, "define"), plain)
+        assert(!vo_has(c, "held in 3 bytes") && !vo_has(c, "bitfield struct held in"), c)
+        assert(vo_has(vo_define(c, "r$$sysl"), "load volatile i32"), c)
+
+// A bitfield struct nested in another is refused by its own container, though the outer one is what an
+// access moves: there is no access to the inner one alone that is not its own 3 bytes. The volatile goes
+// on a field of the outer struct instead, which qualifies every access to its one container.
+@test("a 24-bit bitfield struct with a volatile field is refused even where it is nested in a 32-bit one")
+vo_arm_nested_container_refused()
+    if !vo_ready() then return
+
+    val src = "@packed\nstruct Inner\n    a: volatile u3\n    b: u21\n@packed\nstruct Outer\n    i: Inner\n    c: u7\n" +
+              "    d: u1\n@export(\"r\")\nr(o: *Outer) -> u3 = o.i.a\n"
+    val moved = "@packed\nstruct Inner\n    a: u3\n    b: u21\n@packed\nstruct Outer\n    i: Inner\n    c: volatile u7\n" +
+                "    d: u1\n@export(\"r\")\nr(o: *Outer) -> u3 = o.i.a\n"
+
+    for m in vo_arm_machines
+        vo_arm_container_said(vo_on(m, src), "Inner", "a", "24")
+        val out = vo_on(m, moved)
+
+        assert(vo_has(vo_define(out, "r$$sysl"), "load volatile i32"), out)
+
+@test("a volatile u24 and a 24-bit volatile bitfield struct are still accepted on AArch64 and on x86_64")
+vo_arm_three_bytes_elsewhere_accepted()
+    if !vo_ready() then return
+
+    for m in ["aarch64-freestanding", "x86_64-linux"]
+        for src in ["@export(\"w\")\nw(p: *volatile u24) = *p += 1\n",
+                    "struct R\n    a: volatile i20\n@export(\"w\")\nw(r: *R) = r.a = 1\n",
+                    "@export(\"w\")\nw(v: []volatile u24) = v[0] = 1\n",
+                    "@packed\nstruct H\n    a: volatile u12\n    b: volatile u12\n@export(\"r\")\nr(h: *H) -> u12 = h.b\n"]
+            val out = vo_on(m, src)
+
+            assert(!vo_has(out, "held in 3 bytes") && !vo_has(out, "bitfield struct held in") && vo_has(out, "define"), out)
 
 @test("a volatile u48 is still accepted on AArch64 and on x86_64")
 vo_arm_u48_elsewhere_accepted()

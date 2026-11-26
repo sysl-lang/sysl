@@ -503,6 +503,33 @@ programmer's business, as above. A pointer to an empty struct itself is another 
 `@export` hands it to C, since the header then declares the empty struct
 (*A struct's layout in the header*, below).
 
+**An `@align(n)` struct with no fields does not cross by value where C sizes it otherwise.** sysl
+gives one its alignment's room — `n` bytes — and a struct or array made only of such structs as much
+again. C lays the
+same declaration out its own way: clang and gcc give it no bytes at all, and pass it as no argument;
+Microsoft's C gives it its four bytes of an empty struct rounded up to the alignment, which agrees
+from `@align(4)` up and not at `@align(2)`. So one is refused as an `extern`'s, an `@export`'s or a
+function pointer's parameter or result, itself or held at any depth of a struct or an array passed by
+value, on every target whose C sizes it differently — every target but Windows x64, and that one
+at `@align(2)`:
+
+```sysl
+@align(16)
+struct Pad
+end Pad
+
+extern take(p: Pad, x: i32)
+
+take(Pad(), 7)
+```
+
+```error
+error: 'p' of the 'extern' 'take' is Pad, which holds no data but occupies 16 bytes in sysl, for its alignment, and none in C on
+```
+
+Give the struct a field, or keep it out of what C is handed. Used only inside sysl it is unaffected,
+and so is `@align(1)`, which asks for nothing and leaves a plain empty struct.
+
 **A [function pointer](#a-function-s-address-extern-a-b-r) whose signature carries such a struct by
 value is refused on the same target, for the same reason**: a call through a `*extern(A) -> R` is an
 `extern` call, and C calls through one it was handed under its own layout of `A`. The type itself is
@@ -2195,6 +2222,15 @@ Four cases need a word each:
 
   An empty struct by value in an exported signature still crosses in its C slot, a private export is
   declared in no header, and every other target's C gives an empty struct no bytes either.
+- **An `@align(n)` struct with no fields is declared only where C gives it sysl's size.** The header
+  writes it as `typedef struct SYSL_ALIGNED(n) { } Pad;` and keeps it as a field, since sysl gives it
+  `n` bytes — but clang's and gcc's C give that declaration none, and Microsoft's four at `@align(2)`.
+  So on every target where the sizes differ (all but Windows x64, and that one at `@align(2)`), an
+  export taking or answering a pointer that reaches one — directly, through a field, through a
+  function pointer's parameter — and exported storage holding one, are refused as the empty struct is
+  above, in the words *holds no data but occupies 16 bytes in sysl, for its alignment, and none in C
+  on '…': the header's declaration of Pad gives it a size sysl does not*. By value it was already
+  refused, once (*What crosses the boundary*, above).
 
 ### Naming a type in the header
 

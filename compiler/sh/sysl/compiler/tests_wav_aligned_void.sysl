@@ -1,0 +1,227 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+
+// **An `@align(n)` struct holding no data is refused wherever C would lay it out, on every machine
+// whose C sizes it otherwise than sysl.** sysl gives one its alignment's room (`tests_zsa_…`: "an
+// @align(n) empty struct keeps its room"); C gives the same declaration another size. Each size below is
+// clang 21's, `-fsyntax-only` with `_Static_assert`, over the `typedef`s the header writes:
+//
+//     typedef struct __attribute__((aligned(16))) { } A16;     linux-gnu: 0    windows-msvc: 16
+//     typedef struct __attribute__((aligned(2))) { } A2;       linux-gnu: 0    windows-msvc: 4
+//     struct { int32_t a; A16 e; int32_t b; }                  linux-gnu: 32, b at 16   msvc: 48, b at 32
+//     struct { A2 x; A2 y; }  8 on msvc;  struct { A4 x; A4 y; }  8;  struct { A16 a; }  16
+//
+// sysl: A16 16, A2 2, the three-field struct 48 with b at 32, the A2 pair 4, the A4 pair 8. Passed by
+// value, clang on arm64-macos drops an A16 argument entirely (`void take(A16, int)` is
+// `declare void @take(i32)`) where sysl passed an `i128`. So on Windows x64 only a size that differs
+// is refused, and every other machine refuses each one.
+
+private wav_said(text: string, target_name: string) -> string
+    val done = typed_of_target(text, target_named(target_name).unwrap())
+
+    post_analysis_checks(done.an, program_of(done, done.main_module), buf())
+
+    val errors = errors_of(done.an.diagnostics())
+
+    if errors.is_empty() then "" else analysis_report(errors)
+end wav_said
+
+// `sysl emit-header --target <target>` over a file of only declarations: the status and what it said.
+private wav_emit(text: string, target_name: string) -> (int, string)
+    val root = make_temp_dir("sysl-wav").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [5]string = ["sysl", "emit-header", "--target", target_name, s"$root/main.sysl"]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var out = ""
+
+    for item in said
+        out = out + item + "\n"
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    (code, out)
+end wav_emit
+
+private wav_has(said: string, part: string) = assert(said.contains(part), said)
+
+private wav_none(text: string, target_name: string) = assert_eq(wav_said(text, target_name), "")
+
+private wav_linux() -> string = "x86_64-linux"
+
+private wav_mac() -> string = "aarch64-macos"
+
+private wav_win() -> string = "x86_64-windows"
+
+// The aligned empty structs every test below declares, and a struct holding one between two fields.
+private wav_types() -> string =
+    "@align(16)\nstruct A16\nend A16\n@align(2)\nstruct A2\nend A2\n@align(4)\nstruct A4\nend A4\n" +
+    "struct M16\n    a: i32\n    e: A16\n    b: i32\nstruct M2\n    a: i8\n    e: A2\n    b: i8\n"
+
+// "holds no data but occupies …", with C's size as the refusal words it on each machine.
+private wav_sizes(sysl_size: int, c_size: int, target: string) -> string =
+    s"holds no data but occupies $sysl_size bytes in sysl, for its alignment, and " +
+    (if c_size == 0 then "none" else s"$c_size") +
+    (if target == wav_win() then " in Microsoft's C" else " in C") + s" on '$target'"
+
+// The by-value refusal's tail: `shown` holds `room` at `path` ("" where it is `room`).
+private wav_call(shown: string, path: string, room: string, sizes: string) -> string =
+    if path == "" then
+        s"$shown, which $sizes, so $shown is laid out differently on the two sides of the call. Give the " +
+        s"empty struct a field, or keep $room out of the call"
+    else
+        s"$shown, whose field '$path' is $room, which $sizes, so $shown is laid out differently on the two " +
+        s"sides of the call. Give the empty struct a field, or take '$path' out of $shown"
+
+// The header refusal's tail: `lead` is what the type reaches the struct through.
+private wav_header(lead: string, room: string, sizes: string) -> string =
+    s"$lead $sizes: the header's declaration of $room gives it a size sysl does not, so C finds what " +
+    s"lies after it where sysl did not put it. Give the empty struct a field, or keep $room out of what " +
+    "the header declares"
+
+// -- by value: an `extern`, an export, a function pointer ----------------------------------------------
+
+@test("an extern taking or answering an aligned empty struct by value is refused off Windows")
+wav_extern_by_value()
+    val text = s"${wav_types()}extern take(a: A16, x: i32)\nextern give() -> A16\n" +
+               "take(give(), 7)\n"
+
+    for target in [wav_linux(), wav_mac()]
+        val said = wav_said(text, target)
+
+        wav_has(said, s"'a' of the 'extern' 'take' is ${wav_call("A16", "", "A16", wav_sizes(16, 0, target))}")
+        wav_has(said, s"the 'extern' 'give' returns ${wav_call("A16", "", "A16", wav_sizes(16, 0, target))}")
+
+    // Microsoft's C gives A16 its sixteen bytes too, and passes it by address as sysl does.
+    wav_none(text, wav_win())
+
+@test("an extern taking an @align(2) empty struct is refused on Windows x64, where C gives it four")
+wav_extern_align2_windows()
+    val text = s"${wav_types()}extern take(a: A2)\nextern hold(a: A4)\ntake(A2())\nhold(A4())\n"
+    val said = wav_said(text, wav_win())
+
+    wav_has(said, s"'a' of the 'extern' 'take' is ${wav_call("A2", "", "A2", wav_sizes(2, 4, wav_win()))}")
+    assert(!said.contains("'hold'"), said)
+
+@test("a struct holding an aligned empty struct, at any depth or in an array, is refused by value")
+wav_extern_holder_by_value()
+    val text = s"${wav_types()}struct Deep\n    x: i32\n    m: M16\nstruct Many\n    x: i32\n" +
+               "    es: [2]A16\nstruct W\n    a: A16\nextern one(m: M16)\nextern two(d: Deep)\n" +
+               "extern three(v: Many)\nextern four(w: W)\n" +
+               "one(M16(1, A16(), 2))\ntwo(Deep(0, M16(1, A16(), 2)))\nthree(Many(0, [A16(), A16()]))\n" +
+               "four(W(A16()))\n"
+    val said = wav_said(text, wav_linux())
+    val sizes = wav_sizes(16, 0, wav_linux())
+
+    wav_has(said, s"'m' of the 'extern' 'one' is ${wav_call("M16", "e", "A16", sizes)}")
+    wav_has(said, s"'d' of the 'extern' 'two' is ${wav_call("Deep", "m.e", "A16", sizes)}")
+    wav_has(said, s"'v' of the 'extern' 'three' is " +
+                  wav_call("Many", "es", "[2]A16", wav_sizes(32, 0, wav_linux())))
+    // A struct of no fields but an aligned one is itself the type C gives no bytes.
+    wav_has(said, s"'w' of the 'extern' 'four' is ${wav_call("W", "", "W", sizes)}")
+
+    // On Windows each of these is laid out alike (M16 is 48 with b at 32 there as here).
+    wav_none(text, wav_win())
+
+@test("a struct of two @align(2) empty structs is refused on Windows x64, of two @align(4) ones not")
+wav_windows_pairs()
+    val text = s"${wav_types()}struct H2\n    x: A2\n    y: A2\nstruct H4\n    x: A4\n    y: A4\n" +
+               "extern two(h: H2)\nextern four(h: H4)\nextern mixed(m: M2)\n" +
+               "two(H2(A2(), A2()))\nfour(H4(A4(), A4()))\nmixed(M2(1, A2(), 2))\n"
+    val said = wav_said(text, wav_win())
+
+    wav_has(said, s"'h' of the 'extern' 'two' is ${wav_call("H2", "", "H2", wav_sizes(4, 8, wav_win()))}")
+    wav_has(said, s"'m' of the 'extern' 'mixed' is ${wav_call("M2", "e", "A2", wav_sizes(2, 4, wav_win()))}")
+    assert(!said.contains("'four'"), said)
+
+@test("an export taking or answering an aligned empty struct by value is refused, once")
+wav_export_by_value()
+    val text = s"${wav_types()}@export(\"made\")\nmade(m: M16) -> A16 = m.e\n"
+    val said = wav_said(text, wav_linux())
+    val sizes = wav_sizes(16, 0, wav_linux())
+
+    wav_has(said, s"'m' of the exported 'made' is ${wav_call("M16", "e", "A16", sizes)}")
+    wav_has(said, s"the exported 'made' returns ${wav_call("A16", "", "A16", sizes)}")
+    // The by-value refusal is the one the parameter earns; the header's is not said again.
+    assert(!said.contains("header"), said)
+    // A private export is declared in no header, but its symbol is still called by C.
+    wav_has(wav_said(s"${wav_types()}@export(\"made\")\nprivate made(m: M16) -> i32 = m.a\n", wav_linux()),
+            s"'m' of the exported 'made' is ${wav_call("M16", "e", "A16", sizes)}")
+    wav_none(text, wav_win())
+
+@test("a function pointer type over an aligned empty struct by value is refused wherever it is met")
+wav_function_pointer()
+    val text = s"${wav_types()}struct Hooks\n    on: *extern(M16) -> i32\n" +
+               "extern get_hooks() -> *Hooks\nextern get_back() -> *extern() -> A16\n" +
+               "val hooks = get_hooks()\nval back = get_back()\nval made = back()\n"
+    val said = wav_said(text, wav_linux())
+    val sizes = wav_sizes(16, 0, wav_linux())
+
+    wav_has(said, "parameter 1 of the function pointer type '*extern(M16) -> int' is " +
+                  wav_call("M16", "e", "A16", sizes))
+    wav_has(said, s"the function pointer type '*extern() -> A16' returns ${wav_call("A16", "", "A16", sizes)}")
+    wav_none(text, wav_win())
+
+// -- behind a pointer: what the header declares -------------------------------------------------------
+
+@test("an export reaching an aligned empty struct behind a pointer is refused where C sizes it otherwise")
+wav_export_pointer()
+    val text = s"${wav_types()}struct Inner\n    a: i32\n    p: *M16\n" +
+               "@export(\"one\")\none(p: *M16) -> i32 = 0\n@export(\"two\")\ntwo(v: Inner) -> *A16 = null\n" +
+               "@export(\"three\")\nthree(cb: *extern(*M16) -> i32) -> i32 = 0\n"
+    val said = wav_said(text, wav_linux())
+    val sizes = wav_sizes(16, 0, wav_linux())
+
+    wav_has(said, s"'p' of the exported 'one' is ${wav_header("*M16, whose field 'e' reaches A16, which", "A16", sizes)}")
+    wav_has(said, s"'v' of the exported 'two' is " +
+                  wav_header("Inner, whose field 'p.e' reaches A16, which", "A16", sizes))
+    wav_has(said, s"the exported 'two' returns ${wav_header("*A16, which reaches A16, which", "A16", sizes)}")
+    wav_has(said, s"'cb' of the exported 'three' is " +
+                  wav_header("*extern(*M16) -> int, whose field 'e' reaches A16, which", "A16", sizes))
+    wav_none(text, wav_win())
+
+    val narrow = s"${wav_types()}@export(\"one\")\none(p: *M2) -> i32 = 0\n"
+
+    wav_has(wav_said(narrow, wav_win()),
+            s"'p' of the exported 'one' is " +
+            wav_header("*M2, whose field 'e' reaches A2, which", "A2", wav_sizes(2, 4, wav_win())))
+
+@test("exported storage holding an aligned empty struct is refused off Windows")
+wav_export_storage()
+    if !std_root().is_ok() then return
+
+    val text = s"${wav_types()}@export(\"g_m\")\nvar g_m = M16(1, A16(), 2)\n"
+    val got = wav_emit(text, wav_linux())
+
+    assert(got.0 != 0, got.1)
+    wav_has(got.1, s"the exported storage 'g_m' is " +
+                   wav_header("M16, whose field 'e' reaches A16, which", "A16", wav_sizes(16, 0, wav_linux())))
+
+    val win = wav_emit(text, wav_win())
+
+    assert_eq(win.0, 0, win.1)
+    wav_has(win.1, "typedef struct {\n\tint32_t a;\n\tA16 e;\n\tint32_t b;\n} M16;\n")
+
+// -- what is not refused ----------------------------------------------------------------------------
+
+@test("an aligned empty struct sysl alone sees, behind an extern's pointer, or at @align(1), is not refused")
+wav_accepted()
+    // Used only inside sysl: a local, an ordinary function by value, a module var.
+    val inside = s"${wav_types()}pass(m: M16) -> M16 = m\nvar kept = A16()\nval m = pass(M16(1, A16(), 2))\n" +
+                 "extern keep(a: i32)\nkeep(m.b)\n"
+
+    for target in [wav_linux(), wav_mac(), wav_win()]
+        wav_none(inside, target)
+
+    // A pointer to C's own declaration is one register either side: what C reads through it is the
+    // program's business, as for every other struct behind an extern's pointer.
+    wav_none(s"${wav_types()}extern poke(p: *M16)\nvar m = M16(1, A16(), 2)\npoke(&m)\n", wav_linux())
+
+    // `@align(1)` asks for nothing: the struct is a plain empty struct, no bytes on either side.
+    wav_none("@align(1)\nstruct A1\nend A1\nextern take(a: A1, x: i32)\ntake(A1(), 7)\n", wav_linux())

@@ -1,0 +1,509 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **What a struct's invariant lets the optimizer fold**, which is a performance promise: a container
+// shaped like the benchmark suite's own `Vector` -- storage, a first and a last index, and an `at`
+// that compares the index with `last_idx - first_idx` -- reads its element with one compare and no
+// bounds test of its own once the struct says `first_idx <= last_idx && last_idx <= storage.len`.
+//
+// Three things make that so, and each has its cells here:
+//
+//  - every conjunct of the invariant is told to the optimizer at a member's entry, each on its own,
+//    whatever receiver the member takes (`contract_assume.sysl`);
+//  - a difference of two fields the invariant orders is `sub nuw` (`nowrap.sysl`'s `nowrap_sub`);
+//  - past `if k >= s.hi - s.lo then <leave>`, `s.lo + k` is `add nuw`, for as long as nothing can
+//    write either field or `k` (`nw_field_guard`), and that holds into the value the list ends with.
+//
+// The fold is asked of a real optimizer, with a control beside each positive. Every cell where the
+// test must stay is also run, and an index out of range there must still trap, in both build modes.
+
+private ivf_ready() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: clang is not installed, so there is no optimizer to ask")
+        return false
+    end if
+
+    true
+end ivf_ready
+
+private ivf_ir(src: string) -> string = xvr_ir([("main.sysl", src)])
+
+// What clang's `-O2` leaves of a program.
+private ivf_optimized(src: string) -> string
+    val dir = make_temp_dir("sysl-ivf").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ivf_ir(src)).unwrap()
+
+    val got = capture("clang", ["-O2", "-S", "-emit-llvm", "-o", "-", file], "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+    got.text
+end ivf_optimized
+
+// The lines of the function whose `define` names `@<name>(`, to the brace closing it.
+private ivf_body(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in lines_of(out)
+        if !inside && l.starts_with("define") && (l.contains(s"@$name(") || l.contains(s"@\"$name\"("))
+            inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    assert(inside, s"nothing defines a function named '$name':\n$out")
+    body
+end ivf_body
+
+// How many bounds failures a body can reach: a call of the failure stub, or of a block the optimizer
+// split out as cold, which is where it moves one.
+private ivf_checks(body: string) -> int
+    var n = 0
+
+    for l in lines_of(body)
+        if l.contains("@sysl.bounds.fail") || (l.contains(" call ") && l.contains(".cold.")) then n += 1
+
+    n
+end ivf_checks
+
+// Whether a bounds test is left in `name` at `-O2`, in the build mode `debug` says: 1 where one is,
+// however many copies of it the optimizer made, and 0 where none is.
+private ivf_left(src: string, name: string, debug: bool) -> int
+    use_overflow_checks(debug)
+
+    val out = ivf_optimized(src)
+
+    use_overflow_checks(false)
+    if ivf_checks(ivf_body(out, name)) > 0 then 1 else 0
+end ivf_left
+
+// The program built for real in the mode `flag` names, and run: how it stopped, its output, its errors.
+private ivf_run(src: string, flag: string) -> (Status, string, string)
+    val root = absolute_path(make_temp_dir("sysl-ivf").unwrap())
+
+    write_text(s"$root/main.sysl", src).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, "2", Some(exe))
+
+    reset_search_paths()
+
+    val out = built match
+        Err(why) -> (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+            Ok(said) -> (said.status, said.text, said.err.unwrap_or(""))
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end ivf_run
+
+// The program prints exactly `want` in both modes.
+private ivf_prints(src: string, want: string)
+    if !ivf_ready() then return
+
+    for flag in ["--release", "--debug"]
+        val (state, printed, err) = ivf_run(src, flag)
+
+        assert_eq(err, "")
+        assert_eq(printed, want)
+        assert(state == Status.Exited(0), s"$flag stopped with $state")
+end ivf_prints
+
+// The program prints `before` and then stops at a trap whose report starts with `report`, in both
+// modes -- a check the proof must not have taken away.
+private ivf_traps(src: string, before: string, report: string)
+    if !ivf_ready() then return
+
+    for flag in ["--release", "--debug"]
+        val (state, printed, err) = ivf_run(src, flag)
+
+        assert(err.starts_with(report), s"$flag: expected a report starting '$report', got '$err'")
+        assert_eq(printed, before)
+        assert(state == Status.Signalled(5), s"$flag stopped with $state, having printed '$printed'")
+end ivf_traps
+
+// -- the fixture ------------------------------------------------------------------------------------
+
+private ivf_both() -> string = "    invariant first_idx <= last_idx && last_idx <= storage.len\n"
+
+// The suite's `Vector` reduced to its `at`: `clauses` are the invariant, `between` the statements
+// put between the guard and the read, `guard` the guard's comparison and `read` the element read.
+private ivf_vec_with(clauses: string, between: string, guard: string, read: string, main: string) -> string =
+    "@noinline\ntouch() -> int = 0\n\nstruct Vec\n    storage: []int\n    first_idx: usize\n    last_idx: usize\n" +
+    clauses + "\n    @noinline\n    at(*self, idx: usize) -> Option[int]\n" +
+    s"        if $guard then return None\n" + between + s"        Some($read)\n\n" +
+    "    @noinline\n    shrink(*self)\n        self.first_idx, self.last_idx, self.storage = 0, 0, self.storage[0..<0]\n\n" + main
+
+private ivf_vec(clauses: string, between: string) -> string =
+    ivf_vec_with(clauses, between, "idx >= self.last_idx - self.first_idx", "self.storage[self.first_idx + idx]",
+                 ivf_main())
+
+private ivf_main() -> string =
+    "var v = Vec([1, 2, 3, 4], 1, 3)\nprint(v.at(0).unwrap(), v.at(1).unwrap(), v.at(2).is_none())\n"
+
+// -- the element read is folded ---------------------------------------------------------------------
+
+@test("a Vector's at reads its element with no bounds test, in either mode")
+ivf_at_folds()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_vec(ivf_both(), ""), "Vec.at", false), 0)
+    assert_eq(ivf_left(ivf_vec(ivf_both(), ""), "Vec.at", true), 0)
+
+@test("and keeps it without the invariant")
+ivf_at_keeps_without_the_invariant()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_vec("", ""), "Vec.at", false), 1)
+    assert_eq(ivf_left(ivf_vec("", ""), "Vec.at", true), 1)
+
+@test("two clauses fold as one '&&' does")
+ivf_two_clauses_fold()
+    if !ivf_ready() then return
+
+    val two = "    invariant first_idx <= last_idx\n    invariant last_idx <= storage.len\n"
+
+    assert_eq(ivf_left(ivf_vec(two, ""), "Vec.at", false), 0)
+
+@test("half the invariant is not enough, and the test stays")
+ivf_half_the_invariant_keeps()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_vec("    invariant first_idx <= last_idx\n", ""), "Vec.at", false), 1)
+    assert_eq(ivf_left(ivf_vec("    invariant last_idx <= storage.len\n", ""), "Vec.at", false), 1)
+
+// Each conjunct is kept or put back on its own, so one that cannot be repeated -- it calls something --
+// does not take the others with it. Before, every clause was said as one '&&', and nothing was.
+@test("a clause that calls something leaves the others told")
+ivf_a_calling_clause_leaves_the_rest()
+    if !ivf_ready() then return
+
+    val src = "@noinline\nroom(n: usize) -> usize = n\n\n" +
+        ivf_vec(ivf_both() + "    invariant room(first_idx) >= first_idx\n", "")
+
+    assert_eq(ivf_left(src, "Vec.at", false), 0)
+
+// `a || b` held does not say `a`, so it is not split, and what it would have settled stays.
+@test("a clause that is an '||' is not split, and the test stays")
+ivf_an_or_clause_is_not_split()
+    if !ivf_ready() then return
+
+    val src = ivf_vec("    invariant first_idx <= last_idx\n    invariant last_idx <= storage.len || first_idx == 9\n", "")
+
+    assert_eq(ivf_left(src, "Vec.at", false), 1)
+
+@test("every conjunct is its own assumption at the member's entry")
+ivf_each_conjunct_is_assumed()
+    if xvr_no_library() then return
+
+    val body = ivf_body(ivf_ir(ivf_vec(ivf_both(), "")), "Vec.at")
+
+    assert_eq(xvr_count(body, "call void @llvm.assume(i1 "), 2)
+
+@test("a folded at still answers None past the end")
+ivf_folded_at_runs() = ivf_prints(ivf_vec(ivf_both(), ""), "2 3 true\n")
+
+@test("the index written the other way round folds too")
+ivf_swapped_add_folds()
+    if !ivf_ready() then return
+
+    val src = ivf_vec_with(ivf_both(), "", "idx >= self.last_idx - self.first_idx",
+                           "self.storage[idx + self.first_idx]", ivf_main())
+
+    assert_eq(ivf_left(src, "Vec.at", false), 0)
+
+@test("so does the guard written the other way round")
+ivf_reversed_guard_folds()
+    if !ivf_ready() then return
+
+    val src = ivf_vec_with(ivf_both(), "", "self.last_idx - self.first_idx <= idx",
+                           "self.storage[self.first_idx + idx]", ivf_main())
+
+    assert_eq(ivf_left(src, "Vec.at", false), 0)
+
+@test("a declaration between the guard and the read keeps the fold")
+ivf_a_declaration_between_folds()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_vec(ivf_both(), "        val j = idx * 2\n"), "Vec.at", false), 0)
+
+// -- where the test must stay, and still traps -------------------------------------------------------
+
+@test("a call between the guard and the read keeps the test")
+ivf_a_call_between_keeps()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_vec(ivf_both(), "        touch()\n"), "Vec.at", false), 1)
+
+// The member called between is the one that makes the test necessary: it empties the vector.
+@test("and a call that empties the vector traps at the read")
+ivf_a_call_that_empties_traps()
+    val src = ivf_vec(ivf_both(), "        self.shrink()\n").replace_all(ivf_main(),
+        "var v = Vec([1, 2, 3, 4], 1, 3)\nprint(v.at(0).unwrap())\n")
+
+    ivf_traps(src, "", "index 0 out of bounds for length 0")
+
+@test("a guard that is '>' keeps the test, and an index at the size traps")
+ivf_a_strict_guard_keeps()
+    if !ivf_ready() then return
+
+    val src = ivf_vec_with(ivf_both(), "", "idx > self.last_idx - self.first_idx",
+                           "self.storage[self.first_idx + idx]",
+                           "var v = Vec([1, 2, 3, 4], 1, 4)\nprint(v.at(3).unwrap())\n")
+
+    assert_eq(ivf_left(src, "Vec.at", false), 1)
+    ivf_traps(src, "", "index 4 out of bounds for length 4")
+
+@test("a guard that does not leave keeps the test")
+ivf_a_guard_that_stays_keeps()
+    if !ivf_ready() then return
+
+    val src = ivf_vec_with(ivf_both(), "", "idx >= self.last_idx - self.first_idx then print(\"past\")\n" +
+                           "        if false", "self.storage[self.first_idx + idx]",
+                           "var v = Vec([1, 2, 3, 4], 1, 4)\nprint(v.at(3).unwrap())\n")
+
+    assert_eq(ivf_left(src, "Vec.at", false), 1)
+
+@test("an index added to the other field keeps the test, and traps")
+ivf_the_other_field_keeps()
+    if !ivf_ready() then return
+
+    val src = ivf_vec_with(ivf_both(), "", "idx >= self.last_idx - self.first_idx",
+                           "self.storage[self.last_idx + idx]",
+                           "var v = Vec([1, 2, 3, 4], 1, 4)\nprint(v.at(0).unwrap())\n")
+
+    assert_eq(ivf_left(src, "Vec.at", false), 1)
+    ivf_traps(src, "", "index 4 out of bounds for length 4")
+
+@test("a call in the read itself keeps the test")
+ivf_a_call_in_the_read_keeps()
+    if !ivf_ready() then return
+
+    val src = ivf_vec_with(ivf_both(), "", "idx >= self.last_idx - self.first_idx",
+                           "touch() + self.storage[self.first_idx + idx]", ivf_main())
+
+    assert_eq(ivf_left(src, "Vec.at", false), 1)
+
+// `k` is a local the read goes on to change: past the guard it is below the size, and one more is
+// not.
+@test("an index written after the guard keeps the test, and traps")
+ivf_a_rewritten_index_keeps()
+    if !ivf_ready() then return
+
+    val src = "struct Vec\n    storage: []int\n    first_idx: usize\n    last_idx: usize\n" + ivf_both() +
+        "\n    @noinline\n    after(*self, idx: usize) -> int\n        var k = idx\n\n" +
+        "        if k >= self.last_idx - self.first_idx then return -1\n\n        k += 1\n\n" +
+        "        self.storage[self.first_idx + k]\n\nvar v = Vec([1, 2, 3, 4], 1, 4)\nprint(v.after(2))\n"
+
+    assert_eq(ivf_left(src, "Vec.after", false), 1)
+    ivf_traps(src, "", "index 4 out of bounds for length 4")
+
+// A guard proved inside a branch says nothing after the branch.
+@test("a guard inside a branch does not reach past it, and the read traps")
+ivf_a_guard_in_a_branch_ends_with_it()
+    if !ivf_ready() then return
+
+    val src = "struct Vec\n    storage: []int\n    first_idx: usize\n    last_idx: usize\n" + ivf_both() +
+        "\n    @noinline\n    maybe(*self, idx: usize, careful: bool) -> int\n        if careful\n" +
+        "            if idx >= self.last_idx - self.first_idx then return -1\n\n" +
+        "        self.storage[self.first_idx + idx]\n\nvar v = Vec([1, 2, 3, 4], 1, 4)\n" +
+        "print(v.maybe(7, true))\nprint(v.maybe(7, false))\n"
+
+    assert_eq(ivf_left(src, "Vec.maybe", false), 1)
+    ivf_traps(src, "-1\n", "index 8 out of bounds for length 4")
+
+// A branch's value is the rest of its own list, so a guard there covers it.
+@test("a guard in a branch covers that branch's value")
+ivf_a_guard_covers_its_branch_value()
+    if !ivf_ready() then return
+
+    val src = "struct Vec\n    storage: []int\n    first_idx: usize\n    last_idx: usize\n" + ivf_both() +
+        "\n    @noinline\n    pick(*self, idx: usize, careful: bool) -> int\n        val got = if careful\n" +
+        "            if idx >= self.last_idx - self.first_idx then return -1\n\n" +
+        "            self.storage[self.first_idx + idx]\n        else 0\n\n        got\n\n" +
+        "var v = Vec([1, 2, 3, 4], 1, 4)\nprint(v.pick(1, true), v.pick(9, true), v.pick(9, false))\n"
+
+    assert_eq(ivf_left(src, "Vec.pick", false), 0)
+    ivf_prints(src, "3 -1 0\n")
+
+// -- every receiver, a generic struct, a struct with a destructor ------------------------------------
+
+private ivf_receiver(recv: string) -> string =
+    "struct Vec\n    storage: []int\n    first_idx: usize\n    last_idx: usize\n" + ivf_both() +
+    s"\n    @noinline\n    at($recv, idx: usize) -> int\n" +
+    "        if idx >= self.last_idx - self.first_idx then return -1\n\n" +
+    "        self.storage[self.first_idx + idx]\n\nval v: &Vec = Vec([1, 2, 3, 4], 1, 3)\n" +
+    "print(v.at(0), v.at(1), v.at(2))\n"
+
+@test("a member taking 'self' by value folds")
+ivf_a_value_receiver_folds()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_receiver("self"), "Vec.at.owned", false), 0)
+    ivf_prints(ivf_receiver("self"), "2 3 -1\n")
+
+@test("and one taking '&self'")
+ivf_a_reference_receiver_folds()
+    if !ivf_ready() then return
+
+    assert_eq(ivf_left(ivf_receiver("&self"), "Vec.at", false), 0)
+    ivf_prints(ivf_receiver("&self"), "2 3 -1\n")
+
+@test("a generic struct folds at each instantiation")
+ivf_a_generic_struct_folds()
+    if !ivf_ready() then return
+
+    val src = "struct Thing\n    n: int\n\nstruct Vec[E]\n    storage: []E\n    first_idx: usize\n" +
+        "    last_idx: usize\n" + ivf_both() + "\n    @noinline\n    at(*self, idx: usize) -> Option[E]\n" +
+        "        if idx >= self.last_idx - self.first_idx then return None\n\n" +
+        "        Some(self.storage[self.first_idx + idx])\n\nvar a = Vec([1, 2, 3], 1, 3)\n" +
+        "var b: Vec[&Thing] = Vec([Thing(7), Thing(8)], 0, 2)\n" +
+        "print(a.at(1).unwrap(), b.at(1).unwrap().n, a.at(2).is_none(), b.at(2).is_none())\n"
+    val out = ivf_optimized(src)
+
+    assert_eq(ivf_checks(ivf_body(out, "Vec.at.int")), 0)
+    assert_eq(ivf_checks(ivf_body(out, "Vec.at.ref.Thing")), 0)
+    ivf_prints(src, "3 8 true true\n")
+
+@test("a struct with a destructor folds, and its invariant still traps a bad write")
+ivf_a_struct_with_a_destructor()
+    if !ivf_ready() then return
+
+    val src = "struct Vec\n    storage: []int\n    first_idx: usize\n    last_idx: usize\n" + ivf_both() +
+        "\n    @noinline\n    at(self, idx: usize) -> int\n" +
+        "        if idx >= self.last_idx - self.first_idx then return -1\n\n" +
+        "        self.storage[self.first_idx + idx]\n\n    @noinline\n    peek(&self, idx: usize) -> int\n" +
+        "        if idx >= self.last_idx - self.first_idx then return -1\n\n" +
+        "        self.storage[self.first_idx + idx]\n\nimpl Drop for Vec\n    drop(self) = print(\"gone\")\n\n" +
+        "val v = Vec([1, 2, 3, 4], 1, 3)\nprint(v.at(1), v.at(5), v.peek(0))\nv.last_idx = 9\nprint(\"unreached\")\n"
+    val out = ivf_optimized(src)
+
+    assert_eq(ivf_checks(ivf_body(out, "Vec.at.owned")), 0)
+    assert_eq(ivf_checks(ivf_body(out, "Vec.peek")), 0)
+    ivf_traps(src, "3 -1 2\n", "invariant of 'Vec' failed")
+
+// -- the write the invariant refuses still traps -----------------------------------------------------
+
+@test("a write that breaks the invariant traps where the page says")
+ivf_a_breaking_write_traps()
+    val src = ivf_vec(ivf_both(), "").replace_all(ivf_main(),
+        "var v = Vec([1, 2, 3, 4], 1, 3)\nprint(v.at(1).unwrap())\nv.first_idx = 4\nprint(\"unreached\")\n")
+
+    ivf_traps(src, "3\n", "invariant of 'Vec' failed")
+
+// -- the difference of two ordered fields ----------------------------------------------------------
+
+private ivf_pair(fields: string, clause: string, member: string) -> string =
+    s"struct Pair\n$fields$clause\n    @noinline\n$member\n\nvar p = Pair(1, 5)\nprint(p.gap())\n"
+
+private ivf_usizes() -> string = "    lo: usize\n    hi: usize\n"
+
+private ivf_gap(text: string) -> string = s"    gap(*self) -> usize = $text"
+
+@test("the difference of two fields the invariant orders is 'sub nuw'")
+ivf_ordered_difference_is_nuw()
+    if xvr_no_library() then return
+
+    val body = ivf_body(ivf_ir(ivf_pair(ivf_usizes(), "    invariant lo <= hi\n", ivf_gap("self.hi - self.lo"))),
+                        "Pair.gap")
+
+    assert(body.contains(" = sub nuw i64 "), body)
+
+@test("in a debug build too, where it would otherwise be checked")
+ivf_ordered_difference_is_unchecked_in_debug()
+    if xvr_no_library() then return
+
+    use_overflow_checks(true)
+
+    val body = ivf_body(ivf_ir(ivf_pair(ivf_usizes(), "    invariant lo <= hi\n", ivf_gap("self.hi - self.lo"))),
+                        "Pair.gap")
+
+    use_overflow_checks(false)
+    assert(body.contains(" = sub nuw i64 "), body)
+    assert(!body.contains("usub.with.overflow"), body)
+
+@test("every spelling of the order says it: '<', '>=', '>' and a chain")
+ivf_every_spelling_of_the_order()
+    if xvr_no_library() then return
+
+    for clause in ["    invariant lo < hi\n", "    invariant hi >= lo\n", "    invariant hi > lo\n",
+                   "    invariant 0 <= lo <= hi\n"]
+        val body = ivf_body(ivf_ir(ivf_pair(ivf_usizes(), clause, ivf_gap("self.hi - self.lo"))), "Pair.gap")
+
+        assert(body.contains(" = sub nuw i64 "), s"$clause:\n$body")
+
+private ivf_plain_sub(src: string)
+    val body = ivf_body(ivf_ir(src), "Pair.gap")
+
+    assert(!body.contains("sub nuw"), body)
+    assert(body.contains(" = sub "), body)
+end ivf_plain_sub
+
+@test("the difference the other way round is not")
+ivf_reversed_difference_is_plain()
+    if xvr_no_library() then return
+
+    ivf_plain_sub(ivf_pair(ivf_usizes(), "    invariant lo <= hi\n", ivf_gap("self.lo - self.hi")))
+
+@test("nor two fields of two different values")
+ivf_two_values_is_plain()
+    if xvr_no_library() then return
+
+    ivf_plain_sub("struct Pair\n" + ivf_usizes() + "    invariant lo <= hi\n\n    @noinline\n" +
+        "    gap(*self, o: *Pair) -> usize = self.hi - o.lo\n\nvar p = Pair(1, 5)\nvar q = Pair(2, 3)\n" +
+        "print(p.gap(&q))\n")
+
+@test("nor a struct with no such order")
+ivf_no_order_is_plain()
+    if xvr_no_library() then return
+
+    ivf_plain_sub(ivf_pair(ivf_usizes(), "    invariant lo != hi\n", ivf_gap("self.hi - self.lo")))
+    ivf_plain_sub(ivf_pair(ivf_usizes(), "", ivf_gap("self.hi - self.lo")))
+    ivf_plain_sub(ivf_pair(ivf_usizes(), "    invariant lo <= hi || hi == 0usize\n", ivf_gap("self.hi - self.lo")))
+
+@test("nor signed fields, whose difference can still overflow")
+ivf_signed_fields_are_plain()
+    if xvr_no_library() then return
+
+    val body = ivf_body(ivf_ir("struct Pair\n    lo: int\n    hi: int\n    invariant lo <= hi\n\n    @noinline\n" +
+        "    gap(*self) -> int = self.hi - self.lo\n\nvar p = Pair(1, 5)\nprint(p.gap())\n"), "Pair.gap")
+
+    assert(!body.contains("nuw"), body)
+
+@test("a local struct read by name is the same place twice")
+ivf_a_local_struct()
+    if xvr_no_library() then return
+
+    val body = ivf_body(ivf_ir("struct Pair\n" + ivf_usizes() + "    invariant lo <= hi\n\n@noinline\n" +
+        "gap(lo: usize, hi: usize) -> usize\n    val p = Pair(lo, hi)\n\n    p.hi - p.lo\n\nprint(gap(1, 5))\n"),
+        "gap$$sysl")
+
+    assert(body.contains(" = sub nuw i64 "), body)
+
+@test("a generic struct's order holds at an unsigned instantiation")
+ivf_a_generic_order()
+    if xvr_no_library() then return
+
+    val body = ivf_body(ivf_ir("struct Span[T: Integer]\n    lo: T\n    hi: T\n    invariant lo <= hi\n\n" +
+        "    @noinline\n    gap(*self) -> T = self.hi - self.lo\n\nvar s = Span(1u32, 5u32)\nprint(s.gap())\n"),
+        "Span.gap.uint")
+
+    assert(body.contains(" = sub nuw i32 "), body)

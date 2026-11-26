@@ -454,7 +454,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TStep(task, wake) -> gen_step(e, task, wake)
     TPark(register) -> gen_park(e, register)
 
-    TErase(operand, vtable, _) -> gen_erase(e, operand, vtable)
+    TErase(operand, vtable, ty) -> gen_erase(e, operand, vtable, ty)
     TVCall(receiver, slot, args, ty, _) -> gen_vcall(e, receiver, slot, args, ty, node_id(x))
 
     TDowngrade(value, weak_ty) -> gen_downgrade(e, value, weak_ty)
@@ -815,15 +815,18 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
 
             // A sum proved not to wrap is the `nuw` add in either mode: there is nothing to check.
             val proved = op == "+" && nowrap_add(e, l, r, bt)
+            // And so is a difference of two fields the struct's invariant orders (`nowrap_sub`).
+            val proved_sub = op == "-" && nowrap_sub(e, l, r, bt)
 
-            if overflow_checked(op, l, r, bits, signed) || (!proved && plain_checked(e, op, bt, site))
+            if overflow_checked(op, l, r, bits, signed) ||
+               (!proved && !proved_sub && plain_checked(e, op, bt, site))
                 return checked_arith(e, op, bits, signed, lv, rv, arith_text(op, texpr_type(l), texpr_type(r)), site)
 
-            if proved
-                val sum = fresh_reg(e)
+            if proved || proved_sub
+                val got = fresh_reg(e)
 
-                emit(e, InBin(sum, OpAddNuw, lty(e, bt), lv, rv))
-                return sum
+                emit(e, InBin(got, if proved then OpAddNuw else OpSubNuw, lty(e, bt), lv, rv))
+                return got
             end if
         _ -> ()
 
@@ -1746,7 +1749,7 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span)
     // nothing the call reads is let go here.
     if e.abandoning.has(name) then release_all(e)
 
-    val symbol = hand_over_args(e, name, args, staged)
+    val symbol = hand_over_args(e, name, args, staged, Some(span), ty)
 
     // A sysl definition's tail is named the way a foreign one's is: by the callee's whole function
     // type, since the argument list alone does not say where the declared parameters stop.

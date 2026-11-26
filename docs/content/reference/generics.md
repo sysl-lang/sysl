@@ -2154,6 +2154,22 @@ print(1)
 function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' are different value parameters
 ```
 
+Where what parts the two is an operation compared as written, the refusal names it — the two may be
+one at every instantiation, but the form cannot show it:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+half[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N / 2 * 2](b.used)
+
+print(1)
+```
+
+```error
+function 'half' should return Buf[N], but its body yields Buf[N / 2 * 2] — '/' by 2 is compared as written, and 'N / 2 * 2' is not 'N' for every N
+```
+
 The same holds where a local's declared type, an argument or a field meets such a value, and a
 parameter is never the constant one instantiation might choose: `-> Buf[3] = b` is refused with
 *"'N' stands for every value an instantiation chooses, not only 3"*. Forms that agree are accepted,
@@ -2641,7 +2657,43 @@ an 'if const' is decided while compiling, so its condition has to be known then
 ```
 
 A generic body is also checked once before any instance, for what does not depend on its parameters.
-That check reads neither arm of an `if const`; each instance reads the arm it takes. A
+That check reads no arm of an `if const` but one: the first arm of **`if const N == c`**, a value
+parameter against a constant (either way about), is read there with `N` as `c`, since only the
+instance at `c` takes it. So `[]` and `Buf[0]` are the `[N]int` and `Buf[N]` asked for under
+`N == 0`:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+zeros[const N: usize]() -> [N]int = if const N == 0 then [] else [0; N]
+
+empty[const N: usize]() -> Buf[N] = if const N == 0 then Buf[0](0) else Buf[N](1)
+
+print(zeros[0]().len, zeros[3]().len, empty[0]().used, empty[4]().used)
+```
+
+```output
+0 3 0 1
+```
+
+and what that arm yields is held to it there, called or not:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+one[const N: usize]() -> Buf[N] = if const N == 1 then Buf[2](0) else Buf[N](1)
+
+print(1)
+```
+
+```error
+the first arm of this 'if const' yields Buf[2], but Buf[N] is expected — the arm is taken only where N is 1, and there they are Buf[1] and Buf[2]
+```
+
+Any other condition, the `else`, and an `elif const` are left to the instances, each reading the
+arm it takes. A
 [`const` function](/reference/declarations/)'s promise is held the same way: the arm an instance
 takes is refused there if it cannot run while compiling, and an arm no instance takes may hold
 anything.

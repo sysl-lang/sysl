@@ -621,8 +621,29 @@ private half_of(built: LibraryBuild, t: Target, who: string,
         foreign.add(name)
 
     val first = codegen_with_gaps(built.program, t, built.promotions, imports, Some(foreign))
-    val lowered = codegen_with_gaps(library_deferring_gaps(built.program, first.1), t,
+
+    // **A body the fiber-switch check would refuse once lowered is deferred as a gap is**
+    // (`abandons.sysl`'s `library_half_refusals`): the program compiles it from source and its own
+    // lowering answers, so the answer is the same whether this half is linked or not. A deferral can
+    // change what a body still here keeps, so the half is lowered again until none is refused.
+    var deferred: Buf[(string, string)] = buf()
+
+    deferred.extend(first.1.view())
+    deferred.extend(library_half_refusals(built.switch_holds, first.2).view())
+
+    var lowered = codegen_with_gaps(library_deferring_gaps(built.program, deferred), t,
                                     built.promotions, imports, Some(foreign))
+
+    loop
+        val more = library_half_refusals(built.switch_holds, lowered.2)
+
+        if more.is_empty() then break
+
+        deferred.extend(more.view())
+        lowered = codegen_with_gaps(library_deferring_gaps(built.program, deferred), t,
+                                    built.promotions, imports, Some(foreign))
+    end loop
+
     val defined = advertised(built.determined, lowered.0)
     val text = ir_print_module(lowered.0)
 

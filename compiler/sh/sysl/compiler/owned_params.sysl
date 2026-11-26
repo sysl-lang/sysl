@@ -1,5 +1,6 @@
 module sh.sysl.compiler
 
+import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
 
@@ -495,14 +496,20 @@ owned_symbol(symbol: string) -> string = s"$symbol.owned"
 //
 // It runs after the last argument is worked out, so a later argument that leaves early -- a `?` --
 // finds every count still where the frame gives it back.
-hand_over_args(e: *Emit, name: string, args: Buf[TExpr], staged: Buf[(int, Val)]) -> string
+//
+// `span` and `ty` are the call's, where it is a call written as a value; a local whose release can run
+// code is handed over only where `calm_keeps.sysl` proves the hand-over moves no destructor.
+hand_over_args(e: *Emit, name: string, args: Buf[TExpr], staged: Buf[(int, Val)], span: Option[Span] = None,
+               ty: Type = Unit) -> string
     if !e.split_funcs.has(name) then return symbol_of(e, name)
 
     for k in 0..<args.len()
         if e.owned_params.has(owned_key(name, k)) && k < staged.len()
             val a = args[k]
 
+            e.moves.calm.handing = calm_hand_over(e, name, k, args, ty, span)
             retain_moving(e, a, texpr_type(a), staged[k].1, false)
+            e.moves.calm.handing = false
 
     owned_symbol(symbol_of(e, name))
 end hand_over_args
