@@ -57,6 +57,10 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
     // `@unchecked` marks the block under it rather than a declaration (`unchecked.sysl`) -- unless
     // parentheses follow it, where it is a struct's promise to cross (`promises.sysl`), or, with a
     // string in them, a block's promise that the processor has those extensions (`extensions.sysl`).
+    //
+    // On a line of its own above an `extern` or another annotation, it is the declaration's: the null
+    // check of a `*nonnull T` C hands over is dropped (`TrustNonNull`).
+    if word == "unchecked" && trust_ahead(p, 2) then return parse_attributed_decl(p, start)
     if word == "unchecked" && !p.kw_at(2, "(") then return parse_unchecked_block(p, start)
 
     if word == "unchecked" && at_string(p, 3) then return parse_extensions_block(p, start)
@@ -67,6 +71,11 @@ parse_at_stmt(p: *Parser, start: Span) -> Stmt
 
     parse_attributed_decl(p, start)
 end parse_at_stmt
+
+// Whether the tokens from `n` on are the end of a bare `@unchecked`'s line followed by an `extern` or
+// another annotation: the declaration form, rather than the block one, which an indent follows.
+private trust_ahead(p: *Parser, n: usize) -> bool =
+    p.peek_at(n) == Newline && (p.kw_at(n + 1, "extern") || p.kw_at(n + 1, "@"))
 
 // `@assert(cond)`, `@assert(cond, "why")`, `@assert(cond, s"why ${T::Name}")` -- a condition settled
 // while compiling, and what to say when it does not hold.
@@ -496,6 +505,10 @@ parse_attribute(p: *Parser) -> Option[Attr]
         skip_line(p)
         return None
     end if
+
+    // A bare `@unchecked` on a line of its own above an `extern` or another annotation drops the
+    // boundary's null checks.
+    if word == "unchecked" && trust_ahead(p, 0) then return Some(TrustNonNull)
 
     // `@unchecked` among a declaration's annotations, or above a member: it marks a block.
     if word == "unchecked"
@@ -1206,6 +1219,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
             Checked -> f.marks.checked = true
             NoFuse -> f.marks.no_fuse = true
             TrackCaller -> f.marks.track_caller = true
+            TrustNonNull -> f.marks.trusts_nonnull = true
             StackBound(bytes, calls, at) ->
                 f.marks.stack = bytes
                 f.marks.stack_calls = calls
@@ -1282,7 +1296,7 @@ names_pointer_param(ps: Buf[Param], name: string) -> bool
     for item in ps
         if item.name == name
             return *item.typ.kind match
-                PtrType(_, _) -> true
+                PtrType(_, _, _) -> true
                 _ -> false
 
     false
@@ -1412,7 +1426,8 @@ private parse_attributed_decl(p: *Parser, start: Span) -> Stmt
         return from_first(start, parse_extern_decl(p, at, vis, capabilities_of(attrs),
                                                    any_is(attrs, "blocks"),
                                                    any_is(attrs, "abandons"), kept_names(attrs),
-                                                   answered_names(attrs), any_is(attrs, "returns_twice")))
+                                                   answered_names(attrs), any_is(attrs, "returns_twice"),
+                                                   any_trust(attrs)))
     end if
 
     // A `type` names a scalar or a pointer for a generated header, which is the struct's request made
@@ -1476,6 +1491,11 @@ private refuse_unless(p: *Parser, at: Span, attrs: Buf[Attr], form: string)
             return
 
 private may_carry(form: string, a: Attr) -> bool
+    // A bare `@unchecked` above an `extern` or a function -- an export's, which the function's own
+    // reading holds it to (`trust_needs_export`).
+    if is_trust(a) then return form == "extern" || (form != "struct" && form != "enum" && form != "type" &&
+                                                    form != "binding")
+
     if form == "struct"
         return is_layout(a) || attr_word(a) == "export" || attr_word(a) == "guards" || attr_word(a) == "unchecked" ||
             attr_word(a) == "pinned" || attr_word(a) == "unique" || is_user(a) || is_annotation_mark(a)
@@ -1498,6 +1518,18 @@ end may_carry
 private is_user(a: Attr) -> bool = a match
     User(_) -> true
     _ -> false
+
+// Whether an attribute is the bare `@unchecked` an `extern` or an `@export` takes.
+private is_trust(a: Attr) -> bool = a match
+    TrustNonNull -> true
+    _ -> false
+
+private any_trust(attrs: Buf[Attr]) -> bool
+    for a in attrs
+        if is_trust(a) then return true
+
+    false
+end any_trust
 
 private is_annotation_mark(a: Attr) -> bool = a match
     AnnotationMark -> true

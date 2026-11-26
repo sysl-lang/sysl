@@ -145,7 +145,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         val r = fresh_reg(e)
 
-        emit(e, InLoad(r, lty(e, ty), p, place_access(e, x), None))
+        emit(e, InLoad(r, lty(e, ty), p, load_access(e, x), None))
         r
 
     TAddrOf(place, _) -> address(e, place)
@@ -188,7 +188,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
 
         if read_under_union(x) then emit_union_check(e, p, ty, x.span)
 
-        emit(e, InLoad(r, lty(e, ty), p, place_access(e, x), None))
+        emit(e, InLoad(r, lty(e, ty), p, load_access(e, x), None))
         r
 
     TLen(receiver, _) -> gen_len(e, receiver)
@@ -236,8 +236,9 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     // call to a named `extern`, and the two go through one function. A driver whose transport is a
     // struct of function pointers is the shape that wants it.
     TCallPtr(callee, args, _, ty) ->
-        gen_foreign_call(e, foreign_result(e, ty), gen_expr(e, callee), args, ty, false,
-                         pointer_kept(texpr_type(callee), args.len()))
+        checked_answer(e, gen_foreign_call(e, foreign_result(e, ty), gen_expr(e, callee), args, ty, false,
+                                           pointer_kept(texpr_type(callee), args.len())),
+                       ty, type_show(texpr_type(callee)))
 
     // An address is the C-callable entry rather than the definition, since a `*extern` may only
     // hold something C can call.
@@ -617,7 +618,7 @@ private gen_field(e: *Emit, x: TExpr, receiver: TExpr, index: int, ty: Type) -> 
         val p = address(e, x)
         val r = fresh_reg(e)
 
-        emit(e, InLoad(r, lty(e, ty), p, place_access(e, x), None))
+        emit(e, InLoad(r, lty(e, ty), p, load_access(e, x), None))
         return r
 
     val v = gen_expr(e, receiver)
@@ -774,7 +775,7 @@ private gen_binary(e: *Emit, op: string, l: TExpr, r: TExpr, ty: Type, site: Spa
     val lt = underlying(texpr_type(l))
 
     lt match
-        Ptr(_, _) ->
+        Ptr(_, _, _) ->
             if op == "-" then return gen_ptr_diff(e, l, r, lt)
         _ -> ()
 
@@ -909,7 +910,7 @@ end update_expansion_at
 // the answer counts elements. The divide is skipped for a one-byte pointee.
 private gen_ptr_diff(e: *Emit, l: TExpr, r: TExpr, lt: Type) -> Val
     val stride = lt match
-        Ptr(inner, _) -> e.layout.size(*inner)
+        Ptr(inner, _, _) -> e.layout.size(*inner)
         _ -> usize(1)
 
     val ity = LInt(e.word_bits)
@@ -1772,9 +1773,18 @@ private gen_call(e: *Emit, name: string, args: Buf[TExpr], ty: Type, span: Span)
 
         if untraced.is_some() then return untraced.unwrap()
 
-        return gen_foreign_call(e, CallForm(form.ret, form.ret_attrs, variadic_type_of(e, name)),
-                                VGlobal(symbol), args, ty, e.abandoning.has(name),
-                                e.kept_params.get(name).unwrap_or(buf()), e.twice.has(name))
+        // Trusted, the answer is said to be what the declaration promises; checked, it is not, or the
+        // optimizer would take the check away.
+        val ret_attrs = if e.trusted.has(name) then proved_nonnull(form.ret_attrs, ty) else form.ret_attrs
+        val answered = gen_foreign_call(e, CallForm(form.ret, ret_attrs, variadic_type_of(e, name)),
+                                        VGlobal(symbol), args, ty, e.abandoning.has(name),
+                                        e.kept_params.get(name).unwrap_or(buf()), e.twice.has(name))
+
+        // A `*nonnull T` C answers is C's promise, checked where it is handed over unless the
+        // declaration said `@unchecked` (`nonnull_checks.sysl`).
+        if e.trusted.has(name) then return answered
+
+        return checked_answer(e, answered, ty, symbol)
 
     // A factory whose answer this frame holds no longer than itself lays it here (`stack_box.sysl`).
     gen_frame_call(e, name, args, ty, span) match
@@ -2116,6 +2126,20 @@ private gen_cast(e: *Emit, operand: TExpr, ty: Type, site: Span) -> Val
     convert(e, from, ty, v)
 end gen_cast
 
+// **An address read as the `Option` of a pointer that is never null** (`p.nonnull()`): the option is
+// the address alone (`layout.sysl`'s `null_niche`), so it is built as the `Some` of it -- and a null
+// address built that way is every bit of `None`.
+private address_as_option(e: *Emit, opt_ty: Type, d: &EnumType, v: Val) -> Val
+    val some = d.variant("Some")
+
+    if some.is_none() then return gap_at(e, "an option with no 'Some'")
+
+    var carried: Buf[Val] = buf()
+
+    carried.push(v)
+    enum_value(e, opt_ty, d, some.unwrap(), carried)
+end address_as_option
+
 // One scalar type read as another.
 convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
     if type_eq(from, to) then return v
@@ -2155,14 +2179,17 @@ convert(e: *Emit, from: Type, to: Type, v: Val) -> Val
         (Bool, Integer(b_bits, _, _, _)) -> convert_int(e, 1, false, b_bits, v)
         (Integer(a_bits, a_signed, _, _), Char) -> checked_char(e, a_bits, a_signed, v)
         (Enum(d), Integer(_, _, _, _)) -> convert(e, underlying(d.underlying), ut, v)
-        (Ptr(_, _), Ptr(_, _)) -> v
+        (Ptr(_, _, _), Ptr(_, _, _)) -> v
+        // `p.nonnull()`: the address is the `Option[*nonnull T]` already, a null one being `None`.
+        (Ptr(_, _, _), Enum(d)) -> if null_niche(d) then address_as_option(e, ut, d, v) else gap_at(e, "a pointer read as an enum that is not its option")
+        (CFn(_, _, _), Enum(d)) -> if null_niche(d) then address_as_option(e, ut, d, v) else gap_at(e, "a pointer read as an enum that is not its option")
         // Only `is_null` writes this one -- `ptr_cast` refuses a reference -- and it reads the address
         // to compare it with null, taking no share of what it names.
-        (Ref(_, _), Ptr(_, _)) -> v
-        (Ptr(_, _), Integer(_, _, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
-        (Integer(_, _, _, _), Ptr(_, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
-        (Ptr(_, _), CFn(_, _, _)) -> v
-        (CFn(_, _, _), Ptr(_, _)) -> v
+        (Ref(_, _), Ptr(_, _, _)) -> v
+        (Ptr(_, _, _), Integer(_, _, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
+        (Integer(_, _, _, _), Ptr(_, _, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
+        (Ptr(_, _, _), CFn(_, _, _)) -> v
+        (CFn(_, _, _), Ptr(_, _, _)) -> v
         (CFn(_, _, _), CFn(_, _, _)) -> v
         (CFn(_, _, _), Integer(_, _, _, _)) -> cast_to(e, CastPtrToInt, from, ut, v)
         (Integer(_, _, _, _), CFn(_, _, _)) -> cast_to(e, CastIntToPtr, from, ut, v)
@@ -2256,7 +2283,7 @@ zero_of(e: *Emit, ty: Type) -> Val
         Floating(bits, _, _) -> if bits == 128 then VQuad(0, 0) else v_float(0.0)
         Char -> VInt(from_int(0))
         Bool -> VInt(from_int(0))
-        Ptr(_, _) -> if erased(underlying(ty)) then VZero else VNull
+        Ptr(_, _, _) -> if erased(underlying(ty)) then VZero else VNull
         Ref(_, _) -> if erased(underlying(ty)) then VZero else VNull
         Weak(inner) -> if is_trait(*inner) then VZero else VNull
         CFn(_, _, _) -> VNull

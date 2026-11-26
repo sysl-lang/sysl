@@ -1,0 +1,194 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// **`*nonnull T` and `*const nonnull T` -- the spelling, the type, and every conversion**
+// (`reference/memory.md § A pointer that is never null`). The word sits after the `*` and after any
+// `const`, and is soft: a type of a program's own called `nonnull` still parses. A `*nonnull T` widens
+// to `*T` (and to `*const nonnull T`, `*const T`) wherever one is wanted; the other way is spelled
+// out, `.nonnull()`; `null` is refused wherever a `*nonnull T` is wanted, and so is a `*T`.
+//
+// The axes: each conversion both ways, in a binding, an argument, a field, a return and an operand
+// pair; each way of making one (`&place`, `&p[n]`, `into_raw`, a `c"…"` literal, `.nonnull()`); the
+// refusals' exact text; the order with `const`; the soft word; the type as printed and as mangled.
+//
+// Skipped cells: the extern boundary (`tests_tnn_extern.sysl`) and the raw tier
+// (`tests_tnn_raw.sysl`).
+
+// -- the type itself ------------------------------------------------------------------------------
+
+@test("a *nonnull T is shown and mangled apart from a *T, and is a type of its own")
+tnn_type_shown()
+    val i = Integer(32, true, false, None)
+
+    assert_eq(type_show(Ptr(i, false, true)), "*nonnull int")
+    assert_eq(type_show(Ptr(i, true, true)), "*const nonnull int")
+    assert_eq(type_show(Ptr(i, false, false)), "*int")
+    assert_eq(mangle(Ptr(i, false, true)), "nnptr.int")
+    assert_eq(mangle(Ptr(i, true, true)), "constnnptr.int")
+    assert_eq(mangle(Ptr(i, false, false)), "ptr.int")
+    assert(!type_eq(Ptr(i, false, true), Ptr(i, false, false)))
+    assert(type_eq(Ptr(i, true, true), Ptr(i, true, true)))
+    assert(!has_zero(Ptr(i, false, true)))
+    assert(has_zero(Ptr(i, false, false)))
+
+@test("a *nonnull extern is shown and mangled apart from a *extern, whatever order its marks were set in")
+tnn_fn_pointer_shown()
+    val i = Integer(32, true, false, None)
+    var ps: Buf[Type] = buf()
+
+    ps.push(i)
+
+    val plain = CFn(ps, i, buf())
+    val nn = CFn(ps, i, with_nonnull(buf(), true))
+
+    assert_eq(type_show(nn), "*nonnull extern(int) -> int")
+    assert_eq(mangle(nn), "nn." + mangle(plain))
+    assert(!type_eq(nn, plain))
+
+    val first = with_abandons(with_nonnull(buf(), true), true)
+    val second = with_nonnull(with_abandons(buf(), true), true)
+
+    assert(type_eq(CFn(ps, i, first), CFn(ps, i, second)))
+    assert_eq(type_show(CFn(ps, i, first)), "@abandons *nonnull extern(int) -> int")
+
+@test("the word is soft: a type named nonnull is still pointed at")
+tnn_soft_word()
+    tnn_prints(raw"""
+        struct nonnull
+            v: int
+
+        var n = nonnull(4)
+        val p: *nonnull = &n
+        val q: *nonnull nonnull = &n
+
+        print(p.v, q.v)
+        """, "", "4 4\n")
+
+@test("'*nonnull const T' is refused, naming the one order")
+tnn_const_order()
+    tnn_refused("var x = 1\nval p: *nonnull const int = &x\n",
+                "'const' goes before 'nonnull' — what may be done through the pointer first, then what its value promises: '*const nonnull T'")
+
+// -- making one ------------------------------------------------------------------------------------
+
+@test("&place, &p[n], into_raw and a c literal are never null where one is wanted")
+tnn_makers()
+    tnn_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Node
+            v: int
+
+        first(p: *nonnull int) -> int = *p
+
+        var x = 3
+        var arr = [10, 20, 30]
+        val r: &Node = Node(8)
+        val a: *nonnull int = &x
+        val b: *nonnull int = &arr[1]
+        val c: *nonnull Node = r.into_raw()
+        val s: *const nonnull u8 = c"hi"
+        val d: *nonnull int = &b[1]
+
+        print(first(&x), *a, *b, c.v, s[1], *d)
+        """, "", "3 3 20 8 105 30\n")
+
+@test("an address with no position asking is the *T it always was, and may be set to null")
+tnn_unasked_address()
+    tnn_prints(raw"""
+        var x = 1
+        var p = &x
+
+        p = null
+        print(p == null)
+        """, "", "true\n")
+
+// -- widening -------------------------------------------------------------------------------------
+
+@test("a *nonnull T goes wherever a *T, a *const T or a *const nonnull T is wanted")
+tnn_widens()
+    tnn_prints(raw"""
+        struct Keep
+            p: *int
+
+        plain(p: *int) -> int = *p
+        reads(p: *const int) -> int = *p
+        reads_nn(p: *const nonnull int) -> int = *p
+        back(p: *nonnull int) -> *int = p
+
+        var x = 6
+        val nn: *nonnull int = &x
+        val k = Keep(nn)
+        var held: *int = null
+
+        held = nn
+        print(plain(nn), reads(nn), reads_nn(nn), *back(nn), *k.p, *held)
+        """, "", "6 6 6 6 6 6\n")
+
+@test("a *nonnull T and a *T meet at the *T in a comparison and a subtraction")
+tnn_operands_meet()
+    tnn_prints(raw"""
+        var a = [1, 2, 3]
+        val p: *nonnull int = &a[0]
+        val q: *int = &a[2]
+
+        print(p == q, p != q, q - p, p == p)
+        """, "", "false true 2 true\n")
+
+// -- the refusals ----------------------------------------------------------------------------------
+
+@test("null where a *nonnull T is wanted is refused, naming Option and None")
+tnn_null_refused()
+    tnn_refused("val p: *nonnull int = null\n",
+                "'null' is the address a '*nonnull int' never holds, so it is neither stored in one nor compared with one — a pointer that may be absent is an 'Option[*nonnull int]', one word all the same, whose null is 'None'")
+
+@test("comparing a *nonnull T with null is refused as the same mistake")
+tnn_null_compare_refused()
+    tnn_refused("var x = 1\nval p: *nonnull int = &x\nprint(p == null)\n",
+                "'null' is the address a '*nonnull int' never holds")
+
+@test("null as an argument, a field and a return of a *nonnull T is refused")
+tnn_null_refused_everywhere()
+    tnn_refused("f(p: *nonnull int) -> int = 0\nprint(f(null))\n", "never holds")
+    tnn_refused("struct S\n    p: *nonnull int\n\nval s = S(null)\n", "never holds")
+    tnn_refused("f() -> *nonnull int = null\n", "never holds")
+    tnn_refused("twice(n: int) -> int = n\n\nval f: *nonnull extern(int) -> int = null\n",
+                "'null' is the address a '*nonnull extern(int) -> int' never holds")
+
+@test("a *T where a *nonnull T is wanted is refused, naming .nonnull()")
+tnn_nullable_refused()
+    tnn_refused("var x = 1\nval p: *int = &x\nval q: *nonnull int = p\n",
+                "a '*int' may be null, and a '*nonnull int' never is — so the one does not become the other. Check it with '.nonnull()', which answers an 'Option[*nonnull int]' that is 'None' for null")
+    tnn_refused("f(p: *nonnull int) -> int = *p\n\nvar x = 1\nval p: *int = &x\nprint(f(p))\n",
+                "a '*int' may be null, and a '*nonnull int' never is")
+
+@test("a *const nonnull T where a *nonnull T is wanted is refused as a *const is")
+tnn_const_refused()
+    tnn_refused("var x = 1\nval p: *const nonnull int = &x\nval q: *nonnull int = p\n",
+                "a '*const nonnull int' may be read through and not written, and a '*nonnull int' is a licence to write")
+
+@test("a struct holding a *nonnull T has no zero value")
+tnn_no_zero()
+    tnn_refused("struct S\n    at: *nonnull int\n\nvar s: S\n", "S has no zero value, so 's' needs an initial value")
+    tnn_refused("var p: *nonnull int\n", "needs an initial value")
+
+@test("p.nonnull() takes no arguments")
+tnn_nonnull_arity()
+    tnn_refused("var x = 1\nval p: *int = &x\nval q = p.nonnull(1)\n",
+                "'nonnull' takes no arguments — it asks the pointer it is called on whether it is null")
+
+@test("a pointee's own nonnull member is the one a call through the pointer reaches")
+tnn_member_wins()
+    tnn_prints(raw"""
+        struct Probe
+            v: int
+
+            nonnull(self) -> int = self.v + 100
+
+        var x = Probe(1)
+        val p: *Probe = &x
+
+        print(p.nonnull())
+        """, "", "101\n")

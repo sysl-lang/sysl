@@ -1,0 +1,324 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `*nonnull T` has the null niche** (`layout.sysl`'s `null_niche`, `reference/memory.md § A
+// pointer that is never null`): `Option[*nonnull T]` is the address alone, one word, and `None` is
+// null, as `Option[&T]` is. A `*T` keeps its tagged `Option`.
+//
+// The axes: the size wherever the value sits (a local, a field, an array element, a `Buf`, nested in
+// another `Option`, an enum payload), beside the shapes that keep the tag (`*T`, `*nonnull Trait`);
+// every way the variant is read (`match`, `unwrap`, `is_none`, `?`, the library's generic methods);
+// generics instantiated at `*nonnull X` and at `*X` side by side (two instantiations, two symbols);
+// `&sync` closures capturing one; a 32-bit target; and the mutation cells -- a `None` really is
+// the null address, and the null refusal really refuses.
+//
+// Skipped cells, and why: separate compilation does not change a layout, which every unit asks of
+// the same `TargetLayout` (`tests_nnc_null_niche.sysl` says the same of `Option[&T]`); ARC does not
+// arise, a raw pointer holding no count.
+
+// -- the harness shared by the `tnn_` files --------------------------------------------------------
+
+tnn_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The program built (with a C file beside it where one is given) and run: what it printed on both
+// streams, and its status, or the build's complaint and -1.
+tnn_outcome(text: string, c: string) -> (string, int)
+    val root = make_temp_dir("sysl-tnn").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    if c != "" then write_text(s"$root/probe.c", c).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end tnn_outcome
+
+tnn_prints(text: string, c: string, want: string)
+    if !tnn_ready() then return
+
+    val out = tnn_outcome(text, c)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end tnn_prints
+
+// What a compilation for `t` came to: the first thing it said about the program, or nothing, and
+// its LLVM text.
+tnn_build(text: string, t: Target) -> (string, string)
+    var units: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(found) -> units = found
+
+    val parsed = parse(source_of("test.sysl", text), t)
+
+    if !parsed.ok() then return (parsed.report.at(0).message, "")
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), true)
+    val early = tnn_first_of(done.reported)
+
+    if early != "" then return (early, "")
+
+    val whole = program_of(done, done.main_module)
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = tnn_first_of(done.an.diagnostics())
+
+    if late != "" then return (late, "")
+
+    val kept = prune(strip_tests(whole), own)
+
+    ("", ir_print_module(codegen_with_gaps(kept, t, pr).0))
+end tnn_build
+
+private tnn_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end tnn_first_of
+
+tnn_says(text: string, part: string) = assert(text.contains(part), s"expected '$part' in:\n$text")
+
+tnn_lacks(text: string, part: string) = assert(!text.contains(part), s"did not expect '$part' in:\n$text")
+
+// The refusal a program meets, which must contain `part`.
+tnn_refused(text: string, part: string)
+    if std_root().is_err() then return
+
+    tnn_says(tnn_build(text, host_target()).0, part)
+end tnn_refused
+
+// -- the size -------------------------------------------------------------------------------------
+
+@test("an Option of a *nonnull T is one word; a *T, a *nonnull to a trait and an int keep the tag")
+tnn_sizes()
+    tnn_prints(raw"""
+        trait Shape
+            area(self) -> int
+
+        struct Pair
+            a: Option[*nonnull int]
+            b: int
+
+        enum Held
+            Empty
+            At(p: *nonnull int)
+
+        print(sizeof(*nonnull int), sizeof(*const nonnull int), sizeof(Option[*nonnull int]),
+              alignof(Option[*nonnull int]), sizeof(Option[*const nonnull u8]))
+        print(sizeof(Option[*int]), sizeof(Option[*nonnull Shape]), sizeof(Option[int]))
+        print(sizeof(Option[Option[*nonnull int]]), sizeof(Pair), sizeof([4]Option[*nonnull int]))
+        print(sizeof(Held), sizeof(Option[*nonnull extern(int) -> int]), sizeof(Option[*extern(int) -> int]))
+        """, "", "8 8 8 8 8\n16 24 8\n16 16 32\n16 8 16\n")
+
+@test("on a 32-bit target the Option of a *nonnull T is the four-byte address and no tag")
+tnn_thirty_two_bits()
+    if std_root().is_err() then return
+
+    val b = tnn_build(raw"""
+        @assert(sizeof(Option[*nonnull u32]) == 4, "one address")
+        @assert(sizeof(Option[*u32]) == 8, "a tag beside the address")
+
+        first(o: Option[*nonnull u32]) -> u32 = o match
+            Some(p) -> *p
+            None -> 0
+
+        @export("pick")
+        pick() -> u32 = first(None)
+        """, target_named("thumb-freestanding").unwrap())
+
+    assert_eq(b.0, "")
+    tnn_says(b.1, "%enum.sysl$Option.nnptr.uint = type { [1 x i32] }")
+
+// -- every way the variant is read ----------------------------------------------------------------
+
+@test("match, unwrap, unwrap_or, is_none and ? read an Option of a *nonnull T by its address")
+tnn_reads()
+    tnn_prints(raw"""
+        first_over(a: [3]*nonnull int, k: int) -> Option[*nonnull int]
+            for p in a
+                if *p > k then return Some(p)
+
+            None
+
+        twice(a: [3]*nonnull int, k: int) -> Option[int]
+            val p = first_over(a, k)?
+
+            Some(*p * 2)
+
+        var x = 1
+        var y = 5
+        var z = 9
+        val a: [3]*nonnull int = [&x, &y, &z]
+
+        print(*first_over(a, 4).unwrap(), first_over(a, 9).is_none(), twice(a, 0).unwrap_or(-1),
+              twice(a, 9).unwrap_or(-1))
+
+        for k in [0, 6, 100]
+            first_over(a, k) match
+                Some(p) -> print(*p)
+                None -> print("none")
+        """, "", "5 true 2 -1\n1\n9\nnone\n")
+
+@test("an Option of a *nonnull T in a struct field, an enum payload and a Buf element")
+tnn_holders()
+    tnn_prints(raw"""
+        import sysl.buf.{Buf, buf}
+
+        struct Slot
+            at: Option[*nonnull int]
+            n: int
+
+        enum Edge
+            Leaf
+            Link(to: *nonnull int, back: Option[*nonnull int])
+
+        var x = 3
+        var y = 4
+        var s = Slot(None, 1)
+
+        print(s.at.is_none())
+        s.at = Some(&x)
+        print(*s.at.unwrap() + s.n)
+
+        val e = Link(&x, Some(&y))
+        val f = Link(&y, None)
+
+        for edge in [e, f, Leaf]
+            edge match
+                Link(to, Some(b)) -> print(*to, *b)
+                Link(to, None) -> print(*to, "no back")
+                Leaf -> print("leaf")
+
+        var held: Buf[Option[*nonnull int]] = buf()
+
+        held.push(Some(&y))
+        held.push(None)
+        print(held[0].is_some(), held[1].is_none(), *held[0].unwrap())
+        """, "", "true\n4\n3 4\n4 no back\nleaf\ntrue true 4\n")
+
+// -- generics -------------------------------------------------------------------------------------
+
+@test("a generic instantiated at *nonnull X and at *X is two instantiations, each with its own layout")
+tnn_generic_twins()
+    tnn_prints(raw"""
+        wrap[T](x: T) -> Option[T] = Some(x)
+
+        size_of_option[T](x: T) -> usize = sizeof(Option[T])
+
+        var x = 7
+        val p: *nonnull int = &x
+        val q: *int = &x
+
+        print(size_of_option(p), size_of_option(q))
+        print(*wrap(p).unwrap(), *wrap(q).unwrap(), wrap(p).is_some())
+
+        val none_p: *int = null
+
+        print(wrap(none_p).is_some())
+        """, "", "8 16\n7 7 true\ntrue\n")
+
+@test("a struct generic over its pointer, held at *nonnull, gets the niche through the parameter")
+tnn_generic_struct()
+    tnn_prints(raw"""
+        struct Cell[T]
+            v: Option[T]
+
+        var x = 11
+        val c: Cell[*nonnull int] = Cell(Some(&x))
+        val d: Cell[*nonnull int] = Cell(None)
+
+        print(sizeof(Cell[*nonnull int]), sizeof(Cell[*int]))
+        print(*c.v.unwrap(), d.v.is_none())
+        """, "", "8 16\n11 true\n")
+
+// -- a crossing ------------------------------------------------------------------------------------
+
+@test("a *nonnull T crosses into a &sync closure as a *T does")
+tnn_sync_capture()
+    tnn_prints(raw"""
+        run(f: &sync Fn() -> int) -> int = f()
+
+        var x = 21
+        val p: *nonnull int = &x
+
+        print(run(() -> *p * 2))
+        """, "", "42\n")
+
+// -- mutation cells -------------------------------------------------------------------------------
+
+// The niche is the null address and nothing else: a `None` handed to C is NULL, and an address C makes
+// null comes back `None` -- so a layout that kept a tag, or stored `None` as anything but zero, fails.
+@test("None is the null address on both sides of the C boundary, and a C NULL is None")
+tnn_niche_is_null()
+    tnn_prints(raw"""
+        extern c_is_null(p: Option[*nonnull i32]) -> i32
+        extern c_maybe(give: i32, p: *nonnull i32) -> Option[*nonnull i32]
+
+        var x: i32 = 9
+
+        print(c_is_null(None), c_is_null(Some(&x)))
+
+        for g in [0, 1]
+            c_maybe(g, &x) match
+                Some(p) -> print("some", *p)
+                None -> print("none")
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
+
+        int32_t c_is_null(int32_t *p) { return p == NULL; }
+        int32_t *c_maybe(int32_t give, int32_t *p) { return give ? p : NULL; }
+        """, "1 0\nnone\nsome 9\n")
+
+@test("p.nonnull() is None for the null address and Some for any other, the same bits")
+tnn_nonnull_method()
+    tnn_prints(raw"""
+        var x = 5
+        var p: *int = &x
+
+        print(p.nonnull().is_some(), *p.nonnull().unwrap())
+        p = null
+        print(p.nonnull().is_none())
+
+        val c: *const int = &x
+
+        print(*c.nonnull().unwrap(), sizeof(Option[*const nonnull int]))
+        """, "", "true 5\ntrue\n5 8\n")
+
+@test("p.nonnull().unwrap() on a null pointer stops the program as unwrapping any None does")
+tnn_nonnull_unwrap_traps()
+    if !tnn_ready() then return
+
+    val out = tnn_outcome("val p: *int = null\nval q = p.nonnull().unwrap()\nprint(usize(q))\n", "")
+
+    assert_eq(out.1, 134)
+    tnn_lacks(out.0, "0\n")

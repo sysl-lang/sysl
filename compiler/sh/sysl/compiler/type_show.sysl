@@ -160,11 +160,12 @@ private canonical_name(t: Type) -> string = t match
     VaList -> "va_list"
     Never -> "never"
     Unknown -> "?"
-    Ptr(inner, ro) -> s"*${if ro then "const " else ""}${type_show(*inner)}"
+    Ptr(inner, ro, nn) -> s"*${if ro then "const " else ""}${if nn then "nonnull " else ""}${type_show(*inner)}"
     Ref(inner, sync) -> s"&${if sync then "sync " else ""}${type_show(*inner)}"
     Weak(inner) -> s"weak ${type_show(*inner)}"
     CFn(ps, r, k) ->
-        s"${if marks_abandon(k) then "@abandons " else ""}*extern(${marked_list(ps, k)}) -> ${type_show(*r)}"
+        s"${if marks_abandon(k) then "@abandons " else ""}*${if marks_nonnull(k) then "nonnull " else ""}" +
+        s"extern(${marked_list(ps, k)}) -> ${type_show(*r)}"
     Array(n, elem, term) -> s"[${extent_text(n, term)}]${type_show(*elem)}"
     Vector(n, elem, term) -> s"<${extent_text(n, term)}>${type_show(*elem)}"
     Slice(elem, ro) -> s"[]${if ro then "const " else ""}${type_show(*elem)}"
@@ -253,12 +254,36 @@ with_abandons(marks: Buf[(string, Type)], on: bool) -> Buf[(string, Type)]
     var out: Buf[(string, Type)] = buf()
 
     for item in marks
-        if item.0 != abandons_mark().0 then out.push(item)
+        if item.0 != abandons_mark().0 && item.0 != nonnull_mark().0 then out.push(item)
 
     if on then out.push(abandons_mark())
 
+    // The `nonnull` mark rides after it, so one type has one list whichever was set first.
+    if marks_nonnull(marks) then out.push(nonnull_mark())
+
     out
 end with_abandons
+
+// **A function pointer's `nonnull` rides with its marks too**, under a name no program can write:
+// `*nonnull extern(A) -> R` and `*extern(A) -> R` are two types to `type_eq`, passed alike, and the
+// first has the null niche -- so they are named apart in a symbol (`mangle`). Nothing that asks about a
+// parameter's mark finds it.
+nonnull_mark() -> (string, Type) = ("@nonnull", Unit)
+
+// Whether a function pointer's marks say it is never null.
+marks_nonnull(marks: Buf[(string, Type)]) -> bool = has_mark(marks, nonnull_mark().0)
+
+// A function pointer's marks with the `nonnull` mark set as `on` says, every other mark kept.
+with_nonnull(marks: Buf[(string, Type)], on: bool) -> Buf[(string, Type)]
+    var out: Buf[(string, Type)] = buf()
+
+    for item in marks
+        if item.0 != nonnull_mark().0 then out.push(item)
+
+    if on then out.push(nonnull_mark())
+
+    out
+end with_nonnull
 
 // The mark of a parameter the callable may let out what it reads through, but not keep.
 fn_lets_out_assoc(i: usize) -> (string, Type) = (s"@lets_out:$i", Unit)
@@ -468,7 +493,9 @@ end fn_parts
 mangle(t: Type) -> string = t match
     Struct(d) -> mangled(d.base, d.targs)
     Enum(d) -> mangled(d.base, d.targs)
-    Ptr(inner, ro) -> if ro then s"constptr.${mangle(*inner)}" else s"ptr.${mangle(*inner)}"
+    Ptr(inner, ro, nn) ->
+        if nn then (if ro then s"constnnptr.${mangle(*inner)}" else s"nnptr.${mangle(*inner)}")
+        else if ro then s"constptr.${mangle(*inner)}" else s"ptr.${mangle(*inner)}"
     Ref(inner, sync) -> if sync then s"sync.${mangle(*inner)}" else s"ref.${mangle(*inner)}"
     Weak(inner) -> s"weak.${mangle(*inner)}"
     Array(n, elem, _) -> s"arr$n.${mangle(*elem)}"
@@ -480,7 +507,8 @@ mangle(t: Type) -> string = t match
     Slice(elem, ro) -> if ro then s"constslice.${mangle(*elem)}" else s"slice.${mangle(*elem)}"
     Volatile(inner) -> s"volatile.${mangle(*inner)}"
     Trait(n, args, _) -> mangled(n, args)
-    CFn(ps, r, _) -> cfn_mangle(ps, *r)
+    // A function pointer that is never null is named apart, as its `Option` is laid out apart.
+    CFn(ps, r, marks) -> if marks_nonnull(marks) then s"nn.${cfn_mangle(ps, *r)}" else cfn_mangle(ps, *r)
     // A fixed-point type mangles under its full spelling whatever alias it was written with.
     Fixed(bits, frac, signed) -> fixed_canonical(bits, frac, signed)
     // A name and nothing more is its base wherever types are checked, so `Buf[H]` shares

@@ -437,6 +437,10 @@ struct FuncMarks
     // lifted into a function of its own (`lift_oom_values`), which is what checks and lowers it.
     out_of_memory: Option[Expr]
 
+    // `@unchecked` above an `@export`: a C caller's null handed to a `*nonnull T` parameter is not
+    // checked at entry (`nonnull_checks.sysl`). The parameter is still marked `nonnull` for LLVM.
+    trusts_nonnull: bool
+
     // Whether any of the three was written.
     any(self) -> bool = self.noinline || self.cold || self.inline
 
@@ -455,7 +459,7 @@ end FuncMarks
 no_marks() -> FuncMarks = FuncMarks(false, false, false, None, buf(), false, None, false, false,
                                     false, false, false, false, false, false, buf(), false, buf(), buf(),
                                     false, false, false, false, buf(), buf(), buf(), false, None, None, None,
-                                    false, buf(), 0, false, false, None)
+                                    false, buf(), 0, false, false, None, false)
 
 // A method of a struct, an enum, a trait or an `impl` block.
 struct MethodDecl
@@ -680,6 +684,10 @@ enum Attr
     // `@renamed("Date", "0.10.0")` or `@removed("write 'zone.resolve(dt)'", "0.10.0")`: the
     // declaration under it is a tombstone. `renamed_to` is empty for `@removed`, whose text is `hint`.
     Gone(renamed_to: string, hint: string, version: string)
+    // `@unchecked` with nothing after it, above an `extern` or an `@export`: the null check the
+    // boundary makes of a `*nonnull T` C hands over -- an `extern`'s result, an export's parameter --
+    // is not made.
+    TrustNonNull
 end Attr
 
 // A name a module no longer declares: what it was, whether it named a type (`type LocalDate`) or a
@@ -771,6 +779,7 @@ attr_word(a: Attr) -> string = a match
     AnnotationMark -> "annotation"
     User(u) -> annot_written(u)
     Gone(to, _, _) -> if to == "" then "removed" else "renamed"
+    TrustNonNull -> "unchecked"
 
 // A foreign function's declaration.
 struct ExternDecl
@@ -795,6 +804,9 @@ struct ExternDecl
     // every call carry LLVM's `returns_twice` and no call is a tail call. The C names clang marks by
     // name are marked without it (`returns_twice_symbol`).
     returns_twice: bool
+    // `@unchecked` above it: a `*nonnull T` it answers is taken on trust rather than checked for null
+    // at every call (`nonnull_checks.sysl`).
+    trusts_nonnull: bool
 end ExternDecl
 
 // A struct declaration: its fields, the methods written under it, and what the attributes said.

@@ -981,8 +981,17 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
     // which reach no table of members -- unless the referent's own type has a member of the name.
     if name == "into_raw" && !owns_member(cx, rty, name)
         held match
-            Ref(_, _) -> return into_raw_call(cx, span, receiver, args)
+            Ref(_, _) -> return into_raw_call(cx, span, receiver, args, wants_non_null(expected))
             _ -> ()
+    end if
+
+    // **`nonnull` is every raw pointer's** -- `p.nonnull()` answers `Some` of the same address as a
+    // pointer that is never null, or `None` for null -- unless the pointee's own type has a member of
+    // the name, which a call through the pointer reaches as it always has.
+    if name == "nonnull" && !owns_member(cx, rty, name)
+        val checked = nonnull_call(cx, span, receiver, held, args)
+
+        if checked.is_some() then return checked.unwrap()
     end if
 
     // **Every value answers `to_string()` and `debug_string()`**, by the compiler, where its type has
@@ -1083,7 +1092,7 @@ private reference_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type,
 
     // A written call on a pointer reaches its pointee's member wherever the pointee has one.
     val raw_reaches = held match
-        Ptr(inner, _) -> !bound && satisfies(cx.an, plain_bound(library_key(if name == "eq" then "Eq" else "Hash"),
+        Ptr(inner, _, _) -> !bound && satisfies(cx.an, plain_bound(library_key(if name == "eq" then "Eq" else "Hash"),
                                                              buf()), *inner)
         _ -> false
 
@@ -1239,7 +1248,7 @@ private address_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, n
 
     val word = Integer(64, false, false, None)
     val address = held match
-        Ref(_, _) -> TExpr(span, TCast(receiver, Ptr(byte_type(), false)))
+        Ref(_, _) -> TExpr(span, TCast(receiver, Ptr(byte_type(), false, false)))
         _ -> receiver
     var call_args: Buf[TExpr] = buf()
 
@@ -2060,7 +2069,7 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
     ByPtr -> texpr_type(tr) match
         // A `*self` method is a licence to write, so a `*const T` is no receiver for one: the
         // pointer is handed over as it is, and a read-only one would be written through.
-        Ptr(_, read_only) ->
+        Ptr(_, read_only, _) ->
             if read_only then
                 cx.fault(span, s"'$member' takes '*self', so it writes through what it is called on, and " +
                          s"this is reached through a '${type_show(texpr_type(tr))}', which may be read " +
@@ -2097,7 +2106,7 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
             // the caller can be told about. A `@relocates` member is asked by its caller instead,
             // under its own name, so the refusal says which call moves the storage.
             if !relocates then check_ref_call(cx, span, place)
-            TExpr(span, TAddrOf(place, Ptr(texpr_type(place), false)))
+            TExpr(span, TAddrOf(place, Ptr(texpr_type(place), false, false)))
     // **What is missing is the COUNT, not an address**: a `&self` method may keep what it is called
     // on, so it needs a box to keep a share of, and a value on the stack -- a local `var` as much as a
     // fresh construction -- has none. Boxing a copy here would hand the method a share of something
@@ -3082,12 +3091,35 @@ private no_such_member(cx: &Analyzer, span: Span, rty: Type, name: string) -> TE
         _ -> cx.err(span, s"cannot read field '$name' of ${type_show(rty)}${data_pointer_hint(rty, name)}")
 end no_such_member
 
+// `p.nonnull()` -- the pointer as one that is never null: `Some` of the same address, or `None` where
+// it is null. It costs nothing, the `Option[*nonnull T]` being the address alone (`layout.sysl`'s
+// `null_niche`), so it is a retyping. A pointer to a trait is two words, with no niche, and has no
+// such member; `None` hands the call on to the lookup that says so.
+private nonnull_call(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, args: Buf[Expr]) -> Option[TExpr]
+    val target = held match
+        Ptr(inner, ro, _) -> if is_trait(*inner) then return None else Ptr(inner, ro, true)
+        CFn(ps, r, marks) -> CFn(ps, r, with_nonnull(marks, true))
+        _ -> return None
+
+    if !args.is_empty() then
+        return Some(cx.err(span, "'nonnull' takes no arguments — it asks the pointer it is called on " +
+                           "whether it is null"))
+
+    var opt_args: Buf[Type] = buf()
+
+    opt_args.push(target)
+    Some(TExpr(span, TCast(receiver, reinstantiate(cx.an, library_key("Option"), opt_args))))
+end nonnull_call
+
 // `r.into_raw()` -- a counted reference given up as the address of its payload, a `*T` that carries
 // one count of the object away with it (`from_raw` in `sysl.raw` adopts it back). It is asked of the
 // reference as written, so a `&T` is what has it and the `T` inside does not. A trait object is two
 // words and its table would be lost, so it is refused, as are a value and a plain pointer, which hold
 // no count to carry.
-private into_raw_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr]) -> TExpr
+//
+// **The address of a payload is never null, so it is a `*nonnull T` where the position wants one**
+// (`non_null`), and the `*T` it has always been everywhere else.
+private into_raw_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr], non_null: bool) -> TExpr
     val ty = texpr_type(receiver)
 
     if ty == Unknown then return bad_expr(span)
@@ -3102,8 +3134,8 @@ private into_raw_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr
                               s"'${type_show(ty)}' is two words — the address and the table of the type " +
                               "it was erased from — so give up the '&T' it was made from instead")
 
-            TExpr(span, TIntoRaw(receiver, Ptr(inner, false)))
-        Ptr(inner, _) ->
+            TExpr(span, TIntoRaw(receiver, Ptr(inner, false, non_null)))
+        Ptr(inner, _, _) ->
             cx.err(span, s"type '${type_show(ty)}' has no method 'into_raw' — 'into_raw' gives up a " +
                    s"counted reference, and a '*' pointer holds no count; '&${type_show(*inner)}' has it")
         Weak(inner) ->
@@ -3131,7 +3163,7 @@ private no_such_method(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, ba
                        name: string, args: Buf[Expr]) -> TExpr
     // `into_raw` is every counted reference's, and a type's own member of the name is what a call
     // reaches first.
-    if name == "into_raw" then return into_raw_call(cx, span, receiver, args)
+    if name == "into_raw" then return into_raw_call(cx, span, receiver, args, false)
 
     val provided = builtin_method(cx, span, receiver, rty, name, args)
 
@@ -3404,7 +3436,7 @@ private object_downcast(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, n
 
     val ref_ty = obj match
         Ref(_, sync) -> Ref(target, sync)
-        Ptr(_, ro) -> Ptr(target, ro)
+        Ptr(_, ro, nn) -> Ptr(target, ro, nn)
         _ -> return bad_expr(span)
 
     var opt_args: Buf[Type] = buf()
@@ -3439,7 +3471,7 @@ private downcast_refusal(cx: &Analyzer, obj: Type, rty: Type, target: Type, name
     if is_trait(target) then return Some(downcast_to_trait(shown, asked, name))
 
     target match
-        Ref(_, _) | Ptr(_, _) | Weak(_) ->
+        Ref(_, _) | Ptr(_, _, _) | Weak(_) ->
             return Some(s"a $shown holds the value a reference was erased from, never a reference " +
                         s"itself, so '$asked' is never what it holds — ask for the type it points at")
         _ -> ()
