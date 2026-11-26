@@ -1,0 +1,209 @@
+module sysl.fs
+@requires(os)
+@tests
+
+// Whether an entry is a program, a link's own owner, and how much room a filesystem has -- over the
+// `access`, `lchown` and `space` hooks of `sysl.fs.sys` as `sysl.fs.hosted` answers them. Each test
+// makes its own directory, so none shares a path with another running beside it. What needs the
+// program's own ids, a skip when run as root, or a child (`df`) is `sysl/process/identity_tests.sysl`'s:
+// `sysl.process` and `sysl.testing` depend on this module, so its tests may not import them.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+/** A fresh directory for one test, named for it. */
+private own_dir(tag: string) -> string = make_temp_dir(s"sysl-fs-own-$tag-").unwrap()
+
+/** A file at `path` holding `text`, with exactly the permission bits `mode`. */
+private made(path: string, text: string, mode: u32)
+    write_text(path, text).unwrap()
+    set_permissions(path, mode).unwrap()
+
+// -- Meta.executable: the bits ------------------------------------------------------------------------
+
+@test("a script with its execute bits set is executable, and a plain file is not")
+own_executable_script_and_plain()
+    val dir = own_dir("exec")
+
+    made(s"$dir/script", "#!/bin/sh\nexit 0\n", 0o755)
+    made(s"$dir/plain", "words\n", 0o644)
+
+    assert(metadata(s"$dir/script").unwrap().executable())
+    assert(!metadata(s"$dir/plain").unwrap().executable())
+
+    ignore(remove_dir_all(dir))
+end own_executable_script_and_plain
+
+@test("any one of the three execute bits makes a file executable, and none of the others does")
+own_executable_each_bit()
+    val dir = own_dir("bits")
+    val path = s"$dir/f"
+
+    made(path, "x", 0o600)
+
+    val execute: []u32 = [0o100, 0o010, 0o001]
+
+    for bit in execute
+        set_permissions(path, 0o600 | bit).unwrap()
+        assert(metadata(path).unwrap().executable(), f"bit $bit%#o")
+
+    // Every other permission bit, setuid, setgid and sticky among them, with no execute bit beside it.
+    val others: []u32 = [0o400, 0o200, 0o040, 0o020, 0o004, 0o002, 0o4000, 0o2000, 0o1000]
+
+    for bit in others
+        set_permissions(path, bit).unwrap()
+        assert(!metadata(path).unwrap().executable(), f"bit $bit%#o")
+
+    ignore(remove_dir_all(dir))
+end own_executable_each_bit
+
+@test("a directory's execute bits make it searchable, not executable")
+own_executable_not_a_directory()
+    val dir = own_dir("dir")
+
+    make_dir(s"$dir/sub").unwrap()
+    set_permissions(s"$dir/sub", 0o755).unwrap()
+
+    assert(!metadata(s"$dir/sub").unwrap().executable())
+
+    ignore(remove_dir_all(dir))
+end own_executable_not_a_directory
+
+@test("metadata through a link to a script is executable; link_metadata of the link is not")
+own_executable_through_a_link()
+    val dir = own_dir("link")
+
+    made(s"$dir/script", "#!/bin/sh\n", 0o700)
+    symlink(s"$dir/script", s"$dir/l").unwrap()
+
+    assert(metadata(s"$dir/l").unwrap().executable())
+    assert(!link_metadata(s"$dir/l").unwrap().executable())
+
+    ignore(remove_dir_all(dir))
+end own_executable_through_a_link
+
+// -- executable(path): the system's answer ------------------------------------------------------------
+
+@test("executable(path) answers for this program: an owner-executable script yes, a plain file no")
+own_executable_path()
+    val dir = own_dir("access")
+
+    made(s"$dir/script", "#!/bin/sh\nexit 0\n", 0o700)
+    made(s"$dir/plain", "words\n", 0o644)
+
+    assert(executable(s"$dir/script"))
+    assert(!executable(s"$dir/plain"))
+
+    // And it agrees with readable and writable about the same file, which share the hook.
+    assert(readable(s"$dir/plain") && writable(s"$dir/plain"))
+
+    ignore(remove_dir_all(dir))
+end own_executable_path
+
+@test("executable(path) of a path that is not there, or a link to nothing, is false")
+own_executable_of_nothing()
+    val dir = own_dir("none")
+
+    symlink(s"$dir/missing", s"$dir/dangling").unwrap()
+
+    assert(!executable(s"$dir/missing"))
+    assert(!executable(s"$dir/dangling"))
+
+    ignore(remove_dir_all(dir))
+end own_executable_of_nothing
+
+@test("executable(path) of a searchable directory is true, and of a sliced path names only the slice")
+own_executable_directory_and_slice()
+    val dir = own_dir("slice")
+
+    made(s"$dir/script", "#!/bin/sh\n", 0o700)
+    made(s"$dir/scriptx", "#!/bin/sh\n", 0o600)
+
+    assert(executable(dir))
+
+    // The slice is not followed by a zero, so a shim that read past it would ask about `scriptx`.
+    val longer = s"$dir/scriptx"
+
+    assert(executable(longer[0..<longer.len - 1]))
+    assert(!executable(longer))
+
+    ignore(remove_dir_all(dir))
+end own_executable_directory_and_slice
+
+// -- set_link_owner -----------------------------------------------------------------------------------
+
+@test("set_link_owner of a file to the ids it has succeeds and changes nothing, as set_owner does")
+own_link_owner_round_trip()
+    val dir = own_dir("lown")
+    val path = s"$dir/f"
+
+    made(path, "x", 0o644)
+
+    val before = metadata(path).unwrap()
+
+    set_link_owner(path, before.owner, before.group).unwrap()
+
+    val after = metadata(path).unwrap()
+
+    assert_eq(after.owner, before.owner)
+    assert_eq(after.group, before.group)
+
+    ignore(remove_dir_all(dir))
+end own_link_owner_round_trip
+
+@test("set_link_owner changes a link to nothing, where set_owner follows it and finds nothing")
+own_link_owner_dangling()
+    val dir = own_dir("ldang")
+    val link = s"$dir/dangling"
+
+    symlink(s"$dir/missing", link).unwrap()
+
+    val m = link_metadata(link).unwrap()
+
+    set_link_owner(link, m.owner, m.group).unwrap()
+    assert_eq(set_owner(link, m.owner, m.group).unwrap_err(), IoError.NotFound)
+
+    ignore(remove_dir_all(dir))
+end own_link_owner_dangling
+
+@test("set_link_owner on a path that is not there reports NotFound")
+own_link_owner_of_nothing()
+    val dir = own_dir("lnone")
+
+    assert_eq(set_link_owner(s"$dir/missing", 0, 0).unwrap_err(), IoError.NotFound)
+
+    ignore(remove_dir_all(dir))
+
+// -- space --------------------------------------------------------------------------------------------
+
+@test("space answers sane numbers: available <= free <= total, and the total is not zero")
+own_space_is_sane()
+    val dir = own_dir("space")
+    val s = space(dir).unwrap()
+
+    assert(s.total > 0, "a filesystem of no bytes")
+    assert(s.free > 0, "a temporary directory's filesystem with nothing free")
+    assert(s.available <= s.free, s"available ${s.available} > free ${s.free}")
+    assert(s.free <= s.total, s"free ${s.free} > total ${s.total}")
+
+    ignore(remove_dir_all(dir))
+end own_space_is_sane
+
+@test("space of a file is the space of the filesystem holding it, as of its directory")
+own_space_of_a_file()
+    val dir = own_dir("sfile")
+
+    made(s"$dir/f", "x", 0o644)
+
+    // The total does not move between two readings; free space may, as anything else writes.
+    assert_eq(space(s"$dir/f").unwrap().total, space(dir).unwrap().total)
+
+    ignore(remove_dir_all(dir))
+end own_space_of_a_file
+
+@test("space of a path that is not there reports NotFound")
+own_space_of_nothing()
+    val dir = own_dir("snone")
+
+    assert_eq(space(s"$dir/missing").unwrap_err(), IoError.NotFound)
+
+    ignore(remove_dir_all(dir))

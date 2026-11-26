@@ -391,14 +391,20 @@ print(accepted.recv(into).unwrap())
 3
 ```
 
-## Options: `set_no_delay`, `set_reuse_port`, keepalive
+## Options: `set_no_delay`, `set_reuse_port`, `set_v6_only`, keepalive
 
 Each is a setter that takes `on = true` and a getter of the same name that reads it back from the
 kernel: `set_no_delay` / `no_delay` (`TCP_NODELAY`, send small writes at once), `set_reuse_port` /
 `reuse_port` (`SO_REUSEPORT`, several sockets bind one port, set before `bind`; also on `UdpSocket`),
 and `set_keepalive` / `keepalive` (`SO_KEEPALIVE`). The keepalive timing is
 `set_keepalive_idle(seconds)`, `set_keepalive_interval(seconds)` and `set_keepalive_count(probes)`,
-each positive and read back by the same name without `set_`. **The idle time is `TCP_KEEPIDLE` on
+each positive and read back by the same name without `set_`. `set_v6_only` / `v6_only`
+(`IPV6_V6ONLY`, on `Socket` and `UdpSocket`) makes an IPv6 socket take IPv6 only. **Both Darwin and
+Linux default to dual-stack**, where a listener on `::` also holds the IPv4 side of the port and a
+second one on `0.0.0.0` is refused with "address in use"; with `set_v6_only()` on the `::` socket the
+two bind one port, which is how a server runs one listener per family. Set it before `bind`: a bound
+socket refuses the change (Darwin `InvalidInput`, Linux the system's "busy") and keeps its setting. On
+an IPv4 socket both calls answer `InvalidInput`. **The idle time is `TCP_KEEPIDLE` on
 Linux and `TCP_KEEPALIVE` on Darwin**; the library picks. A closed socket answers `NotOpen`, a
 target without an option answers the "not supported" error, and a socket that is not TCP answers the
 system's refusal of the TCP options.
@@ -568,7 +574,7 @@ hooks, each an `extern` no module of the library defines.
 | `sysl_net_send(fd, from, len) -> isize`, `sysl_net_recv(fd, into, room) -> isize` | a count of bytes |
 | `sysl_net_send_to(fd, from, len, to) -> isize`, `sysl_net_recv_from(fd, into, room, from) -> isize` | a count of bytes, the sender written into `from` |
 | `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
-| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive), `no_delay`, `reuse_port`, `keepalive` (1 or 0), `keepalive_idle`, `keepalive_interval`, `keepalive_count` (seconds or probes, positive); `send_buffer_size` and `recv_buffer_size`, and each of the six above plus `read_back` (14 to 19), ignore `value` and answer the setting |
+| `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive), `no_delay`, `reuse_port`, `keepalive` (1 or 0), `keepalive_idle`, `keepalive_interval`, `keepalive_count` (seconds or probes, positive), `v6_only` (20, 1 or 0; `EINVAL` on a socket that is not IPv6); `send_buffer_size` and `recv_buffer_size`, and each of the six above plus `read_back` (14 to 19), and `v6_only + read_back` (26), ignore `value` and answer the setting |
 | `sysl_net_send_vectored(fd, pieces, count) -> isize` | a count of bytes; `pieces` is `count` `Piece`s, a base pointer and a length each, laid out as C's `struct iovec` |
 | `sysl_net_peer_credentials(fd, out) -> int` | zero, a Unix domain peer's user, group and process id (-1 if unknown) written into `out` |
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
@@ -622,7 +628,7 @@ so a freestanding program that builds an `Address` and never makes a socket is a
 Multicast, broadcast, Unix datagram sockets, Linux's abstract namespace, and every socket option
 beyond the two timeouts, the two buffer sizes, `non_blocking`, `reuse_address` (here because a
 listener that has just been stopped cannot otherwise be started again until `TIME_WAIT` runs out — a
-minute or two, during which the program looks broken), `reuse_port`, `no_delay` and keepalive.
+minute or two, during which the program looks broken), `reuse_port`, `no_delay`, `v6_only` and keepalive.
 
 **All of them are additive**, so leaving them out costs a later release nothing, and guessing at them
 now would fix a shape before anybody has used one. Each would be a hook in `sysl.net.sys` and a call

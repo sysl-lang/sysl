@@ -85,17 +85,33 @@ read_text(path: string) -> Result[string, IoError]
         Err(e) -> Err(InvalidUtf8(e.offset))
 end read_text
 
-/** Writes the bytes, replacing whatever was there and making the file if it was not. */
-write_bytes(path: string, bytes: []const u8) -> Result[unit, IoError] = put(create(path)?, bytes)
+/** Writes the bytes, replacing whatever was there and making the file if it was not.
+ *
+ * **`mode` is the permission bits a file this call makes is born with**, exactly as `create` takes
+ * them: `0o666` by default, narrowed by the process umask, bits above the twelve dropped, ignored on
+ * a target with no permission bits. A file that is already there keeps its own mode -- its contents
+ * are replaced, not the file. A failure answers what the open or the write said, the OS's reason
+ * included, whichever mode was asked for.
+ */
+write_bytes(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError] =
+    put(create(path, mode)?, bytes)
 
-write_text(path: string, text: string) -> Result[unit, IoError] = write_bytes(path, text.bytes)
+/** `write_bytes` for text, with the same `mode`. */
+write_text(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError] =
+    write_bytes(path, text.bytes, mode)
 
 /** Writes the bytes at the end of the file, making it if it is not there. Each call lands after
  * whatever the file already held, including anything another program appended in between.
+ *
+ * `mode` is the permission bits of a file this call makes, as `write_bytes` takes them; a file that
+ * is already there keeps its own.
  */
-append_bytes(path: string, bytes: []const u8) -> Result[unit, IoError] = put(append(path)?, bytes)
+append_bytes(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError] =
+    put(append(path, mode)?, bytes)
 
-append_text(path: string, text: string) -> Result[unit, IoError] = append_bytes(path, text.bytes)
+/** `append_bytes` for text, with the same `mode`. */
+append_text(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError] =
+    append_bytes(path, text.bytes, mode)
 
 /** The shared tail of the three above: write everything, then close, and report the first thing that
  * went wrong rather than the last.

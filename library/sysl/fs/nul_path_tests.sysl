@@ -1,0 +1,236 @@
+module sysl.fs
+@requires(os)
+@tests
+
+import sysl.time.Instant
+
+// A path holding a zero byte is refused with `Other(22)` (`EINVAL`) before C is called. C reads a path up
+// to its first zero, so a call that passed one on would act on the file named by the bytes before it:
+// `open("a\0zzz")` would open `a`. Every family of call that takes a path has a test here, and each one
+// uses a real file `a` as the victim, so a call that truncated the path would answer `Ok` instead.
+
+private fsn_ignore(r: Result[unit, IoError]) = ()
+
+private fsn_scratch(name: string) -> string
+    val dir = "/tmp/sysl-fs-nul-" + name
+
+    fsn_ignore(remove_dir_all(dir))
+    make_dir(dir).unwrap()
+    write_bytes(dir + "/a", [u8('x')]).unwrap()
+    make_dir(dir + "/d").unwrap()
+    dir
+end fsn_scratch
+
+private fsn_done(dir: string) = fsn_ignore(remove_dir_all(dir))
+
+private fsn_refused(r: Result[unit, IoError]) = assert_eq(r, Err(Other(22)))
+
+@test("fsn_ open, create, append and the update opens refuse a path holding a zero byte")
+fsn_open_family()
+    val dir = fsn_scratch("open")
+    val bad = dir + "/a\0zzz"
+
+    assert_eq(open(bad).unwrap_err(), Other(22))
+    assert_eq(create(bad).unwrap_err(), Other(22))
+    assert_eq(append(bad).unwrap_err(), Other(22))
+    assert_eq(open_update(bad).unwrap_err(), Other(22))
+    assert_eq(create_update(bad).unwrap_err(), Other(22))
+    assert_eq(open_uncached(bad).unwrap_err(), Other(22))
+    assert_eq(read_bytes(bad).unwrap_err(), Other(22))
+    assert_eq(read_text(bad).unwrap_err(), Other(22))
+    fsn_refused(write_bytes(bad, [u8('y')]))
+    fsn_refused(write_text(bad, "y"))
+    fsn_refused(append_bytes(bad, [u8('y')]))
+    fsn_refused(append_text(bad, "y"))
+    assert_eq(read_text(dir + "/a").unwrap(), "x")
+    assert(!exists(dir + "/a\0zzz"))
+    fsn_done(dir)
+end fsn_open_family
+
+@test("fsn_ a path holding a zero byte makes no file: the one before the zero is not created")
+fsn_create_makes_nothing()
+    val dir = fsn_scratch("creates")
+
+    assert_eq(create(dir + "/fresh\0zzz").unwrap_err(), Other(22))
+    assert(!exists(dir + "/fresh"))
+    fsn_done(dir)
+end fsn_create_makes_nothing
+
+@test("fsn_ metadata, link_metadata and the questions built on them refuse a zero byte")
+fsn_metadata_family()
+    val dir = fsn_scratch("meta")
+    val bad = dir + "/a\0zzz"
+
+    assert_eq(metadata(bad).unwrap_err(), Other(22))
+    assert_eq(link_metadata(bad).unwrap_err(), Other(22))
+    assert(!is_file(bad))
+    assert(!is_dir(dir + "/d\0zzz"))
+    assert(!is_link(bad))
+    assert(!exists(bad))
+    assert(metadata(dir + "/a").is_ok())
+    fsn_done(dir)
+end fsn_metadata_family
+
+@test("fsn_ remove_file, remove_dir and truncate refuse a zero byte and touch nothing")
+fsn_remove_family()
+    val dir = fsn_scratch("remove")
+
+    fsn_refused(remove_file(dir + "/a\0zzz"))
+    fsn_refused(remove_dir(dir + "/d\0zzz"))
+    fsn_refused(remove_dir_all(dir + "/d\0zzz"))
+    fsn_refused(truncate(dir + "/a\0zzz", 0))
+    assert_eq(read_text(dir + "/a").unwrap(), "x")
+    assert(is_dir(dir + "/d"))
+    fsn_done(dir)
+end fsn_remove_family
+
+@test("fsn_ rename refuses a zero byte in either argument and moves nothing")
+fsn_rename_both()
+    val dir = fsn_scratch("rename")
+
+    fsn_refused(rename(dir + "/a\0zzz", dir + "/b"))
+    fsn_refused(rename(dir + "/a", dir + "/b\0zzz"))
+    fsn_refused(rename(dir + "/a\0x", dir + "/b\0y"))
+    assert(exists(dir + "/a"))
+    assert(!exists(dir + "/b"))
+    fsn_done(dir)
+end fsn_rename_both
+
+@test("fsn_ make_dir and make_dir_all refuse a zero byte and make no directory")
+fsn_create_dir_family()
+    val dir = fsn_scratch("mkdir")
+
+    fsn_refused(make_dir(dir + "/n\0zzz"))
+    fsn_refused(make_dir_all(dir + "/n\0zzz/m"))
+    assert(!exists(dir + "/n"))
+    fsn_done(dir)
+end fsn_create_dir_family
+
+@test("fsn_ entries refuses a zero byte and does not list the directory before it")
+fsn_read_dir()
+    val dir = fsn_scratch("entries")
+
+    assert_eq(entries(dir + "/d\0zzz").unwrap_err(), Other(22))
+    assert_eq(entries(dir).unwrap().len(), 2)
+    fsn_done(dir)
+end fsn_read_dir
+
+@test("fsn_ symlink and hard_link refuse a zero byte in either argument")
+fsn_link_both()
+    val dir = fsn_scratch("link")
+
+    fsn_refused(symlink(dir + "/a\0zzz", dir + "/l"))
+    fsn_refused(symlink(dir + "/a", dir + "/l\0zzz"))
+    fsn_refused(hard_link(dir + "/a\0zzz", dir + "/h"))
+    fsn_refused(hard_link(dir + "/a", dir + "/h\0zzz"))
+    assert(!exists(dir + "/l"))
+    assert(!exists(dir + "/h"))
+    assert_eq(read_link(dir + "/a\0zzz").unwrap_err(), Other(22))
+    assert_eq(canonicalize(dir + "/a\0zzz").unwrap_err(), Other(22))
+    fsn_done(dir)
+end fsn_link_both
+
+@test("fsn_ set_permissions, set_owner, set_link_owner and set_modified refuse a zero byte")
+fsn_setters()
+    val dir = fsn_scratch("set")
+    val bad = dir + "/a\0zzz"
+    val before = metadata(dir + "/a").unwrap().permissions()
+
+    fsn_refused(set_permissions(bad, 0o600))
+    fsn_refused(set_owner(bad, 0, 0))
+    fsn_refused(set_link_owner(bad, 0, 0))
+    fsn_refused(set_modified(bad, Instant(1500000000123456)))
+    assert_eq(metadata(dir + "/a").unwrap().permissions(), before)
+    fsn_done(dir)
+end fsn_setters
+
+@test("fsn_ space, set_current_dir, make_temp_dir, copy_file and copy_dir_all refuse a zero byte")
+fsn_the_rest()
+    val dir = fsn_scratch("rest")
+
+    assert_eq(space(dir + "/a\0zzz").unwrap_err(), Other(22))
+    fsn_refused(set_current_dir(dir + "/d\0zzz"))
+    assert_eq(make_temp_dir("pre\0fix").unwrap_err(), Other(22))
+    fsn_refused(copy_file(dir + "/a\0zzz", dir + "/c"))
+    fsn_refused(copy_file(dir + "/a", dir + "/c\0zzz"))
+    fsn_refused(copy_dir_all(dir + "/d\0zzz", dir + "/e"))
+    assert(!exists(dir + "/c"))
+    fsn_done(dir)
+end fsn_the_rest
+
+@test("fsn_ open_dir and a Dir's own calls refuse a zero byte")
+fsn_beneath()
+    val dir = fsn_scratch("beneath")
+
+    assert_eq(open_dir(dir + "/d\0zzz").unwrap_err(), Other(22))
+
+    val d = open_dir(dir).unwrap()
+
+    assert_eq(d.open("a\0zzz").unwrap_err(), Other(22))
+    assert_eq(d.create("n\0zzz").unwrap_err(), Other(22))
+    assert_eq(d.link_metadata("a\0zzz").unwrap_err(), Other(22))
+    fsn_refused(d.remove_file("a\0zzz"))
+    assert(!d.exists("a\0zzz"))
+    assert(d.exists("a"))
+    fsn_done(dir)
+end fsn_beneath
+
+@test("fsn_ the calls that turn a failure into success or a retry still refuse a zero byte")
+fsn_failure_swallowers()
+    val dir = fsn_scratch("swallow")
+
+    // A failed publish removes its pending entry by contract, so the target-side cells get their own.
+    write_bytes(dir + "/q1", [u8('q')]).unwrap()
+    make_dir(dir + "/q2").unwrap()
+
+    fsn_refused(remove_dir_all(dir + "/a\0zzz"))
+    fsn_refused(remove_dir_all(dir + "/nothing\0zzz"))
+    fsn_refused(make_dir_all(dir + "/d\0zzz"))
+    fsn_refused(make_dir_all("\0"))
+    fsn_refused(publish_file(dir + "/a\0zzz", dir + "/p"))
+    fsn_refused(publish_file(dir + "/q1", dir + "/p\0zzz"))
+    fsn_refused(publish_dir(dir + "/d\0zzz", dir + "/p"))
+    fsn_refused(publish_dir(dir + "/q2", dir + "/p\0zzz"))
+    fsn_refused(write_bytes_atomic(dir + "/w\0zzz", [u8('y')]))
+    fsn_refused(write_text_atomic(dir + "/w\0zzz", "y"))
+    assert(exists(dir + "/a"))
+    assert(is_dir(dir + "/d"))
+    assert(!exists(dir + "/q1") && !is_dir(dir + "/q2"))
+    assert(!exists(dir + "/p"))
+    assert(!exists(dir + "/w"))
+    fsn_done(dir)
+end fsn_failure_swallowers
+
+@test("fsn_ a slice that ends before the zero byte is accepted: only the bytes of the path count")
+fsn_slice_beyond()
+    val dir = fsn_scratch("slice")
+    val whole = dir + "/a\0zzz"
+    val p = whole[0..<(dir.len + 2)]
+
+    assert_eq(read_text(p).unwrap(), "x")
+    assert(metadata(p).is_ok())
+    assert(exists(p))
+    fsn_done(dir)
+end fsn_slice_beyond
+
+@test("fsn_ a slice that starts after a zero byte is accepted too")
+fsn_slice_after()
+    val dir = fsn_scratch("after")
+    val whole = "q\0" + dir + "/a"
+    val p = whole[2..<whole.len]
+
+    assert_eq(read_text(p).unwrap(), "x")
+    fsn_done(dir)
+end fsn_slice_after
+
+@test("fsn_ a path that is only a zero byte, and one that is empty, are not mistaken for each other")
+fsn_empty_and_lone_zero()
+    val dir = fsn_scratch("empty")
+
+    assert_eq(open("").unwrap_err(), NotFound)
+    assert_eq(open("\0").unwrap_err(), Other(22))
+    assert_eq(metadata("").unwrap_err(), NotFound)
+    assert_eq(metadata("\0").unwrap_err(), Other(22))
+    assert_eq(open(dir + "/\0").unwrap_err(), Other(22))
+    fsn_done(dir)
+end fsn_empty_and_lone_zero
