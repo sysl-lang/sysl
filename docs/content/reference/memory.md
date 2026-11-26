@@ -865,7 +865,7 @@ run(c: bool)
 ```
 
 **A local holding a copy of the parameter is followed along the same ways.** Written over with
-something else on every way to where it is stored or its address handed over, it no longer holds the
+something else on every way to where it is stored, answered or its address handed over, it no longer holds the
 parameter there; written over on only some — an `if` without an `else`, a loop body that may not run,
 one `match` arm, a `break` or `continue` past the store — it still does. Only a store of the whole
 local counts as writing it over: a store through a pointer to it, or in a closure's body, does not;
@@ -911,6 +911,32 @@ run()
 
 ```error
 'note' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
+```
+
+The same holds of an answer ([below](#handing-it-back-is-not-keeping-it)): a copy written over on every
+way to a `return` or to the body's result is not what the function hands back there.
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+pick(p: *int) -> *int
+    var q = p
+    print(*q)
+    q = &spare
+    q
+
+run()
+    var n = 41
+    held = pick(&n)
+
+run()
+print(*held)
+```
+
+```output
+41
+0
 ```
 
 ### Handing it back is not keeping it
@@ -1524,9 +1550,10 @@ stores the box through another capture, or hands it to a call that keeps it, doe
 a program, which sees every table there is, each method or closure of that trait at the receiver's own
 arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
 C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
-whose table it never saw — or a recursion still being worked out answers "it may get out", as does a
-task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
-`&sync T` is never laid in a frame.
+whose table it never saw — answers "it may get out", as does a task's body and a payload over a
+kilobyte, which every frame of a recursion would pay for. **A recursion is settled at a fixed point**:
+a box handed to a recursive function, or to a cycle of functions calling one another, stays in the
+frame unless one of their paths lets it out. A `&sync T` is never laid in a frame.
 
 ```sysl
 trait Reader
