@@ -4174,8 +4174,14 @@ wait_for(n: u64)
   a float goes through the general registers. They are **separate accesses**: neither atomic nor one
   bus transaction, so a device or an interrupt handler may change the high word between the two reads —
   a free-running 64-bit counter is read again until two reads agree on the high word. A width that is
-  not whole words (`u40`, `u48`) has a tail no word access moves, and is refused there; one of 32 bits
-  or fewer (`u24`) keeps LLVM's access.
+  not whole words (`u40`, `u48`) has a tail no word access moves, and is refused there.
+- **On 32-bit ARM a volatile of 32 bits or fewer must be held in 1, 2 or 4 bytes.** A `u12` is one
+  `ldrh` and a `u3` one `ldrb`, but a width of 17 to 24 bits (`u24`, `i20`) is held in 3 bytes, which
+  LLVM moves as an `ldrh` and an `ldrb` in either order, so it is refused at every place a `volatile`
+  goes. A bitfield struct is reached as its one container, so there the container decides: two `u12`
+  fields are a 3-byte container and two `u20` fields a 5-byte one, both refused with a volatile field,
+  while a `u12` and a `u20` are one `ldr`. A C bitfield is reached as its declared unit, which is
+  always 8, 16, 32 or 64 bits.
 - **Every other processor keeps LLVM's `load volatile`**: x86 decodes the faulting instruction itself,
   and RISC-V has no writeback addressing, so a `volatile u128` is accepted there.
 
@@ -4195,6 +4201,26 @@ struct Timer
 
 ```error
 'volatile u48' is not a type on thumb-freestanding: it is 48 bits wide, and a 32-bit ARM volatile wider than 32 bits is made as whole 32-bit words, one 'ldr' or 'str' each, which 48 bits is not
+```
+
+```sysl target=thumbv6m-freestanding
+struct Dma
+    count: volatile u24
+```
+
+```error
+'volatile u24' is not a type on thumbv6m-freestanding: it is 24 bits wide, held in 3 bytes, and a 32-bit ARM volatile of 32 bits or fewer is made as one 'ldr' or 'str' of 1, 2 or 4 bytes, which 24 bits is not
+```
+
+```sysl target=thumbv6m-freestanding
+@packed
+struct Pair
+    lo: volatile u12
+    hi: volatile u12
+```
+
+```error
+'Pair.lo' is volatile, and 'Pair' is a bitfield struct held in one integer of 24 bits on thumbv6m-freestanding, which every access to it moves whole
 ```
 
 The counter read on a Cortex-M, where a `volatile u64` is two word reads:
