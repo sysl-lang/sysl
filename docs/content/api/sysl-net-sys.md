@@ -9,7 +9,7 @@ requires: "requires { os }"
 
 ## Index
 
-[`datagram`](#datagram) [`keepalive`](#keepalive) [`keepalive_count`](#keepalive_count) [`keepalive_idle`](#keepalive_idle) [`keepalive_interval`](#keepalive_interval) [`no_delay`](#no_delay) [`non_blocking`](#non_blocking) [`read_back`](#read_back) [`read_timeout`](#read_timeout) [`recv_buffer`](#recv_buffer) [`recv_buffer_size`](#recv_buffer_size) [`reuse_address`](#reuse_address) [`reuse_port`](#reuse_port) [`send_buffer`](#send_buffer) [`send_buffer_size`](#send_buffer_size) [`stream`](#stream) [`unix_domain`](#unix_domain) [`write_timeout`](#write_timeout) [`Credentials`](#credentials) [`Endpoint`](#endpoint) [`Piece`](#piece)
+[`datagram`](#datagram) [`keepalive`](#keepalive) [`keepalive_count`](#keepalive_count) [`keepalive_idle`](#keepalive_idle) [`keepalive_interval`](#keepalive_interval) [`no_delay`](#no_delay) [`non_blocking`](#non_blocking) [`read_back`](#read_back) [`read_timeout`](#read_timeout) [`recv_buffer`](#recv_buffer) [`recv_buffer_size`](#recv_buffer_size) [`reuse_address`](#reuse_address) [`reuse_port`](#reuse_port) [`send_buffer`](#send_buffer) [`send_buffer_size`](#send_buffer_size) [`stream`](#stream) [`unix_domain`](#unix_domain) [`v6_only`](#v6_only) [`write_timeout`](#write_timeout) [`Credentials`](#credentials) [`Endpoint`](#endpoint) [`Piece`](#piece)
 
 ## Constants
 
@@ -79,7 +79,7 @@ is what `sysl.net.would_block` recognises.
 const read_back: int = 6
 ```
 
-Added to `no_delay` .. `keepalive_count` to read the option back: `value` is ignored and the answer
+Added to `no_delay` .. `keepalive_count` and to `v6_only` to read the option back: `value` is ignored and the answer
 is the setting -- 0 or 1 for the flags, the number for the three keepalive times -- or a negative
 status.
 
@@ -158,6 +158,16 @@ const unix_domain: int = 1
 
 `socket`'s `family` for a Unix domain socket: a stream between processes on one machine, addressed
 by a path in the filesystem rather than by an `Endpoint`. Only `stream` is asked for with it.
+
+### `v6_only`
+
+```sysl
+const v6_only: int = 20
+```
+
+`option`'s `which` for `IPV6_V6ONLY` (an IPv6 socket takes only IPv6, so a listener on `::` and one
+on `0.0.0.0` may share a port), `value` 1 or 0. A socket that is not IPv6 answers `EINVAL`'s
+status, and so does one already bound. Read it back with `v6_only + read_back`.
 
 ### `write_timeout`
 

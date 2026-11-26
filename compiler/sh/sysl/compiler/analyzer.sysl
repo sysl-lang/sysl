@@ -527,13 +527,16 @@ struct Analyzer
     // **A body whose result nothing fixed, read for what it yields**: `"closure"` for a closure's
     // (`closure.sysl`'s `closure_body`), `"function"` for a declaration written `= …` with no result
     // (`inferred_results.sysl`'s `own_result_block`), and empty where the result is known. A `?` in
-    // it has no result type to early-return into, so it is refused in words that say what to write
-    // -- unless `try_shape` says the callable a closure stands at yields an `Option` or a `Result`
-    // (`f: T -> Option[U]` with `U` still open), when the `?` is taken on trial, `open_try` is set,
-    // and the body is read again against the result the trial settled.
+    // it has no result type to early-return into, so a function's is refused in words that say what
+    // to write. A closure's is taken on trial: `try_shape` says which enum the callable it stands at
+    // yields (`f: T -> Option[U]` with `U` still open), or has an empty `key` where nothing says even
+    // that; `open_try` is set (as it is by a `return` with a value, which is held to the result too),
+    // `try_seen` collects each `?` taken (where it was, and the type of its operand), and the body is
+    // read again against the result the trial settled.
     open_result: string
     try_shape: Option[VariantSeed]
     open_try: bool
+    try_seen: Buf[(Span, Type)]
 
     // The subscripts the target being read is written through, by span: a container whose
     // `IndexPlace` block wrote `index_place_mut` is indexed through that member at these and through
@@ -962,16 +965,19 @@ analyzer_for(an: &Analysis, scope: Scope) -> &Analyzer =
              false, false, false, AwaitOutside, false, buf(), "", buf(), buf(), 0, 0, "", buf(), buf(), buf(),
              false, buf(), buf(), map(), map(), buf(), false, buf(), buf(), buf(), buf(), buf(), false,
              false, false, false, None, buf(), buf(), buf(), None, buf(), None, None, None, 0, None, None,
-             None, None, buf(), false, false, "", None, false, buf(), 0, false, None, buf(), 0, map(), map(), map(), map())
+             None, None, buf(), false, false, "", None, false, buf(), buf(), 0, false, None, buf(), 0, map(), map(), map(), map())
 
 // **The known half of a parameter like `Result[T, E]`, handed to the variant standing at it.** In
 // `keep[T](o: Result[T, E])` called as `keep(Ok(1))`, the `Ok` settles the enum's `T` from its value
 // and nothing in it says what `E` is -- but the parameter does. `at` is the argument's anchor, `key` the
-// enum, and `known` the enum's own type parameters the parameter fixed, by name.
+// enum, and `known` the enum's own type parameters the parameter fixed, by name. `tails` are the other
+// anchors the same value is read at: a closure body ending in an `if` or a `match` yields each
+// branch's last line, and each is seeded as the one line would be.
 struct VariantSeed
     at: Span
     key: string
     known: Buf[Binding]
+    tails: Buf[Span]
 end VariantSeed
 
 // A run of names with nothing in it, named so that a constructor can say which kind it means.
