@@ -155,6 +155,107 @@ end hollow_c_size
 
 private hollow_in_c(l: TargetLayout, target: Target, t: Type) -> bool = hollow_c_size(l, target, t) > 0
 
+// **The first struct holding no data that sysl gives room and C gives a different size**, under `t` --
+// the path of struct fields leading to it (empty where `t` is it) and the type -- or nothing.
+//
+// An `@align(n)` struct with no fields keeps its alignment's room in sysl: `n` bytes, and a struct or
+// array made only of such structs as much again. C lays the same declaration out its own way. clang
+// and gcc give `struct __attribute__((aligned(16))) { }` no bytes at all, and passed by value it is no
+// argument (arm64-macos: `void take(A16, int)` is `declare void @take(i32)`, where sysl's would be
+// `(i128, i32)`). Microsoft's C gives it its four bytes of an empty struct rounded up to the
+// alignment, so `@align(2)` is 4 there where sysl gives 2, and `@align(4)` and wider agree
+// (`aligned_void_c_size`). Each size is clang 21's, `-fsyntax-only` with `_Static_assert` on
+// `x86_64-pc-windows-msvc` and `x86_64-linux-gnu`.
+//
+// `through_pointers` says whether the walk goes behind a pointer and into a function pointer's
+// signature. The header's declarations do: C lays out whatever the header declares. A call's
+// by-value layout does not, since a pointer is one register on both sides.
+aligned_void(l: TargetLayout, target: Target, t: Type, through_pointers: bool) -> Option[(string, Type)]
+    var seen: Buf[Type] = buf()
+
+    aligned_void_walk(l, target, t, through_pointers, &seen)
+end aligned_void
+
+private aligned_void_walk(l: TargetLayout, target: Target, t: Type, through: bool,
+                          seen: *Buf[Type]) -> Option[(string, Type)]
+    t match
+        Constrained(d) -> return aligned_void_walk(l, target, d.base, through, seen)
+        Volatile(inner) -> return aligned_void_walk(l, target, *inner, through, seen)
+        _ -> ()
+
+    if aligned_void_differs(l, target, t) then return Some(("", t))
+
+    t match
+        Struct(d) ->
+            if d.opaque || !d.c_bits.is_empty() || !first_sight(t, seen) then return None
+
+            for item in d.stored()
+                aligned_void_walk(l, target, item.1, through, seen) match
+                    Some(found) ->
+                        val at = if found.0.is_empty() then item.0 else s"${item.0}.${found.0}"
+
+                        return Some((at, found.1))
+                    None -> ()
+
+            None
+        Array(n, elem, _) -> if n == 0 then None else aligned_void_walk(l, target, *elem, through, seen)
+        Ptr(inner, _) -> if through then aligned_void_walk(l, target, *inner, true, seen) else None
+        CFn(params, ret, _) ->
+            if !through then return None
+
+            for param in params
+                val found = aligned_void_walk(l, target, param, true, seen)
+
+                if found.is_some() then return found
+
+            aligned_void_walk(l, target, *ret, true, seen)
+        _ -> None
+end aligned_void_walk
+
+// Whether `t` holds no data, occupies bytes in sysl, and has another size in the target's C.
+private aligned_void_differs(l: TargetLayout, target: Target, t: Type) -> bool =
+    l.size(t) != 0 && void_in_c(l, t) && aligned_void_c_size(l, target, t) != int(l.size(t))
+
+// Whether `t` is a struct, union or array the header declares with nothing C would store in it: every
+// field occupies nothing in sysl (and is left out of the declaration) or is such a type itself.
+private void_in_c(l: TargetLayout, t: Type) -> bool
+    underlying(t) match
+        Struct(d) ->
+            if d.opaque || !d.c_bits.is_empty() then return false
+
+            for item in d.fields
+                if l.size(item.1) != 0 && !void_in_c(l, item.1) then return false
+
+            true
+        Array(n, elem, _) -> n == 0 || void_in_c(l, *elem)
+        _ -> false
+end void_in_c
+
+// The size the target's C gives a type `void_in_c` holds: none where clang and gcc lay it out, and on
+// Windows x64 Microsoft's, where a struct is its members laid end to end at their alignments, never
+// less than four bytes, rounded up to its own alignment (`struct { A2 x, y; }` is 8).
+aligned_void_c_size(l: TargetLayout, target: Target, t: Type) -> int =
+    if c_sizes_empty(target) then msvc_void_size(l, t) else 0
+
+private msvc_void_size(l: TargetLayout, t: Type) -> int
+    underlying(t) match
+        Struct(d) ->
+            var held = 0
+
+            for item in d.fields
+                val n = msvc_void_size(l, item.1)
+
+                held = if !d.union_layout then round_to(held, int(l.align(item.1))) + n
+                       else if n > held then n
+                       else held
+
+            round_to(if held > 4 then held else 4, int(l.align(t)))
+        Array(n, elem, _) -> n * msvc_void_size(l, *elem)
+        _ -> 0
+end msvc_void_size
+
+private round_to(n: int, to: int) -> int = (n + to - 1) / to * to
+
 // A transparent named subtype or a qualifier taken off the top, and every name inside left where it
 // was written -- a name there is exactly the thing a header is asked to spell.
 private header_surface(t: Type) -> Type = t match
