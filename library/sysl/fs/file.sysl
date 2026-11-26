@@ -230,33 +230,46 @@ struct File
      * and the conversion is not atomic: going from `Shared` to `Exclusive` lets go first, so another
      * waiter may get in between.
      *
+     * **Bytes read ahead before the lock are dropped once it is taken**: they were read while somebody
+     * else may have been writing, so the descriptor is moved back to where the program thinks it is
+     * and the next read reads them again, under the lock. A file that had read to the end reads on
+     * past it, since a writer may have added to it. What is buffered for writing is left alone.
+     *
      * A target whose filesystem answers no locks says `not supported on this target`; a wait cut
      * short by a signal answers `Interrupted`.
      */
     lock(self, kind: LockKind) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        answered(fsys.lock(self.inner.fd, kind.how()))
+        answered(fsys.lock(self.inner.fd, kind.how()))?
+        answered(fresh(self.inner))
 
     /** `lock` without the wait: the lock is taken now, or the answer is an `IoError` whose
      * `would_block()` says another open file holds one that conflicts, and nothing new is held. A
      * conversion lets go of the old lock first (`lock`), so a failed one may leave the file holding
-     * no lock at all.
+     * no lock at all. A lock taken drops what was read ahead, as `lock` does; one refused leaves it.
      */
     try_lock(self, kind: LockKind) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        answered(fsys.lock_now(self.inner.fd, kind.how()))
+        answered(fsys.lock_now(self.inner.fd, kind.how()))?
+        answered(fresh(self.inner))
 
-    /** Gives up the lock this file holds, of either kind. A file that holds none answers `Ok` all the
-     * same. Closing the file does this too. **It does not flush**: bytes written under the lock and
-     * still buffered are not in the file yet, so a writer calls `flush` first where a reader is
-     * waiting for them (`close` flushes before it lets go).
+    /** Gives up the lock this file holds, of either kind, **handing over what is buffered first**, as
+     * `close` does: bytes written under the lock are in the file before anybody waiting for it gets
+     * in. The lock is given up even where handing them over fails -- a full disk does not keep every
+     * other process out -- and that failure is the one reported. The flush is a write, so `unlock`
+     * may wait as a write does and a `@no_block` path may not call it; `try_lock` never waits. A file
+     * that holds no lock answers `Ok` all the same. Closing the file does this too.
      */
     unlock(self) -> Result[unit, IoError]
         if self.inner.shut then return Err(NotOpen)
 
-        answered(fsys.lock_now(self.inner.fd, fsys.lock_release))
+        val written = drain(self.inner)
+        val released = fsys.lock_now(self.inner.fd, fsys.lock_release)
+
+        answered(if written != 0 then written else released)
+    end unlock
 
     /** Hands over what is buffered.
      *
@@ -455,6 +468,15 @@ private unread(s: &FileState) -> int
 
     fsys.seek(s.fd, -long(ahead), fsys.seek_current, &at)
 end unread
+
+/** What a lock just taken leaves: nothing read before it kept, and no end reached before it
+ * remembered, since another program may have written in between. Zero, or the code of the seek that
+ * gave the read-ahead back.
+ */
+private fresh(s: &FileState) -> int
+    s.ended = false
+    unread(s)
+end fresh
 
 /** The buffer, made the first time the file needs one. */
 private buffer(s: &FileState) -> []u8

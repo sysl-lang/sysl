@@ -19,12 +19,16 @@ private flk_done(dir: string) = flk_ignore(remove_dir_all(dir))
 private flk_ignore(r: Result[unit, IoError]) = ()
 
 private flk_prober(dir: string) -> string
-    write_text(s"$dir/prober.sysl", "import sysl.fs.{LockKind, open}\nimport sysl.time.{millis, sleep}\n\n" +
+    write_text(s"$dir/prober.sysl", "import sysl.fs.{LockKind, open, read_text}\nimport sysl.time.{millis, sleep}\n\n" +
                "main(args: []string)\n" +
                "    val f = open(args[1]).unwrap()\n\n" +
                "    if args[2] == \"wait\"\n" +
                "        f.lock(LockKind.Exclusive).unwrap()\n" +
                "        print(\"got\")\n" +
+               "        return\n\n" +
+               "    if args[2] == \"read\"\n" +
+               "        f.lock(LockKind.Shared).unwrap()\n" +
+               "        print(read_text(args[1]).unwrap())\n" +
                "        return\n\n" +
                "    if args[2] == \"hold\"\n" +
                "        f.lock(LockKind.Exclusive).unwrap()\n\n" +
@@ -131,6 +135,33 @@ flk_lock_waits_for_unlock()
     flk_done(dir)
 end flk_lock_waits_for_unlock
 
+@test("flk a reader waiting for the lock sees every byte the writer wrote under it, flushed by unlock")
+flk_waiting_reader_sees_the_write()
+    val dir = flk_dir()
+    val prober = flk_prober(dir)
+    val path = s"$dir/handover"
+    var f = create(path).unwrap()
+
+    f.lock(LockKind.Exclusive).unwrap()
+    f.write("written under the lock".bytes)
+
+    val child = start(prober, [path, "read"], stderr = true, timeout = 60000).unwrap()
+
+    sleep(millis(300))
+    assert(child.try_wait().unwrap().is_none(), "the reader did not wait")
+
+    // No flush here: unlock hands the bytes over before it lets the reader in.
+    f.unlock().unwrap()
+
+    val out = child.wait().unwrap()
+
+    assert_eq(out.status, Status.Exited(0), out.err.unwrap_or(""))
+    assert_eq(out.text, "written under the lock\n")
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_waiting_reader_sees_the_write
+
 @test("flk a process that dies holding a lock releases it")
 flk_dead_holder_releases()
     val dir = flk_dir()
@@ -177,18 +208,25 @@ private flk_compile(dir: string, body: string) -> string
     if built.status == Status.Exited(0) then "" else built.err.unwrap_or("")
 end flk_compile
 
-@test("flk try_lock and unlock may be called from a @no_block function, and lock may not")
-flk_only_lock_blocks()
+@test("flk try_lock may be called from a @no_block function; lock waits, and unlock writes")
+flk_only_try_lock_never_blocks()
     val dir = flk_dir()
 
-    assert_eq(flk_compile(dir, "@no_block\nquick(f: File) -> bool = f.try_lock(LockKind.Shared).is_ok() " +
-                               "&& f.unlock().is_ok()\n\nmain()\n    print(1)\n"), "")
+    assert_eq(flk_compile(dir, "@no_block\nquick(f: File) -> bool = f.try_lock(LockKind.Shared).is_ok()\n\n" +
+                               "main()\n    print(1)\n"), "")
 
-    val refused = flk_compile(dir, "@no_block\nslow(f: File) -> bool = f.lock(LockKind.Shared).is_ok()\n\n" +
-                                   "main()\n    print(1)\n")
+    val waits = flk_compile(dir, "@no_block\nslow(f: File) -> bool = f.lock(LockKind.Shared).is_ok()\n\n" +
+                                 "main()\n    print(1)\n")
 
-    assert(refused.contains("this reaches 'sysl.fs.File.lock', which blocks through 'sysl.fs.sys.lock'"),
-           refused)
-    assert(refused.contains("'slow' declared '@no_block'"), refused)
+    assert(waits.contains("this reaches 'sysl.fs.File.lock', which blocks through 'sysl.fs.sys.lock'"),
+           waits)
+    assert(waits.contains("'slow' declared '@no_block'"), waits)
+
+    // unlock hands over what is buffered first, and a write may wait for the device.
+    val writes = flk_compile(dir, "@no_block\nlet_go(f: File) -> bool = f.unlock().is_ok()\n\n" +
+                                  "main()\n    print(1)\n")
+
+    assert(writes.contains("this reaches 'sysl.fs.File.unlock', which blocks through 'sysl.fs.sys.write'"),
+           writes)
     flk_done(dir)
-end flk_only_lock_blocks
+end flk_only_try_lock_never_blocks

@@ -3,6 +3,8 @@ module sysl.fs
 @tests
 
 import sysl.fs.sys as fsys
+import sysl.io.Reader
+import sysl.text.from_utf8
 import sysl.time.monotonic
 
 // `File.lock`, `File.try_lock` and `File.unlock` within one process -- `flock`'s lock belongs to the
@@ -13,7 +15,10 @@ import sysl.time.monotonic
 // The axes: who else asks (a second open, a copy of the same `File`); the two kinds against each
 // other; what ends a lock (`unlock`, `close`, the last copy going, and closing *another* descriptor to
 // the file, which must not); the mode the file was opened in; waiting against not waiting; a closed
-// file; the error a refusal carries. Not here: a failed conversion upward (Shared to Exclusive while
+// file; the error a refusal carries; what the file's buffer holds when a lock is taken or given up
+// (bytes written, bytes read ahead, the end reached). Not here: an unlock whose flush fails (no test
+// machine has a disk to fill on demand; the release is unconditional in the code, the order is
+// what `flk_unlock_flushes_first` pins); a failed conversion upward (Shared to Exclusive while
 // another holds Shared), which `flock` may answer by leaving no lock at all -- the page says "may", and
 // a test would pin one platform's choice; a filesystem that answers no locks (NFS without lockd), which
 // no test machine has; a thread, which cannot be handed a `File` at all (the page's `error` block).
@@ -276,21 +281,122 @@ flk_try_lock_converts()
     flk_done(dir)
 end flk_try_lock_converts
 
-@test("flk a lock does not flush: what is buffered is not written by taking or giving it up")
-flk_lock_leaves_the_buffer_alone()
+@test("flk unlock hands over what is buffered before it lets go, and taking the lock does not")
+flk_unlock_flushes_first()
     val dir = flk_dir()
     val path = s"$dir/buffered"
     var f = create(path).unwrap()
 
     f.lock(LockKind.Exclusive).unwrap()
     f.write("held".bytes)
-    f.unlock().unwrap()
+
+    // Taking the lock again (a conversion) leaves the write buffered: nobody else got in.
+    f.lock(LockKind.Exclusive).unwrap()
     assert_eq(read_text(path).unwrap(), "")
 
-    f.close().unwrap()
+    f.unlock().unwrap()
     assert_eq(read_text(path).unwrap(), "held")
+    assert(!flk_kept_out(path, LockKind.Exclusive))
+
+    // A second unlock has nothing to hand over and nothing to give up.
+    f.unlock().unwrap()
+    f.write(" on".bytes)
+    f.close().unwrap()
+    assert_eq(read_text(path).unwrap(), "held on")
     flk_done(dir)
-end flk_lock_leaves_the_buffer_alone
+end flk_unlock_flushes_first
+
+// Somebody else's write into the middle of `path`, through an open file of its own, finished before
+// this returns.
+private flk_overwrite(path: string, at: long, text: string)
+    var g = open_update(path).unwrap()
+
+    g.seek(at).unwrap()
+    g.write(text.bytes)
+    g.close().unwrap()
+end flk_overwrite
+
+// What one read of at most eight bytes answers, as text.
+private flk_read(f: *File) -> string
+    var window: [8]u8 = [0; 8]
+
+    from_utf8(f.read(window)).unwrap()
+end flk_read
+
+@test("flk lock drops what was read ahead before it, so the next read sees a write made in between")
+flk_lock_drops_read_ahead()
+    val dir = flk_dir()
+    val path = s"$dir/ahead"
+
+    write_text(path, "abcdefgh-tail").unwrap()
+
+    var f = open(path).unwrap()
+    var one: [1]u8 = [0; 1]
+
+    // One byte asked for, the whole file read ahead into the buffer.
+    assert_eq(f.read(one).len, 1)
+
+    flk_overwrite(path, 1, "XYZ")
+    f.lock(LockKind.Shared).unwrap()
+    assert_eq(flk_read(&f), "XYZefgh-")
+    assert_eq(f.tell().unwrap(), 9)
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_lock_drops_read_ahead
+
+@test("flk try_lock that takes the lock drops the read-ahead, and one refused keeps it")
+flk_try_lock_drops_read_ahead_only_when_taken()
+    val dir = flk_dir()
+    val path = s"$dir/tried"
+
+    write_text(path, "abcdefgh-tail").unwrap()
+
+    var holder = open(path).unwrap()
+    var f = open(path).unwrap()
+    var one: [1]u8 = [0; 1]
+
+    assert_eq(f.read(one).len, 1)
+    holder.lock(LockKind.Exclusive).unwrap()
+    flk_overwrite(path, 1, "XYZ")
+
+    // Refused: what was read ahead is still what the next read answers.
+    assert(flk_blocked(f.try_lock(LockKind.Shared)))
+    assert_eq(flk_read(&f), "bcdefgh-")
+
+    flk_overwrite(path, 9, "TAIL")
+    holder.unlock().unwrap()
+
+    // Taken: the rest is read again, under the lock.
+    f.try_lock(LockKind.Shared).unwrap()
+    assert_eq(flk_read(&f), "TAIL")
+
+    flk_ignore(holder.close())
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_try_lock_drops_read_ahead_only_when_taken
+
+@test("flk a file that read to its end reads on past it once it takes the lock")
+flk_lock_forgets_the_end()
+    val dir = flk_dir()
+    val path = s"$dir/grows"
+
+    write_text(path, "abc").unwrap()
+
+    var f = open(path).unwrap()
+
+    assert_eq(flk_read(&f), "abc")
+    assert_eq(flk_read(&f), "")
+    assert(f.at_end())
+
+    append_text(path, "def").unwrap()
+    f.lock(LockKind.Shared).unwrap()
+    assert(!f.at_end())
+    assert_eq(flk_read(&f), "def")
+
+    flk_ignore(f.close())
+    flk_done(dir)
+end flk_lock_forgets_the_end
 
 @test("flk unlock on a file that holds no lock answers Ok")
 flk_unlock_without_a_lock()
