@@ -162,13 +162,16 @@ resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Typ
 
 // A type in one of the three positions a `volatile` may stand -- the pointee of a `*T`, an element,
 // a struct field. What they share is that the storage named is **somebody else's**: a device's
-// registers, reached through an address the program was handed.
-resolve_qualified(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
-    VolatileType(inner) ->
-        val ty = resolve_type(a, scope, inner, subst)
+// registers, reached through an address the program was handed. A struct's own field (`field`) is
+// held to its storage on 32-bit ARM by the struct, once every field is known (`check_arm_storage`):
+// in a bitfield struct the access is the container's, not the field's.
+resolve_qualified(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding], field: bool = false) -> Type =
+    *t.kind match
+        VolatileType(inner) ->
+            val ty = resolve_type(a, scope, inner, subst)
 
-        if volatile_admits(a, scope, t.span, ty) then Volatile(ty) else Unknown
-    _ -> resolve_type(a, scope, t, subst)
+            if volatile_admits(a, scope, t.span, ty, field) then Volatile(ty) else Unknown
+        _ -> resolve_type(a, scope, t, subst)
 
 // The type a module's own storage is declared at -- a module `var`, a `static var` or `val`.
 //
@@ -245,10 +248,83 @@ private arm_wide_ok(a: &Analysis, scope: Scope, span: Span, shown: string, bits:
     false
 end arm_wide_ok
 
+// On 32-bit ARM a volatile of 32 bits or fewer is one `ldrb`, `ldrh` or `ldr` of its storage, so the
+// storage must be 1, 2 or 4 bytes: a `u24` or an `i20` is held in 3, which LLVM moves as an `ldrh` and
+// an `ldrb` in either order, and is refused. A `u12` (2 bytes) and a `u3` (1) are one access.
+private arm_storage_ok(a: &Analysis, scope: Scope, span: Span, t: Type) -> bool
+    if a.tables.target.cpu != Thumb then return true
+
+    val bits = arm_scalar_bits(t)
+
+    if bits <= 16 || bits > 24 then return true
+
+    val shown = type_show(t)
+
+    a.fault(scope, span, s"'volatile $shown' is not a type on ${a.tables.target.name}: it is $bits bits " +
+            "wide, held in 3 bytes, and a 32-bit ARM volatile of 32 bits or fewer is made as one 'ldr' or " +
+            s"'str' of 1, 2 or 4 bytes, which $bits bits is not. Widen it to 32 bits, as 'volatile u32', or " +
+            "narrow it to 16 bits or fewer")
+    false
+end arm_storage_ok
+
+// The bits of a scalar a volatile access moves on 32-bit ARM; 0 for anything whose width is not its
+// own (a pointer, an `int`) or that is not a scalar.
+private arm_scalar_bits(t: Type) -> int = underlying(t) match
+    Integer(bits, _, wide) -> if wide then 0 else bits
+    Fixed(bits, _, _) -> bits
+    Floating(bits, _) -> bits
+    Enum(d) -> if d.simple then bitfield_width(t).unwrap_or(0) else 0
+    _ -> 0
+
+// **A struct's volatile fields held to their storage on 32-bit ARM**, once every field is resolved. A
+// bitfield struct (`layout.sysl`'s `bitfield_ranges`) is reached as its one container, so it is the
+// container that must be 1, 2 or 4 bytes or whole 32-bit words: three narrow fields of 3, 12 and 9 bits
+// are one `ldr`, two of 12 bits a 3-byte container, two of 20 a 5-byte one. Any other struct's
+// volatile field is its own access, held as `arm_storage_ok` holds a pointee. A C bitfield is reached
+// as its declared unit, which is 8, 16, 32 or 64 bits already.
+private check_arm_storage(a: &Analysis, scope: Scope, d: StructDecl, s: &StructType)
+    if a.tables.target.cpu != Thumb then return
+
+    // A field that did not resolve has been complained about, and leaves the layout unknown.
+    for item in s.fields
+        if underlying(unqualified(item.1)) == Unknown then return
+
+    val ranges = bitfield_ranges(s)
+
+    for i in 0..<s.fields.len()
+        val item = s.fields[i]
+
+        val inner: Option[Type] = item.1 match
+            Volatile(t) -> Some(*t)
+            _ -> None
+
+        if s.c_bit(i).is_some() || inner.is_none() then continue
+
+        if ranges.is_none()
+            arm_storage_ok(a, scope, d.fields[i].typ.span, inner.unwrap())
+            continue
+        end if
+
+        val bits = bitfield_bits(ranges.unwrap())
+
+        if bits == 8 || bits == 16 || bits == 32 || bits % 32 == 0 then return
+
+        val name = type_show(Struct(s))
+
+        a.fault(scope, d.fields[i].typ.span, s"'$name.${item.0}' is volatile, and '$name' is a bitfield struct " +
+                s"held in one integer of $bits bits on ${a.tables.target.name}, which every access to it " +
+                "moves whole; a 32-bit ARM volatile is made as one 'ldr' or 'str' of 8, 16 or 32 bits or as " +
+                s"whole 32-bit words, which $bits bits is not. Widen its fields to 8, 16 or 32 bits, or to " +
+                "a multiple of 32 bits")
+        return
+    end for
+end check_arm_storage
+
 // Whether a `volatile` may qualify this type. The qualifier promises exactly the one load or the one
 // store the source wrote, so it means something only where an access is one instruction; a register
-// block is qualified one field at a time, and anything counted is refused outright.
-private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type) -> bool
+// block is qualified one field at a time, and anything counted is refused outright. A struct's own field
+// (`field`) is held to its storage by the struct (`check_arm_storage`).
+private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type, field: bool = false) -> bool
     val shown = type_show(t)
     val head = s"'volatile $shown' is not a type: "
 
@@ -260,6 +336,8 @@ private volatile_admits(a: &Analysis, scope: Scope, span: Span, t: Type) -> bool
                 s"${type_show(underlying(t))} and convert what you read")
         return false
     end if
+
+    if !field && !arm_storage_ok(a, scope, span, t) then return false
 
     val why = underlying(t) match
         Unknown -> return false
@@ -2266,17 +2344,18 @@ instantiate_struct(a: &Analysis, scope: Scope, span: Span, written: string, key:
         c_bit_written(d, i) match
             Some(b) ->
                 val storage = resolve_qualified(a, home, b.storage, subst)
-                val value = if b.zero then Unit else resolve_qualified(a, home, f.typ, subst)
+                val value = if b.zero then Unit else resolve_qualified(a, home, f.typ, subst, true)
 
                 made.fields.push((f.name, value))
                 made.c_bits.push(CBit(i, storage, if b.zero then 0 else c_bit_width(value)))
-            None -> made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst)))
+            None -> made.fields.push((f.name, resolve_qualified(a, home, f.typ, subst, true)))
 
     leave_fields(a, outer)
 
     if !made.c_bits.is_empty() then check_c_bits(a, scope, d, made)
 
     check_bitfields(a, scope, span, made)
+    check_arm_storage(a, scope, d, made)
     check_byte_order(a, scope, span, made)
     check_pinned_holder(a, scope, span, d, made)
 
