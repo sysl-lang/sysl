@@ -57,8 +57,8 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_done("quad_externs")
     check_nested_empty_externs(a, emitted)
     check_done("nested_empty_externs")
-    check_nested_empty_fn_pointers(a, emitted)
-    check_done("nested_empty_fn_pointers")
+    check_fn_pointer_signatures(a, emitted)
+    check_done("fn_pointer_signatures")
     check_general_regs(a, emitted, own, pruned)
     check_done("general_regs")
     promotions
@@ -1453,9 +1453,10 @@ end nested_empty_reason
 
 // **A C function pointer is a C signature as much as an `extern` is**: a call through a `*extern(A) ->
 // R` is lowered by the `extern` call's own `gen_foreign_call`, and C calls through one it was handed
-// under its own layout of `A` and `R`. So a `*extern` type taking or answering, by value, a struct
-// holding an empty struct is refused on the machines `check_nested_empty_externs` refuses such an
-// `extern` on, and for the same reason.
+// under its own layout of `A` and `R`. So a `*extern` type is refused where an `extern` of its
+// signature would be, and for the same reasons: taking or answering, by value, a struct holding an
+// empty struct on the machines `check_nested_empty_externs` refuses one on, and an `f128` (itself or
+// in a struct passed by value) on the machines `check_quad_externs` refuses one on.
 //
 // **The refusal is of the type**, wherever the program this build emits mentions it -- an `extern`'s
 // signature, module storage, a function's signature, a struct's or an enum's field, any depth of
@@ -1463,8 +1464,8 @@ end nested_empty_reason
 // one, a cast) -- rather than at the calls alone: a pointer sysl only stores and C calls through is
 // the same disagreement. Each type is refused once, where the walk first meets it; a struct's fields
 // are blamed on the struct's own declaration.
-check_nested_empty_fn_pointers(a: &Analysis, p: TProgram)
-    if !c_sizes_empty(a.tables.target) then return
+check_fn_pointer_signatures(a: &Analysis, p: TProgram)
+    if !c_sizes_empty(a.tables.target) && c_long_double_is_quad(a.tables.target) then return
 
     var types: Set[string] = set()
     var structs: Set[string] = set()
@@ -1505,7 +1506,7 @@ check_nested_empty_fn_pointers(a: &Analysis, p: TProgram)
     val home = entry_home(a)
 
     walk_stmts(p.main, expr_walk(false, e -> fn_pointers_in(a, home, e.span, texpr_type(e), met, held)))
-end check_nested_empty_fn_pointers
+end check_fn_pointer_signatures
 
 // Every C function pointer type `t` is or holds -- through pointers, arrays, slices, the fields of a
 // struct or an enum and a function pointer's own signature -- each refused where it must be. `met` is
@@ -1563,9 +1564,11 @@ private fn_pointers_in(a: &Analysis, scope: Scope, at: Span, t: Type, met: *Set[
 end fn_pointers_in
 
 // The refusals one C function pointer type earns: each parameter, then the result, that crosses by
-// value holding an empty struct inside a struct that occupies bytes.
+// value holding an empty struct inside a struct that occupies bytes, or holding an `f128` where C has
+// no binary128 type.
 private refuse_fn_pointer(a: &Analysis, scope: Scope, at: Span, t: Type)
     val shown = type_show(t)
+    val target = a.tables.target
 
     underlying(t) match
         CFn(params, ret, _) ->
@@ -1576,13 +1579,25 @@ private refuse_fn_pointer(a: &Analysis, scope: Scope, at: Span, t: Type)
                     a.fault(scope, at, s"parameter ${i + 1} of the function pointer type '$shown' is " +
                             nested_empty_reason(a, params[i], found.unwrap()))
 
+                if quad_unspelled(target, params[i])
+                    a.fault(scope, at, s"parameter ${i + 1} of the function pointer type '$shown' is " +
+                            s"${type_show(params[i])}, ${quad_unspellable(target)}")
+
             val answered = nested_empty_here(a, *ret)
 
             if answered.is_some()
                 a.fault(scope, at, s"the function pointer type '$shown' returns " +
                         nested_empty_reason(a, *ret, answered.unwrap()))
+
+            if quad_unspelled(target, *ret)
+                a.fault(scope, at, s"the function pointer type '$shown' returns ${type_show(*ret)}, " +
+                        quad_unspellable(target))
         _ -> ()
 end refuse_fn_pointer
+
+// Whether `t` crossing by value holds an `f128` that C on `target` has no type for.
+private quad_unspelled(target: Target, t: Type) -> bool =
+    !c_long_double_is_quad(target) && !mentions_unknown(t) && holds_quad(t)
 
 // Whether an `f128` in `f`'s signature is something C on `t` can call it with. The quad runtime's
 // routines are the exception: LLVM is their only caller, and it passes `fp128` the same way on every
