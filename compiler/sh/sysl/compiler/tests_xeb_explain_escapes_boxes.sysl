@@ -1,0 +1,484 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{remove_dir_all, write_text}
+
+// **`--explain-escapes` says why a `&T` box is on the heap** (`stack_box.sysl`'s `BoxWhy`,
+// `reference/memory.md § Promotion is silent, not hidden`): one line per construction and per factory
+// call whose box the frame does not lay, at the construction or the call, naming the first way out
+// the walk met -- and, where a callee lets it out, how that callee does, in parentheses.
+//
+// The cells cross each way out (module storage, a field through a reference, a closure's capture, a
+// value with a destructor, a loop's outer local, a table call's keeping body, a direct keeping callee,
+// a recursion, a non-factory's answer, `break`, a weakening, an `async` body, a payload over the
+// limit, a factory with no frame entry, a trait object stored) with the boxes that say nothing (laid
+// in the frame, a factory's own answer, a generic built twice saying its one line once), and with the
+// commands that lower a program (`emit-llvm`, `test`, `build-c`), a program of two files, and a build
+// without the flag.
+//
+// Skipped cells, and why: a body that becomes another call (`become`) laid its box anyway in the
+// program written for it (its tail call was lowered as a loop), so that line cannot be shown from
+// source; a setter (`WhySetter`) and a compound assignment of a box are shapes no `&T` program here
+// writes; an `asm` statement beside a box is refused before the lowering on every host target.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+// What `sysl <command>` reports, `--explain-escapes` given where `asked`, of a project holding `files`,
+// each line with the project's directory taken out.
+private xeb_said(command: string, files: []const (string, string), asked: bool) -> Buf[string]
+    var notes: Buf[string] = buf()
+
+    if xvr_no_library() || !clang_available() then return notes
+
+    val root = runner_project(files[0].0, files[0].1)
+
+    for k in 1..<files.len
+        write_text(s"$root/${files[k].0}", files[k].1).unwrap()
+
+    val noted = &notes
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+
+    if asked then args.push("--explain-escapes")
+
+    // `sysl test` of a file builds it in this process, as `tests_xet_explain_in_tests` asks it.
+    args.push(if command == "test" then s"$root/${files[0].0}" else root)
+
+    if command == "build-c"
+        args.push("-o")
+        args.push(s"$root/lib.a")
+    end if
+
+    // What else a command says (building the standard module, what it wrote, a warning) is not the
+    // report's. `build-c` hands the report to its output channel, the others to the note channel.
+    run_cli_noted(args.view(), (line) -> if xeb_reports(line) then noted.push(xeb_local(line)),
+                  (line) -> if xeb_reports(line) then noted.push(xeb_local(line)))
+    remove_dir_all(root).unwrap_or(())
+    notes
+end xeb_said
+
+private xeb_explained(text: string) -> Buf[string] = xeb_said("emit-llvm", [("main.sysl", text)], true)
+
+private xeb_reports(line: string) -> bool =
+    line == "no arrays were promoted to the heap" || line.contains(" is boxed on the heap, because ") ||
+        line.contains(" is promoted to the heap, because ")
+
+// Whether a line of `--explain-escapes` is one about a `&T` box or a factory call's, which the suites
+// about arrays and closures leave to this one.
+says_box_line(line: string) -> bool =
+    line.index_of(" is boxed on the heap, because ").is_some() && line.index_of(": a closure ").is_none()
+
+// A line of the report with the directory taken off its file name (the temporary directory may be
+// spelt through a link, so the name is cut at its last `/` before the first `:`).
+private xeb_local(line: string) -> string
+    val colon = line.index_of(":")
+
+    if colon.is_none() then return line
+
+    line[0..<colon.unwrap()].last_index_of("/") match
+        Some(at) -> line[at + 1..<line.bytes.len]
+        None -> line
+end xeb_local
+
+// The report is `want`, line for line.
+private xeb_says(got: Buf[string], want: []const string)
+    if xvr_no_library() || !clang_available() then return
+
+    var all = ""
+
+    for item in got
+        all = all + item + "\n"
+
+    assert_eq(got.len(), want.len, all)
+
+    for k in 0..<want.len
+        assert_eq(got[k], want[k])
+end xeb_says
+
+private const xeb_heap: string = "is boxed on the heap, because"
+
+// -- the page's example ---------------------------------------------------------------------------
+
+private const xeb_page: string = raw"""
+    struct Counter
+        n: int
+
+    var kept: Option[&Counter] = None
+
+    counter(n: int) -> &Counter = Counter(n)
+
+    keep(c: &Counter)
+        kept = Some(c)
+
+    count(n: int, c: &Counter) -> int = if n == 0 then c.n else count(n - 1, c)
+
+    main()
+        val a: &Counter = Counter(1)
+
+        kept = Some(a)
+        keep(counter(2))
+        print(count(3, Counter(3)))
+
+        val quiet: &Counter = Counter(4)
+
+        print(quiet.n, kept.unwrap().n)
+        kept = None
+    """
+
+@test("the page's example: a store into module storage, a factory call handed to a keeper, a recursion")
+xeb_the_pages_example()
+    xeb_says(xeb_explained(xeb_page), [
+        "no arrays were promoted to the heap",
+        s"main.sysl:14:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 16",
+        s"main.sysl:17:10: what 'counter' answers $xeb_heap it is handed to 'keep' on line 17, which keeps " +
+            "its parameter 'c' (it is stored in 'kept' on line 9)",
+        s"main.sysl:18:20: a 'Counter' $xeb_heap it is handed to 'count' on line 18, which keeps its " +
+            "parameter 'c' (it is handed to 'count' on line 11, a recursion whose answer is still being " +
+            "worked out)"])
+
+@test("a build that does not ask says nothing of its boxes")
+xeb_unasked_says_nothing()
+    val got = xeb_said("emit-llvm", [("main.sysl", xeb_page)], false)
+
+    assert_eq(got.len(), 0)
+
+@test("a program whose every box is laid in its frame says only that no array moved")
+xeb_framed_boxes_say_nothing()
+    xeb_says(xeb_explained(raw"""
+        struct Counter
+            n: int
+
+        counter(n: int) -> &Counter = Counter(n)
+
+        read(c: &Counter) -> int = c.n
+
+        main()
+            val a: &Counter = Counter(1)
+            val b = counter(2)
+
+            print(read(a) + b.n)
+        """), ["no arrays were promoted to the heap"])
+
+// -- the ways out ---------------------------------------------------------------------------------
+
+private const xeb_ways: string = raw"""
+    struct Counter
+        n: int
+
+    struct Holder
+        c: Option[&Counter]
+
+    struct Big
+        xs: [200]int
+
+    struct Guard
+        c: &Counter
+
+    impl Drop for Guard
+        drop(self) = print("dropped", self.c.n)
+
+    trait Reader
+        read(self, c: &Counter) -> int
+
+    struct Keeper
+        k: int
+
+    impl Reader for Keeper
+        read(self, c: &Counter) -> int
+            kept = Some(c)
+            c.n + self.k
+
+    struct Pair[T]
+        a: T
+
+    var kept: Option[&Counter] = None
+    var held: Option[&Holder] = None
+
+    counter(start: int) -> &Counter = Counter(start)
+
+    returned(n: int) -> &Counter
+        val c: &Counter = Counter(n)
+
+        kept = Some(c)
+        c
+
+    keep(c: &Counter)
+        kept = Some(c)
+
+    rec(n: int, c: &Counter) -> int = if n == 0 then c.n else rec(n - 1, c)
+
+    leak_closure(n: int) -> &Fn() -> int
+        val c: &Counter = Counter(n)
+
+        () -> c.n
+
+    boxed_pair[T](a: T) -> int
+        val p: &Pair[T] = Pair(a)
+
+        held = None
+        kept = None
+        1
+
+    main()
+        val a: &Counter = Counter(1)
+
+        kept = Some(a)
+
+        val h: &Holder = Holder(None)
+        val b: &Counter = Counter(2)
+
+        h.c = Some(b)
+        held = Some(h)
+
+        keep(counter(3))
+        print(rec(3, Counter(4)))
+        print(leak_closure(5)())
+        print(returned(6).n)
+
+        var last: Option[&Counter] = None
+
+        for i in 0..<3
+            val t: &Counter = Counter(i)
+
+            last = Some(t)
+
+        val big: &Big = Big([0; 200])
+
+        print(big.xs[0])
+
+        val r: &Reader = Keeper(1)
+
+        print(r.read(Counter(7)))
+
+        val g: &Guard = Guard(Counter(8))
+
+        print(g.c.n, boxed_pair(1), boxed_pair(true))
+
+        val quiet: &Counter = Counter(9)
+
+        print(quiet.n, last.is_some())
+    """
+
+@test("each way out is named where the box is built, and a box laid in its frame says nothing")
+xeb_each_way_out()
+    xeb_says(xeb_explained(xeb_ways), [
+        "main.sysl:49:5: a closure erased to '&Fn() -> int' is boxed on the heap, because it is returned " +
+            "from 'leak_closure' on line 49",
+        s"main.sysl:36:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 38",
+        s"main.sysl:47:23: a 'Counter' $xeb_heap it is captured by the closure on line 49",
+        s"main.sysl:59:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 61",
+        s"main.sysl:63:22: a 'Holder' $xeb_heap it is stored in 'held' on line 67",
+        s"main.sysl:64:23: a 'Counter' $xeb_heap it is stored in 'h.c' on line 66",
+        s"main.sysl:69:10: what 'counter' answers $xeb_heap it is handed to 'keep' on line 69, which keeps " +
+            "its parameter 'c' (it is stored in 'kept' on line 42)",
+        s"main.sysl:70:18: a 'Counter' $xeb_heap it is handed to 'rec' on line 70, which keeps its " +
+            "parameter 'c' (it is handed to 'rec' on line 44, a recursion whose answer is still being " +
+            "worked out)",
+        s"main.sysl:77:27: a 'Counter' $xeb_heap it is kept in 'last', which outlives the turn of the loop " +
+            "that builds it",
+        s"main.sysl:87:18: a 'Counter' $xeb_heap it is handed to 'read' on line 87, which keeps its " +
+            "parameter 'c' (it is stored in 'kept' on line 24)",
+        s"main.sysl:89:27: a 'Counter' $xeb_heap it is built into a 'Guard' on line 89, which has a destructor"])
+
+private const xeb_more_ways: string = raw"""
+    struct Counter
+        n: int
+
+    struct Big
+        xs: [200]int
+
+    trait Reader
+        read(self) -> int
+
+    struct Sum
+        k: int
+
+    impl Reader for Sum
+        read(self) -> int = self.k
+
+    var readers: Option[&Reader] = None
+
+    wrapped(n: int) -> Option[&Counter]
+        val c: &Counter = Counter(n)
+
+        Some(c)
+
+    found(n: int) -> Option[&Counter]
+        for i in 0..<n
+            val c: &Counter = Counter(i)
+
+            if i == 2 then break Some(c)
+        else
+            None
+
+    weak_of(n: int) -> int
+        val c: &Counter = Counter(n)
+        val w: weak Counter = c
+
+        c.n
+
+    async later(n: int) -> int
+        val c: &Counter = Counter(n)
+
+        c.n
+
+    main()
+        val big: &Big = Big([0; 200])
+
+        big.xs[1] = 3
+        print(big.xs[1])
+
+        val r: &Reader = Sum(4)
+
+        readers = Some(r)
+        print(wrapped(1).unwrap().n, found(5).unwrap().n, weak_of(2), block_on(later(3)))
+    """
+
+@test("a non-factory's answer, 'break', a weakening, an 'async' body and a stored trait object")
+xeb_more_ways_out()
+    xeb_says(xeb_explained(xeb_more_ways), [
+        "no arrays were promoted to the heap",
+        s"main.sysl:19:23: a 'Counter' $xeb_heap it is returned from 'wrapped' on line 21",
+        s"main.sysl:25:27: a 'Counter' $xeb_heap it is carried out of a loop by 'break' on line 27",
+        s"main.sysl:32:23: a 'Counter' $xeb_heap it is weakened on line 33",
+        s"main.sysl:38:23: a 'Counter' $xeb_heap it is built in the 'async' body of 'later', whose frame " +
+            "keeps no box across an 'await'",
+        s"main.sysl:48:22: a 'Sum' $xeb_heap it is stored in 'readers' on line 50"])
+
+private const xeb_unlaid: string = raw"""
+    struct Counter
+        n: int
+
+    struct Holder
+        c: Option[&Counter]
+
+    struct Big
+        xs: [300]int
+
+    struct Wide
+        xs: [64]int
+
+    var held: Option[&Holder] = None
+
+    from_wide(w: Wide) -> &Counter = Counter(w.xs[0])
+
+    count_down(n: int) -> int
+        val c: &Counter = Counter(n)
+
+        if n == 0 then return c.n
+
+        become count_down(n - 1)
+
+    pair[T](a: T, keep: bool) -> int
+        val h: &Holder = Holder(None)
+
+        if keep then held = Some(h)
+
+        1
+
+    main()
+        val big: &Big = Big([0; 300])
+
+        big.xs[1] = 3
+
+        val h: &Holder = Holder(None)
+        val b: &Counter = Counter(2)
+
+        h.c = Some(b)
+
+        var w: Wide = Wide([0; 64])
+
+        w.xs[0] = 5
+
+        val c = from_wide(w)
+
+        print(big.xs[1], h.c.unwrap().n, c.n, count_down(3), pair(1, true), pair("x", false))
+    """
+
+@test("a payload over the limit, a factory with no frame entry, a field through a reference, a generic once")
+xeb_payloads_and_entries()
+    xeb_says(xeb_explained(xeb_unlaid), [
+        "no arrays were promoted to the heap",
+        s"main.sysl:25:22: a 'Holder' $xeb_heap it is stored in 'held' on line 27",
+        s"main.sysl:32:21: a 'Big' $xeb_heap its payload is 1200 bytes, more than the 1024 a frame holds",
+        s"main.sysl:37:23: a 'Counter' $xeb_heap it is stored in 'h.c' on line 39",
+        s"main.sysl:45:13: what 'from_wide' answers $xeb_heap 'from_wide' has no frame entry, since its " +
+            "parameter 'w' is lent by address"])
+
+// -- the commands and the files ---------------------------------------------------------------------
+
+private const xeb_tested: string = raw"""
+    struct Counter
+        n: int
+
+    struct Holder
+        c: Option[&Counter]
+
+    @test
+    holds()
+        val h: &Holder = Holder(None)
+        val c: &Counter = Counter(1)
+
+        h.c = Some(c)
+        assert(h.c.is_some(), "kept")
+    """
+
+@test("'sysl test' says the lines of the bodies it lowers")
+xeb_under_test()
+    xeb_says(xeb_said("test", [("main.sysl", xeb_tested)], true), [
+        "no arrays were promoted to the heap",
+        s"main.sysl:10:23: a 'Counter' $xeb_heap it is stored in 'h.c' on line 12"])
+
+private const xeb_exported: string = raw"""
+    struct Counter
+        n: int
+
+    var kept: Option[&Counter] = None
+
+    @export("xeb_keep")
+    keep_one(n: int) -> int
+        val c: &Counter = Counter(n)
+
+        kept = Some(c)
+        n
+    """
+
+@test("'sysl build-c' says them for the archive it lowers")
+xeb_under_build_c()
+    xeb_says(xeb_said("build-c", [("main.sysl", xeb_exported)], true), [
+        "no arrays were promoted to the heap",
+        s"main.sysl:8:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 10"])
+
+@test("a program of two files says each file's lines, file by file, in the order written")
+xeb_two_files()
+    val first = raw"""
+        struct Counter
+            n: int
+
+        main()
+            val a: &Counter = Counter(1)
+
+            stash(a)
+            print(last().n)
+        """
+    val other = raw"""
+        var kept: Option[&Counter] = None
+
+        stash(c: &Counter)
+            kept = Some(c)
+
+        last() -> &Counter
+            val b: &Counter = Counter(2)
+
+            kept = Some(b)
+            b
+        """
+
+    xeb_says(xeb_said("emit-llvm", [("main.sysl", first), ("other.sysl", other)], true), [
+        "no arrays were promoted to the heap",
+        s"main.sysl:5:23: a 'Counter' $xeb_heap it is handed to 'stash' on line 7, which keeps its parameter " +
+            "'c' (it is stored in 'kept' on line 4)",
+        s"other.sysl:7:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 9"])

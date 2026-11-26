@@ -805,6 +805,7 @@ emit_llvm_text(path: string, named_target: Option[string],
     // **And one that links is an executable, which keeps its own functions to itself**
     // (`seal_linkage.sysl`); the text `emit-llvm` prints keeps every linkage as written.
     take_local_notes()
+    take_box_notes()
 
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
@@ -813,6 +814,7 @@ emit_llvm_text(path: string, named_target: Option[string],
 
     phase_done("codegen")
     explain_local_notes(program, done.an)
+    explain_box_notes(program, done.an)
 
     // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
     // hook**, where nothing writes it a default (`check_aligned_heap`).
@@ -993,6 +995,22 @@ private explain_local_notes(program: Compilation, an: &Analysis)
 
     if !explaining_borrows() || !errors_of(an.diagnostics()).is_empty() then return
 
+    explain_borrow_lines(own_notes_in_order(program, notes))
+end explain_local_notes
+
+// What `--explain-escapes` reports about the boxes of the program's own files, once they are laid out
+// (`stack_box.sysl`): each one on the heap and the first way out that put it there, in the order
+// written, after the arrays and closures.
+private explain_box_notes(program: Compilation, an: &Analysis)
+    val notes = take_box_notes()
+
+    if !explaining_escapes() || !errors_of(an.diagnostics()).is_empty() then return
+
+    explain_escape_lines(own_notes_in_order(program, notes))
+end explain_box_notes
+
+// The lines of `notes` about the program's own files, by file and then by where each is written.
+private own_notes_in_order(program: Compilation, notes: Buf[LocalNote]) -> Buf[string]
     val files = own_files(program)
     var kept: Buf[LocalNote] = buf()
 
@@ -1013,8 +1031,8 @@ private explain_local_notes(program: Compilation, an: &Analysis)
     for item in kept
         lines.push(item.text)
 
-    explain_borrow_lines(lines)
-end explain_local_notes
+    lines
+end own_notes_in_order
 
 // The machine a command line asked for: the one it named, the manifest's default, or this host --
 // with the floor the manifest states checked before anything is read.
@@ -2073,8 +2091,11 @@ private lower_for_c(path: string, t: Target, level: Option[string] = None) -> Re
 
     if bare_metal_possible(root) then check_bare_metal_storage(done.an, strip_tests(whole), program.own, root, true)
 
+    take_box_notes()
+
     val lowered = codegen_with_gaps(kept, t, promotions)
 
+    explain_box_notes(program, done.an)
     check_aligned_heap(done.an, kept)
     if level.is_some() then check_stack_bounds(done.an, kept, t, level.unwrap(), promotions, None)
 
@@ -2552,6 +2573,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
         Ok(None) -> ()
 
     phase_done("std")
+    take_box_notes()
 
     val lowered = codegen_with_gaps(ready.kept with { precompiled = joined_names(precompiled,
                                                                                  roots.precompiled) },
@@ -2560,6 +2582,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 
     phase_done("codegen")
     explain_local_notes(program, ready.an)
+    explain_box_notes(program, ready.an)
 
     check_aligned_heap(ready.an, ready.kept)
 

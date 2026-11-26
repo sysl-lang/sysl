@@ -1421,7 +1421,7 @@ grammars.
 | `--error-limit <n>` | how many [errors a failed compilation shows](#how-many-errors-are-shown); defaults to 20, and `0` shows every one |
 | `-p <member>`, `--package <member>` | in a [workspace](/reference/packages/#workspaces), the member to build, test or run |
 | `-v`, `--verbose` | report what the build decided: the files read, the standard module and how it was reached, the search paths, the allocator, and the clang and linker command lines |
-| `--explain-escapes` | report every local array promoted to the heap |
+| `--explain-escapes` | report every local array promoted to the heap, and every `&T` box on the heap and why |
 | `--explain-drop-order` | report every local declared below a `defer` in its block, whose release the 0.8.0 drop order moves ahead of that `defer` |
 | `--explain-borrows` | report, for every function, whether its answer is a place of a parameter, +0 from one, or why not |
 
@@ -1691,6 +1691,15 @@ tty.sysl:31:12: 'buf' is promoted to the heap, because this view of it is return
 The position given is the **view**, not the declaration, because the view is the part that is hard
 to find by reading. When nothing was promoted, the flag says so explicitly, so you know it took
 effect. [Memory](/reference/memory/) explains what promotion is and when it happens.
+
+After those lines comes one for each `&T` box, and each call of a factory, that is
+[built on the heap rather than in its frame](/reference/memory/#a-box-nothing-keeps-is-laid-in-the-frame),
+at the construction or the call, with the first way out that put it there:
+
+```
+$ sysl build --explain-escapes main.sysl
+main.sysl:12:23: a 'Counter' is boxed on the heap, because it is stored in 'kept' on line 14
+```
 
 ### `--explain-drop-order`
 
