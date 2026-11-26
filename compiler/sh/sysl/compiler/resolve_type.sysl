@@ -2714,7 +2714,14 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
                 "and takes no type arguments")
         return Unknown
 
-    val already = a.tables.constrained_insts.get(key)
+    // **A name that only names is its base everywhere but in a header** (`reference/ffi.md § Naming a
+    // type in the header`, `§ c type`): an exported alias and a measured `c type` check nothing and
+    // flow to and from their base with no conversion, so every analysis is handed the base itself and
+    // none has to see through a name. The header's reading (`header_spelling.sysl`) keeps the name,
+    // filed apart so the two readings never meet.
+    val spelled = a.header_spelling && names_in_header(d)
+    val slot = if spelled then s"$key\u{1}header" else key
+    val already = a.tables.constrained_insts.get(slot)
 
     if already.is_some() then return already.unwrap()
 
@@ -2724,12 +2731,12 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
     // that struct's own fields may name the alias again (`idles: Slots[Callback]`) -- refused there,
     // the field would keep `Unknown` for good. The second reading finds the struct already in
     // progress and finishes; only a chain that comes round a third time is one that would not end.
-    a.tables.broken.get(key) match
+    a.tables.broken.get(slot) match
         Some(first) ->
             if !first then return Unknown
 
-            a.tables.broken.put(key, false)
-        None -> a.tables.broken.put(key, true)
+            a.tables.broken.put(slot, false)
+        None -> a.tables.broken.put(slot, true)
 
     val base = resolve_type(a, home, d.base, no_bindings())
 
@@ -2804,15 +2811,15 @@ instantiate_named_subtype(a: &Analysis, scope: Scope, span: Span, written: strin
         Some(e) -> Some(e.symbol.unwrap_or(module_bare(spelled_key(key))))
         None -> None
 
-    if !is_plain_alias(d) then
+    if !is_plain_alias(d) && (spelled || !names_in_header(d)) then
         made = constrained_exported(key, base, d.derived, lo, hi, exclusive, pred, cname,
                                     d.wrapping.is_some(), d.c_spelling)
 
-    a.tables.constrained_insts.put(key, made)
+    a.tables.constrained_insts.put(slot, made)
 
     // **The mark comes off with the answer in place**, so a reading after a trial that rewound
     // `constrained_insts` (and not `broken`) starts afresh rather than finding a stale mark.
-    a.tables.broken.remove(key)
+    a.tables.broken.remove(slot)
     made
 end instantiate_named_subtype
 
@@ -3370,6 +3377,21 @@ is_plain_alias(d: TypeDecl) -> bool =
 is_phantom_new(d: TypeDecl) -> bool =
     d.derived && d.range.is_none() && d.pred.is_none() && !d.from_c && d.cname.is_none() &&
         d.wrapping.is_none()
+
+// Whether a declaration is a second name its base answers to everywhere but in a generated header: an
+// exported alias, which the header declares as a `typedef`. It checks nothing and is told apart from
+// its base by nothing.
+//
+// **A measured `c type` is not one**, though it is built the same way: a value of another integer
+// type reaches it only through a written conversion (`Size(xs.len)`, `reference/ffi.md § c type`),
+// since the width is the target's and an implicit widening into it would be one machine's answer.
+names_in_header(d: TypeDecl) -> bool =
+    !d.derived && d.range.is_none() && d.pred.is_none() && d.wrapping.is_none() && !d.from_c &&
+        d.cname.is_some()
+
+// Whether a name is its base to the analysis: a plain alias, or an exported one, whose name only a
+// generated header reads.
+transparent_alias(d: TypeDecl) -> bool = is_plain_alias(d) || names_in_header(d)
 
 // Whether a declaration is an alias a C header is asked to declare as a `typedef`.
 private is_exported_alias(d: TypeDecl) -> bool =
