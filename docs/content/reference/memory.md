@@ -864,6 +864,55 @@ run(c: bool)
 'store' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
 ```
 
+**A local holding a copy of the parameter is followed along the same ways.** Written over with
+something else on every way to where it is stored or its address handed over, it no longer holds the
+parameter there; written over on only some — an `if` without an `else`, a loop body that may not run,
+one `match` arm, a `break` or `continue` past the store — it still does. Only a store of the whole
+local counts as writing it over: a store through a pointer to it, or in a closure's body, does not;
+and the parameter stored back into it, by the body or by a callee handed its address, makes it a copy
+again:
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+note(p: *int)
+    var q = p
+    print(*q)
+    q = &spare
+    held = q
+
+run()
+    var n = 41
+    note(&n)
+
+run()
+print(*held)
+```
+
+```output
+41
+0
+```
+
+```sysl
+static var spare = 0
+static var held: *int = &spare
+
+note(p: *int)
+    var q = p
+    if *p > 50 then q = &spare
+    held = q
+
+run()
+    var n = 41
+    note(&n)
+```
+
+```error
+'note' keeps its parameter 'p' (it is stored in 'held'), and '&n' is the address of a local of 'run'
+```
+
 ### Handing it back is not keeping it
 
 **An answer made of arguments is lent for as long as those arguments live in the caller.**
@@ -1396,7 +1445,10 @@ a buffer, another box), returned other than as a factory's answer, captured by a
 parameter whose body may let it out or answer it into something that does, weakened, given up with
 `into_raw`, carried out of a loop by `break`, or held by a local that outlives the loop turn that
 built it. A view of an array inside a box owns the box, so a view that gets out keeps its box on the
-heap. **A call through a trait object or a callable is a call of every body its table may hold** — in
+heap. **Each capture of a closure is a holder of its own**: a closure handed to a parameter of its own
+type that captures the box beside something else, and keeps only that something else
+(`each(xs, x -> pool.append(node))` keeps `node`, not `pool`), leaves the box in the frame; one that
+stores the box through another capture, or hands it to a call that keeps it, does not. **A call through a trait object or a callable is a call of every body its table may hold** — in
 a program, which sees every table there is, each method or closure of that trait at the receiver's own
 arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
 C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
