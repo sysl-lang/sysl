@@ -806,11 +806,16 @@ emit_llvm_text(path: string, named_target: Option[string],
     // (`seal_linkage.sysl`); the text `emit-llvm` prints keeps every linkage as written.
     take_local_notes()
 
+    // **`--explain-checks` records this lowering and no other** (`explain_checks.sysl`): the
+    // artifact above and the `@stack` text were lowered before it is armed.
+    arm_check_ledger(explaining_checks())
+
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level), None, watched,
                                     if linking then program.own else buf(), compact)
 
+    disarm_check_ledger()
     phase_done("codegen")
     explain_local_notes(program, done.an)
 
@@ -831,6 +836,13 @@ emit_llvm_text(path: string, named_target: Option[string],
     val report = errors_of(done.an.diagnostics())
 
     say_warnings(report, done.an)
+
+    // **And `--explain-checks` says which of the program's checks survive the optimizer**, at the
+    // level this build optimizes at, of the text it builds.
+    if explaining_checks() && report.is_empty()
+        for line in explain_checks_report(text, t, level, own_files(program))
+            say_note(line)
+    end if
 
     Ok(Emitted(text, report, lowered.1, link_required(program.units),
                roots.archives, entries_of(kept, image_entry_named(root, t)), stack_assumptions(kept.funcs)))
@@ -2359,6 +2371,9 @@ run_cache_key_for(command: string, path: string, named_target: Option[string], l
     // for it has no entry to replay.
     if explaining_drops() then return None
 
+    // Nor the report of the checks that survive, whose lowering lays a record down for each.
+    if explaining_checks() then return None
+
     // Nor was the report of every frame, which is read off the compile.
     if stack_usage_flag().is_some() then return None
 
@@ -2371,7 +2386,7 @@ end run_cache_key_for
 // narrowed test build looks for its own entry and then for the whole tree's (`test_project`).
 run_cache_keys_for(command: string, other: string, path: string, named_target: Option[string],
                    level: string, cc: Option[string]) -> (Option[string], Option[string])
-    if explaining_drops() then return (None, None)
+    if explaining_drops() || explaining_checks() then return (None, None)
 
     val t = target_for(path, named_target) match
         Ok(found) -> found
