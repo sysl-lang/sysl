@@ -906,6 +906,25 @@ false true 1
 false no such file or directory
 ```
 
+**A path holding a zero byte is refused, with `Other(22)` (`EINVAL`), by every call that takes one** —
+before C is asked, because C reads a path up to its first zero and the call would act on a different
+file than the one named (`open("a\0b")` would open `a`). Only the bytes of the path count, so a slice
+that ends before a zero is a fine path. `exists`, `is_file` and `is_dir` answer `false` for it.
+
+```sysl
+import sysl.fs.{metadata, exists}
+
+val p = "/tmp\0zzz"
+
+print(metadata(p).unwrap_err())
+print(exists(p), exists(p[0..<4]))
+```
+
+```output
+Invalid argument
+false true
+```
+
 **`exists` answers `false` for a path that exists under a directory the program may not search**,
 which is the one way it differs from the question it looks like it is asking. That case cannot be told
 from absence without a second call whose answer would already be stale — and every caller that
@@ -1079,10 +1098,11 @@ false true
 **`Meta.owner` and `Meta.group` are `u32`s, the type [`sysl.process.user()`](/library/process/#who-the-program-is)
 answers**, so "is this file mine" is one comparison with nothing converted on either side.
 `set_owner(path, owner, group)` is the writing half, beside `set_permissions` and over one `chown`:
-it sets both, so a program changing only one passes the other as `metadata` read it.
+it sets both, and a program changing only one passes `unchanged` for the other, the `4294967295` that
+`chown(2)` reads as "leave this id as it is".
 
 ```sysl
-import sysl.fs.{write_text, metadata, set_owner, remove_file}
+import sysl.fs.{write_text, metadata, set_owner, remove_file, unchanged}
 import sysl.process.{pid, user}
 
 val path = s"/tmp/sysl-fs-doc-owner-${pid()}.txt"
@@ -1096,10 +1116,18 @@ print(m.owner == user())
 set_owner(path, m.owner, m.group).unwrap()
 print(metadata(path).unwrap().owner == m.owner)
 
+set_owner(path, unchanged, m.group).unwrap()
+print(metadata(path).unwrap().owner == m.owner)
+
+set_owner(path, unchanged, unchanged).unwrap()
+print(unchanged == 4294967295)
+
 remove_file(path).unwrap()
 ```
 
 ```output
+true
+true
 true
 true
 ```

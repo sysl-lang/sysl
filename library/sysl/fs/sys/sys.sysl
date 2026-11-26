@@ -376,6 +376,47 @@ private[fs] extern "sysl_fs_stat_beneath" stat_beneath(dir: int, path: *u8, len:
 @needs(os)
 private[fs] extern "sysl_fs_unlink_beneath" unlink_beneath(dir: int, path: *u8, len: usize) -> int
 
+// -- watching for changes ----------------------------------------------------------------------------
+//
+// What `sysl.fs.watch` is written over: a watcher is the kernel's descriptor -- readable while there
+// is something to read -- and a `handle` the supplier keeps its own state behind, handed back to every
+// other call. A watch is a number the supplier chose, zero or more.
+//
+// **What `watch_read` writes is a run of records**, each a 16-byte head and then its paths' bytes with
+// no terminator: the change as one byte (1 created, 2 removed, 3 modified, 4 renamed, 5 attributes, 6
+// overflow), one byte that is 1 where a second path follows, two zero bytes, the watch's number, and
+// the lengths of the first and the second path -- each of the three a 32-bit little-endian number. A
+// record is written whole or not at all.
+
+/** Makes a watcher watching nothing, answering the descriptor to wait on and writing what the other
+ * calls are handed to `handle`.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_open" watch_open(handle: *usize) -> int
+
+/** Starts watching the file or directory at `path`, answering the watch's number. A path this watcher
+ * already watches -- under that name or another -- answers the watch it has.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_add" watch_add(handle: usize, path: *u8, len: usize) -> int
+
+/** Stops the watch `id`: no event for it is read afterwards. One that is not watched -- never was, was
+ * removed, or ended as what it watched went -- is `ENOENT`.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_remove" watch_remove(handle: usize, id: int) -> int
+
+/** Writes at most `room` bytes of records at `into` without waiting, answering how many bytes, and
+ * writing to `more` one where records are still held for the next call -- zero where it gave them
+ * all. Where not even the first fits it answers the code of `ERANGE`, negated.
+ */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_read" watch_read(handle: usize, into: *u8, room: usize, more: *i32) -> isize
+
+/** Closes the watcher's descriptor and lets go of everything behind `handle`. */
+@needs(os)
+private[sysl] extern "sysl_fs_watch_close" watch_close(handle: usize) -> int
+
 // -- words -------------------------------------------------------------------------------------------
 
 /** The supplier's words for the error number `code`, as UTF-8 copied into `into`, with their length
