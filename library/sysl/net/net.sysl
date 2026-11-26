@@ -2,11 +2,12 @@ module sysl.net
 @requires(os)
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{IoError, again, from_status}
+import sysl.fs.{File, IoError, again, from_status}
 import sysl.net.sys as nsys
 import sysl.net.sys.Endpoint
 import sysl.slices.{as_mut_ptr, as_ptr}
 import sysl.sync.Atomic
+import sysl.sys.UNSUPPORTED
 
 /** Sockets -- a TCP stream, a UDP socket, a Unix domain stream -- and the names a host resolves to.
  *
@@ -348,6 +349,42 @@ struct Socket
         moved(nsys.send_vectored(int(self.inner.fd.load()), as_ptr(pieces.view()), pieces.len()))
     end send_vectored
 
+    /** Send up to `count` bytes of `file`, starting `offset` bytes in, and say how many went -- the
+     * bytes go from the file to the socket in the kernel (`sendfile`), never through the program.
+     *
+     * **It answers as `send` does**: a short count is not an error, and the caller comes back from
+     * `offset` plus the count for the rest. The end of the file is the end of what it sends, so a
+     * `count` past it answers what was there and an `offset` at or past it answers zero. A
+     * non-blocking socket with no room answers an error `would_block` recognises; a peer that has
+     * gone answers one `peer_closed` recognises, and never raises `SIGPIPE`.
+     *
+     * **The file's position does not move**, so it mixes with `read` and `write` as `read_at` does,
+     * and what the file still buffers for writing is handed over first, so every byte the program has
+     * written is sent. A file not opened for reading answers `NotOpen`, and a closed one `NotOpen`
+     * too. A `count` of zero answers zero without asking the system, and an `offset` past what a
+     * `long` can hold is refused with `EINVAL`.
+     *
+     * **Where the system has no such call, the library reads and sends instead** -- a target whose
+     * supplier answers `UNSUPPORTED`, or a file the kernel will not send from (not a regular file):
+     * the file is read at the offset 64 KB at a time and each piece sent, until the count, the end
+     * of the file or a short send. The answer means the same either way.
+     */
+    @blocks
+    send_file(self, file: File, offset: u64, count: usize) -> Result[usize, IoError]
+        var f = file
+
+        f.flush()?
+
+        val from = f.fd()?
+
+        if count == 0 then return Ok(0)
+        if offset > u64(i64::Max) then return Err(failure(-22))
+
+        val n = nsys.send_file(int(self.inner.fd.load()), from, i64(offset), count)
+
+        if n != isize(UNSUPPORTED) then moved(n) else read_and_sent(self, f, offset, count)
+    end send_file
+
     /** Send small writes at once (`TCP_NODELAY`) rather than waiting to coalesce them -- what a
      * request/response protocol wants. A socket that is not TCP answers the system's refusal.
      */
@@ -579,6 +616,36 @@ private timed_out_code() -> int = 60
 #else
 private timed_out_code() -> int = 110
 #endif
+
+/** `send_file` where the system cannot send from a file: `count` bytes of `file` from `offset`, read a
+ * piece at a time and sent, until the count, the end of the file, or a send that took less than it
+ * was given. A failure after some bytes went answers those bytes, as a short send does; the next call
+ * meets the failure again and reports it.
+ */
+private read_and_sent(s: Socket, file: File, offset: u64, count: usize) -> Result[usize, IoError]
+    var f = file
+    var piece: []u8 = [0; 65536]
+    var done: usize = 0
+
+    while done < count
+        val want = if count - done < piece.len then count - done else piece.len
+        val got = f.read_at(offset + u64(done), piece[0..<want]) match
+            Ok(b) -> b
+            Err(e) -> return if done > 0 then Ok(done) else Err(e)
+
+        if got.len == 0 then break
+
+        val sent = s.send(got) match
+            Ok(k) -> k
+            Err(e) -> return if done > 0 then Ok(done) else Err(e)
+
+        done += sent
+
+        if sent < got.len then break
+    end while
+
+    Ok(done)
+end read_and_sent
 
 private local_of(fd: i32) -> Result[Address, IoError]
     var at = unspecified()

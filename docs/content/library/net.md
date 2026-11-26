@@ -391,6 +391,82 @@ print(accepted.recv(into).unwrap())
 3
 ```
 
+## From a file: `send_file`
+
+`send_file(file, offset, count)` sends up to `count` bytes of a `sysl.fs.File`, starting `offset`
+bytes in, and the bytes go from the file to the socket inside the kernel (`sendfile`) without
+passing through the program. That is the call a static file server is made of: open the file, send
+the header with `send`, then send the body from the file.
+
+It answers the number of bytes that went, and **it answers as `send` does**: a short count is not an
+error, so the caller comes back from `offset` plus the count for the rest. A non-blocking socket with
+no room answers an error `would_block` recognises, and a peer that has gone answers one
+`peer_closed` recognises without raising `SIGPIPE`. **The end of the file is the end of what it
+sends**: a `count` past it answers what was there, and an `offset` at or past it answers zero. A
+`count` of zero answers zero without asking the system.
+
+```sysl
+import sysl.fs.{create, make_temp_dir, open, remove_dir_all}
+import sysl.net.{resolve, socket}
+import sysl.path.join
+import sysl.text.from_utf8
+
+val dir = make_temp_dir("send-file-").unwrap()
+var w = create(join(dir, "page.html")).unwrap()
+
+w.write("<p>hello</p>".bytes)
+w.close().unwrap()
+
+val here = resolve("127.0.0.1", 0).unwrap()[0]
+val server = socket(here).unwrap()
+
+server.bind(here).unwrap()
+server.listen().unwrap()
+
+val client = socket(server.local().unwrap()).unwrap()
+
+client.connect(server.local().unwrap()).unwrap()
+
+val (accepted, _) = server.accept().unwrap()
+val page = open(join(dir, "page.html")).unwrap()
+
+// Five bytes from the fourth, then everything past the end there is.
+print(accepted.send_file(page, 3, 5).unwrap(), accepted.send_file(page, 8, 100).unwrap())
+
+var into: []u8 = [0; 16]
+var got: usize = 0
+
+while got < 9
+    got += client.recv(into[got..<16]).unwrap()
+
+print(from_utf8(into[0..<got]).unwrap())
+remove_dir_all(dir).unwrap()
+```
+
+```output
+5 4
+hello</p>
+```
+
+**The file's position does not move**, so `send_file` mixes with `read` and `write` as `read_at`
+does, and what the file still buffers for writing is handed over first, so every byte the program
+has written is sent. A file not opened for reading answers `NotOpen`, as a closed one does; an
+`offset` past what a `long` holds is refused with `EINVAL` (22). An offset past 4 GiB is an
+ordinary one — the offset is a `u64` and the count a `usize`, so a file of any size is sent.
+
+**Where there is no `sendfile`, the library reads and sends instead.** A target whose supplier
+answers `sysl.sys.UNSUPPORTED` for `sysl_net_send_file`, and a file the kernel will not send from (a
+pipe, or a filesystem with no page-cache path), go through a loop that reads the file 64 KB at a
+time with `read_at` and sends each piece, stopping at the count, the end of the file or a short
+send. Its answers mean the same; only the copy through the program is extra. A pipe, which has no
+offsets, is refused there as `pread` refuses it (`ESPIPE`, 29).
+
+On Darwin it is `sendfile(file, socket, offset, &len, NULL, 0)`, which takes a TCP or a Unix stream;
+it reports a peer that has gone as `ENOTCONN`, and the answer here is `EPIPE`, as `send`'s is. Under
+Linux it is `sendfile(socket, file, &offset, count)`, which sends at most 2 GiB less 4 KB per call
+(a short count, as any other), and which can raise `SIGPIPE`: it is blocked in the calling thread
+for the call and one it raised is taken back, so the process's disposition is untouched here too.
+
 ## Options: `set_no_delay`, `set_reuse_port`, keepalive
 
 Each is a setter that takes `on = true` and a getter of the same name that reads it back from the
@@ -554,7 +630,7 @@ carry a length byte glibc's do not — stay in that answer's C, where the header
 
 ## Answering the network on a target with no C library
 
-**Everything above reaches the network through `sysl.net.sys` and through nothing else**: sixteen
+**Everything above reaches the network through `sysl.net.sys` and through nothing else**: nineteen
 hooks, each an `extern` no module of the library defines.
 
 | hook | what it answers |
@@ -570,6 +646,7 @@ hooks, each an `extern` no module of the library defines.
 | `sysl_net_shutdown(fd, how) -> int`, `sysl_net_close(fd) -> int` | zero |
 | `sysl_net_option(fd, which, value) -> int` | zero; `read_timeout`, `write_timeout` (milliseconds), `reuse_address`, `non_blocking`, `send_buffer` or `recv_buffer` (bytes, positive), `no_delay`, `reuse_port`, `keepalive` (1 or 0), `keepalive_idle`, `keepalive_interval`, `keepalive_count` (seconds or probes, positive); `send_buffer_size` and `recv_buffer_size`, and each of the six above plus `read_back` (14 to 19), ignore `value` and answer the setting |
 | `sysl_net_send_vectored(fd, pieces, count) -> isize` | a count of bytes; `pieces` is `count` `Piece`s, a base pointer and a length each, laid out as C's `struct iovec` |
+| `sysl_net_send_file(fd, file, offset, count) -> isize` | a count of bytes, at most `count` of the open file `file` from `offset` (never negative; `count` never zero), fewer at its end; `UNSUPPORTED` makes `send_file` read and send instead |
 | `sysl_net_peer_credentials(fd, out) -> int` | zero, a Unix domain peer's user, group and process id (-1 if unknown) written into `out` |
 | `sysl_net_resolve(host, host_len, port, passive, out, room) -> int` | how many addresses it wrote |
 

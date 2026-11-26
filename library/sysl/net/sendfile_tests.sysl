@@ -1,0 +1,381 @@
+module sysl.net
+@requires(posix)
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{File, IoError, NotOpen, create, create_update, make_temp_dir, open, remove_dir_all}
+import sysl.path.join
+import sysl.process.{pid, pipe}
+import sysl.signal.{PIPE, watch}
+import sysl.time.{millis, sleep}
+
+// `Socket.send_file`: bytes from a file to a socket, by the kernel where it can and by a read-and-send
+// loop where it cannot.
+//
+// The axes: where the range sits against the file (all of it, an offset, a count short of the end, a
+// count past it, an offset at and past it, an empty file, a count of zero); the socket (TCP, Unix,
+// blocking, non-blocking and full, a peer that has gone); the file (read-only, read-write with bytes
+// still buffered, write-only, closed, not a regular file); the size (a file over 4 GiB, sparse). The
+// loop the library falls back to on a target with no `sendfile`, and the freestanding cell, are the
+// compiler's `tests_nhk_net_hooks.sysl`: a program there answers the hook itself.
+
+private ignore(r: Result[unit, IoError]) = ()
+
+/** A fresh directory of this test's own. */
+private nsf_dir(name: string) -> string = make_temp_dir(f"sysl-nsf-${pid()}-${name}-").unwrap()
+
+/** A file at `dir/name` holding `bytes`, opened again read-only. */
+private nsf_file(dir: string, name: string, bytes: []const u8) -> File
+    val at = join(dir, name)
+    var w = create(at).unwrap()
+
+    w.write(bytes)
+    w.close().unwrap()
+    open(at).unwrap()
+end nsf_file
+
+/** A TCP listener on the loopback, its client, and the connection it accepted. */
+private nsf_tcp() -> (Socket, Socket, Socket)
+    val addrs = resolve("127.0.0.1", 0).unwrap()
+    var l = socket(addrs[0]).unwrap()
+
+    l.reuse_address().unwrap()
+    l.bind(addrs[0]).unwrap()
+    l.listen().unwrap()
+
+    val at = l.local().unwrap()
+    var c = socket(at).unwrap()
+
+    c.connect(at).unwrap()
+
+    val (a, _) = l.accept().unwrap()
+
+    (l, c, a)
+end nsf_tcp
+
+/** Exactly `n` bytes read from `s`, however many calls that takes. */
+private nsf_take(s: Socket, n: usize) -> []u8
+    var into: []u8 = [0; n]
+    var got: usize = 0
+
+    while got < n
+        val k = s.recv(into[got..<n]).unwrap()
+
+        assert(k > 0, f"the stream ended after $got of $n bytes")
+        got += k
+
+    into
+end nsf_take
+
+/** The text `bytes` hold, for an assertion. */
+private nsf_text(bytes: []const u8) -> string = sysl.text.from_utf8(bytes).unwrap()
+
+private val nsf_alphabet: []const u8 = "abcdefghijklmnopqrstuvwxyz".bytes
+
+// ## Where the range sits
+
+@test("nsf_ the whole file is sent and answers its length")
+nsf_whole_file()
+    val dir = nsf_dir("whole")
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    var (l, c, a) = nsf_tcp()
+
+    assert_eq(a.send_file(f, 0, 26).unwrap(), 26)
+    assert_eq(nsf_text(nsf_take(c, 26)), "abcdefghijklmnopqrstuvwxyz")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_whole_file
+
+@test("nsf_ an offset starts the bytes there, and a count short of the end stops them")
+nsf_offset_and_short_count()
+    val dir = nsf_dir("offset")
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    var (l, c, a) = nsf_tcp()
+
+    assert_eq(a.send_file(f, 20, 100).unwrap(), 6)
+    assert_eq(nsf_text(nsf_take(c, 6)), "uvwxyz")
+    assert_eq(a.send_file(f, 0, 3).unwrap(), 3)
+    assert_eq(nsf_text(nsf_take(c, 3)), "abc")
+    assert_eq(a.send_file(f, 10, 4).unwrap(), 4)
+    assert_eq(nsf_text(nsf_take(c, 4)), "klmn")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_offset_and_short_count
+
+@test("nsf_ a count past the end sends what is there; an offset at or past the end sends nothing")
+nsf_past_the_end()
+    val dir = nsf_dir("past")
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    var (l, c, a) = nsf_tcp()
+
+    assert_eq(a.send_file(f, 24, 1000).unwrap(), 2)
+    assert_eq(a.send_file(f, 26, 10).unwrap(), 0)
+    assert_eq(a.send_file(f, 1000, 10).unwrap(), 0)
+    assert_eq(a.send_file(f, 0, usize::Max).unwrap(), 26)
+    assert_eq(nsf_text(nsf_take(c, 28)), "yzabcdefghijklmnopqrstuvwxyz")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_past_the_end
+
+@test("nsf_ an empty file and a count of zero both answer zero")
+nsf_empty_and_zero()
+    val dir = nsf_dir("empty")
+    val empty: []const u8 = []
+    val e = nsf_file(dir, "e", empty)
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    var (l, c, a) = nsf_tcp()
+
+    assert_eq(a.send_file(e, 0, 10).unwrap(), 0)
+    assert_eq(a.send_file(f, 5, 0).unwrap(), 0)
+    // Nothing went: the next byte on the stream is this one.
+    assert_eq(a.send_file(f, 7, 1).unwrap(), 1)
+    assert_eq(nsf_text(nsf_take(c, 1)), "h")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_empty_and_zero
+
+@test("nsf_ an offset past what a long holds is EINVAL, and the stream is untouched")
+nsf_offset_too_large()
+    val dir = nsf_dir("huge")
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    var (l, c, a) = nsf_tcp()
+
+    assert_eq(a.send_file(f, u64(i64::Max) + 1, 1).unwrap_err().code(), 22)
+    assert_eq(a.send_file(f, u64::Max, 1).unwrap_err().code(), 22)
+    assert_eq(a.send_file(f, u64(i64::Max), 1).unwrap(), 0)
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_offset_too_large
+
+// ## The file
+
+@test("nsf_ the file's position does not move, and its buffered writes are sent")
+nsf_position_and_buffered_writes()
+    val dir = nsf_dir("buffered")
+    var f = create_update(join(dir, "a")).unwrap()
+    var (l, c, a) = nsf_tcp()
+
+    // Written and not flushed: still in the file's own buffer.
+    f.write("hello world".bytes)
+    assert_eq(a.send_file(f, 6, 5).unwrap(), 5)
+    assert_eq(nsf_text(nsf_take(c, 5)), "world")
+    assert_eq(f.tell().unwrap(), 11)
+
+    f.seek(0).unwrap()
+    assert_eq(a.send_file(f, 0, 5).unwrap(), 5)
+    assert_eq(f.tell().unwrap(), 0)
+
+    var into: []u8 = [0; 5]
+
+    assert_eq(nsf_text(f.read(into)), "hello")
+    assert_eq(nsf_text(nsf_take(c, 5)), "hello")
+    f.close().unwrap()
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_position_and_buffered_writes
+
+@test("nsf_ a file not opened for reading, and a closed one, answer NotOpen and send nothing")
+nsf_not_readable()
+    val dir = nsf_dir("unreadable")
+    var w = create(join(dir, "a")).unwrap()
+    var (l, c, a) = nsf_tcp()
+
+    w.write(nsf_alphabet)
+
+    val write_only = a.send_file(w, 0, 26)
+
+    assert(write_only.is_err(), "a write-only file was sent from")
+    assert(write_only.unwrap_err() == NotOpen, "a write-only file was not NotOpen")
+    w.close().unwrap()
+    assert(a.send_file(w, 0, 26).unwrap_err() == NotOpen, "a closed file was not NotOpen")
+
+    // Nothing reached the stream: the next bytes are these.
+    val f = open(join(dir, "a")).unwrap()
+
+    assert_eq(a.send_file(f, 0, 2).unwrap(), 2)
+    assert_eq(nsf_text(nsf_take(c, 2)), "ab")
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_not_readable
+
+@test("nsf_ a file that is not a regular one goes through the read-and-send loop and answers its error")
+nsf_not_a_regular_file()
+    var (r, wr) = pipe().unwrap()
+    var (l, c, a) = nsf_tcp()
+
+    wr.write("piped".bytes)
+    wr.flush().unwrap()
+
+    // A pipe has no offsets, so the loop's positioned read is refused as the platform refuses it.
+    assert_eq(a.send_file(r, 0, 5).unwrap_err().code(), 29)
+    ignore(r.close())
+    ignore(wr.close())
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+end nsf_not_a_regular_file
+
+@test("nsf_ a sparse file over 4 GiB sends from past the 32-bit offsets, with a count past 4 GiB")
+nsf_large_sparse_file()
+    val dir = nsf_dir("large")
+    val at = join(dir, "big")
+    var w = create_update(at).unwrap()
+    val size: u64 = 5 << 30
+
+    w.truncate(long(size)).unwrap()
+    assert_eq(w.write_at(size - 4, "END!".bytes).unwrap(), 4)
+    assert_eq(w.write_at((3 << 30) - 2, "mid".bytes).unwrap(), 3)
+    w.close().unwrap()
+
+    val f = open(at).unwrap()
+    var (l, c, a) = nsf_tcp()
+
+    assert_eq(a.send_file(f, size - 4, 5 << 30).unwrap(), 4)
+    assert_eq(nsf_text(nsf_take(c, 4)), "END!")
+    assert_eq(a.send_file(f, (3 << 30) - 2, 3).unwrap(), 3)
+    assert_eq(nsf_text(nsf_take(c, 3)), "mid")
+    assert_eq(a.send_file(f, size, 10).unwrap(), 0)
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_large_sparse_file
+
+// ## The socket
+
+@test("nsf_ a non-blocking socket under back-pressure sends part, then would_block, then the rest")
+nsf_non_blocking_back_pressure()
+    val dir = nsf_dir("pressure")
+    val total = 16777216
+    var payload: []u8 = [0; 16777216]
+
+    for i in 0..<total
+        payload[i] = u8(i % 251)
+
+    val f = nsf_file(dir, "a", payload)
+    var (l, c, a) = nsf_tcp()
+
+    a.set_send_buffer(65536).unwrap()
+    c.set_recv_buffer(65536).unwrap()
+    a.non_blocking().unwrap()
+
+    // Nobody reads: the first call sends what fits, and a later one finds no room.
+    val first = a.send_file(f, 0, total).unwrap()
+
+    assert(first > 0 && first < total, f"the first send moved $first of $total")
+
+    var full = a.send_file(f, u64(first), total - first)
+    var sent = first
+
+    while full.is_ok() && sent < total
+        sent += full.unwrap()
+        full = a.send_file(f, u64(sent), total - sent)
+
+    assert(sent < total, "the whole file fitted in the buffers: nothing pushed back")
+    assert(would_block(full.unwrap_err()), "a full socket did not answer would_block")
+    assert(!timed_out(full.unwrap_err()), "a full non-blocking socket answered timed_out")
+
+    // Reading and sending in turns, from where each send stopped, moves every byte in order.
+    var got: Buf[u8] = buf()
+    var into: []u8 = [0; 65536]
+    var turns = 0
+
+    while got.len() < total
+        turns += 1
+        assert(turns < 200000, "the transfer did not finish")
+
+        if sent < total
+            a.send_file(f, u64(sent), total - sent) match
+                Ok(n) -> sent += n
+                Err(e) -> assert(would_block(e), "send_file failed")
+
+        val k = c.recv(into).unwrap()
+
+        for b in into[0..<k]
+            got.push(b)
+
+    assert_eq(sent, total)
+
+    for i in 0..<total
+        if got[i] != payload[i] then assert(false, f"byte $i differs")
+
+    c.close().unwrap()
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_non_blocking_back_pressure
+
+@test("nsf_ a TCP peer that has gone is peer_closed, never SIGPIPE")
+nsf_tcp_closed_peer()
+    val dir = nsf_dir("tcpgone")
+    val f = nsf_file(dir, "a", [3u8; 65536])
+    val w = watch(PIPE).unwrap()
+    var (l, c, a) = nsf_tcp()
+
+    c.close().unwrap()
+
+    var refused: Option[IoError] = None
+
+    for _ in 0..<4000
+        if refused.is_none()
+            a.send_file(f, 0, 65536) match
+                Ok(_) -> sleep(millis(5))
+                Err(e) -> refused = Some(e)
+
+    assert(refused.is_some(), "no send_file to a closed TCP peer was refused")
+    assert(peer_closed(refused.unwrap()), f"the error was not a closed peer: ${refused.unwrap()}")
+    assert(!w.take(), "send_file raised SIGPIPE")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_tcp_closed_peer
+
+@test("nsf_ a Unix stream sends from a file, and one whose peer has gone is peer_closed")
+nsf_unix_stream()
+    val dir = nsf_dir("unix")
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    val w = watch(PIPE).unwrap()
+    val at = unix(join(dir, "s.sock")).unwrap()
+    var l = unix_listen(at).unwrap()
+    var c = unix_connect(at).unwrap()
+    var a = l.accept().unwrap()
+
+    assert_eq(a.send_file(f, 13, 5).unwrap(), 5)
+    assert_eq(nsf_text(nsf_take(c, 5)), "nopqr")
+    c.close().unwrap()
+
+    val gone = a.send_file(f, 0, 26)
+
+    assert(gone.is_err() && peer_closed(gone.unwrap_err()), "a closed Unix peer was not peer_closed")
+    assert(!w.take(), "send_file raised SIGPIPE")
+    a.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_unix_stream
+
+@test("nsf_ a closed socket answers an error, not a count")
+nsf_closed_socket()
+    val dir = nsf_dir("closedsock")
+    val f = nsf_file(dir, "a", nsf_alphabet)
+    var (l, c, a) = nsf_tcp()
+
+    a.close().unwrap()
+    assert(a.send_file(f, 0, 26).is_err(), "a closed socket sent from a file")
+    c.close().unwrap()
+    l.close().unwrap()
+    ignore(remove_dir_all(dir))
+end nsf_closed_socket

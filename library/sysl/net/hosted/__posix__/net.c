@@ -396,6 +396,92 @@ int sysl_net_posix_send_vectored(int fd, const struct iovec *iov, size_t count, 
     return 0;
 }
 
+/* Up to `n` bytes of the file `file` from `offset` sent on `fd` by the kernel, without passing through
+ * the program -- `sendfile` on both platforms, whose two signatures share only the name -- answering
+ * how many went. Neither moves the file's own position.
+ *
+ *   - **A short count is not an error**, as for `send`. Darwin answers -1 with `EAGAIN` or `EINTR`
+ *     *and* a count when it stopped partway; that count is the answer. Past the end of the file both
+ *     answer what was there, which may be nothing.
+ *   - **Where the kernel cannot do it, the answer is `ENOTSUP`**, which the hook turns into
+ *     `sysl.sys.UNSUPPORTED` and `sysl.net` into a read-and-send loop: a descriptor the kernel's
+ *     `sendfile` will not read from (`EINVAL` -- not a regular file, or a filesystem with no page-cache
+ *     path), a filesystem that refuses it (`ENOTSUP`), or a platform with no `sendfile`. The loop's
+ *     own read and send then give the honest answer.
+ *   - **A peer that has gone is `EPIPE`, and raises no `SIGPIPE`.** Darwin's `SO_NOSIGPIPE` covers
+ *     `sendfile` as it covers `send`, but answers `ENOTCONN` there where `send` answers `EPIPE`; a
+ *     zero-byte `send` on the same socket asks which it is (`EPIPE` for a peer that went, `ENOTCONN`
+ *     for a socket never connected). Linux's `sendfile` takes no `MSG_NOSIGNAL`, so `SIGPIPE` is
+ *     blocked in this thread across the call and one it raised is taken back before the mask is
+ *     restored -- unless one was already pending, which is the program's own. The process's
+ *     disposition is never touched.
+ */
+#if defined(__APPLE__)
+int sysl_net_posix_send_file(int fd, int file, int64_t offset, size_t n, size_t *sent) {
+    off_t len = n > (size_t) INT64_MAX ? INT64_MAX : (off_t) n;
+    int r = sendfile(file, fd, (off_t) offset, &len, NULL, 0);
+
+    if (r == 0 || ((errno == EAGAIN || errno == EINTR) && len > 0)) {
+        *sent = (size_t) len;
+        return 0;
+    }
+
+    int e = errno;
+
+    if (e == ENOTCONN) {
+        ssize_t k = send(fd, "", 0, SEND_FLAGS);
+
+        if (k < 0) return failed(fd);
+        errno = e;
+    }
+    if (e == EINVAL || e == ENOTSUP || e == EOPNOTSUPP) return ENOTSUP;
+    return failed(fd);
+}
+#elif defined(__linux__)
+#include <pthread.h>
+#include <signal.h>
+#include <sys/sendfile.h>
+#include <time.h>
+
+int sysl_net_posix_send_file(int fd, int file, int64_t offset, size_t n, size_t *sent) {
+    sigset_t pipe_only, before, pending;
+    off_t at = (off_t) offset;
+
+    if (n > 0x7ffff000) n = 0x7ffff000;
+    sigemptyset(&pipe_only);
+    sigaddset(&pipe_only, SIGPIPE);
+    sigemptyset(&pending);
+    sigpending(&pending);
+
+    int was_pending = sigismember(&pending, SIGPIPE) == 1;
+
+    pthread_sigmask(SIG_BLOCK, &pipe_only, &before);
+
+    ssize_t k = sendfile(fd, file, &at, n);
+    int e = errno;
+
+    if (k < 0 && e == EPIPE && !was_pending) {
+        struct timespec now = {0, 0};
+
+        while (sigtimedwait(&pipe_only, NULL, &now) < 0 && errno == EINTR) {}
+    }
+    pthread_sigmask(SIG_SETMASK, &before, NULL);
+
+    if (k >= 0) {
+        *sent = (size_t) k;
+        return 0;
+    }
+    errno = e;
+    if (e == EINVAL || e == ENOSYS || e == ENOTSUP || e == EOPNOTSUPP) return ENOTSUP;
+    return failed(fd);
+}
+#else
+int sysl_net_posix_send_file(int fd, int file, int64_t offset, size_t n, size_t *sent) {
+    (void) fd; (void) file; (void) offset; (void) n; (void) sent;
+    return ENOTSUP;
+}
+#endif
+
 int sysl_net_posix_recv(int fd, unsigned char *buf, size_t n, size_t *got) {
     ssize_t k = recv(fd, buf, n, 0);
 
