@@ -2103,8 +2103,27 @@ arithmetic, which sysl does not provide.
 there, just as `Box[T]` and `Box[U]` are, and a struct's value argument computed in a field or a body
 — `Buf[N + 1]` — is that computation over the symbols. Two such arguments are one type when they are
 the same polynomial: `N + M` is `M + N`, `2 * N` is `N + N`, `N * (M + 1)` is `N * M + N`, and a
-division by a constant that divides every coefficient is exact (`(2 * N + 4) / 2` is `N + 2`). Any
-other operation over a parameter (`N / 2` alone, `!B`) is compared as written.
+division by a constant that divides every coefficient is exact (`(2 * N + 4) / 2` is `N + 2`). A
+comparison whose two sides differ by a constant is that constant's truth (`Flag[N + 1 > N]` is
+`Flag[true]`), and a call to a `const` function is the same call however it is named (`double(N)`
+and `util.double(N)`). Any other operation over a parameter (`N / 2` alone, `!B`, `N > M`) is
+compared as written. A form too large to compare — over 64 terms, or of degree over 8 — is refused
+where it is written:
+
+```sysl
+struct Buf[const N: usize]
+    used: usize
+
+deep[const N: usize]() -> usize
+    val x: Buf[N * N * N * N * N * N * N * N * N] = Buf(1)
+    x.used
+
+print(1)
+```
+
+```error
+the type argument 'N * N * N * N * N * N * N * N * N' is too large to compare (of degree over 8)
+```
 
 So a body that yields what its signature does not name is wrong for every instantiation, and it is
 refused at the declaration, whether or not anything calls it:

@@ -1,8 +1,8 @@
 # Type-level const arithmetic — computed value arguments, solved offsets, value predicates — design
 
-**Status: approved (2026-11-26), item U1.2 of 0.14.** Part of §5.1–§5.2 is already built (§2.3):
-`value_terms.sysl`'s `Mono` form and the symbolic definition walk, with D1 and D2, shipped in 0.13.
-It lifts the refusal
+**Status: approved (2026-11-26), item U1.2 of 0.14.** §5.1 and most of §5.2 are built (§2.3):
+the symbolic definition walk, with D1 and D2, shipped in 0.13, and TL1 brought `value_terms.sysl`'s
+form up to §5.1, with D11. It lifts the refusal
 `generics.md § What may be written with N` pins today ("the length 'N + 1' computes with the value
 parameter 'N' … type-level arithmetic, which is a separate feature") and removes the first row of
 `generics.md § What is deliberately not here`. The feature: a value parameter may be computed with
@@ -138,11 +138,15 @@ The value-parameter symbol work of 2026-11-21 (`value_terms.sysl`; `tests_vpq_`,
 - **`min`/`max` do not exist in a type position**: `Buf[min(N, M)]` is *"undefined function 'min'"*, so
   decision 2's `min`/`max` atoms have nothing to normalise until a constant `min` exists.
 
-How `value_terms.sysl`'s form differs from §5.1: a factor is a parameter's **name** (a string), not
-its declaration index, so N11 (renamed parameters) is not one form; an atom is its **text**, with no
-normalisation inside (no `min`/`max` sorting, no comparison folding — N8 — and no const-call atom by
-key — N9; a call carries no term at all); and past the cap the argument **carries no term** and is
-compared by value, where §5.1 refuses it (D11).
+On 0.13.7 `value_terms.sysl`'s form differed from §5.1: a factor was a parameter's **name**, not its
+declaration index (N11); an atom was its **text**, with nothing normalised inside (no `min`/`max`
+sorting, no comparison folding — N8 — and no const-call atom by key — N9; a call, a comparison and an
+`if` carried no term, so `Flag[N > 3]` read as the `Flag[false]` it folds to at the stand-in zero);
+and past the cap the argument carried no term and was compared by value (D11). **TL1 brought the form
+up to §5.1** (`tests_tlk_const_term.sysl`): `Factor` is a parameter by its place (a member's own after
+its block's) or an atom over its operands' forms, every rule of §5.1 holds, and the cap refuses with
+D11's text (`… (over 64 terms)`, or `(of degree over 8)`). The parentheses of an atom's operands are
+kept (`(2 * N + 3) / 2`).
 
 ## 3. Prior art
 
@@ -205,9 +209,10 @@ Factor      = Param(index)                           -- the declaration's i-th v
 - `+`, `-`, `*`, unary `-`, literals and parameter-free constants (folded to a coefficient) build it
   by the ring operations; a product distributes.
 - **Exact division** (decision 2): `P / c` and `P % c` with `c` a non-zero constant that divides every
-  coefficient of `P` *and* every monomial of `P` has at least one parameter or atom — normalise to
-  `P/c` and `0`. `(2 * N + 4) / 2` is `N + 2`. Otherwise `/` and `%` are atoms. (Truncating division
-  agrees with exact division when exact, for every sign.)
+  coefficient of `P`, the constant monomial's included — normalise to `P/c` and `0`. `(2 * N + 4) / 2`
+  is `N + 2`. Where `P` is itself a constant the two divide as an instance would, truncating.
+  Otherwise `/` and `%` are atoms. (Truncating division agrees with exact division when exact, for
+  every sign.)
 - **Atoms are normalised inside**: their arguments are `ConstTerm`s; `min`/`max` sort and deduplicate
   their arguments (commutative, idempotent) and flatten nesting; a comparison whose two sides differ
   by a **constant** folds to `true`/`false` (`N + 1 > N` is `true` over ℤ); `!`/`&&`/`||` fold
@@ -480,9 +485,11 @@ functions it changes — `tests_value_generics.sysl`, `tests_ice_if_const_expr.s
 `impl`-shape tests `tests_igx_`/`tests_isx_`/`tests_idt_` are the blast radius — and the docs sweep of
 `generics.md`).
 
-1. **TL1 — `ConstTerm`** (new `const_term.sysl`: the form of §5.1, built from an `Expr` and a
-   parameter list; equality; printing; the cap). No language change, no diagnostic reaches a user.
-   Tests (`tlk_`): N1–N11. Design-only dependency for the rest.
+1. **TL1 — the normal form** (re-cut 2026-11-26: `value_terms.sysl`'s existing form brought up to
+   §5.1 rather than a second one in a new file — parameters by place, structured atoms, comparison
+   folding, call atoms by key, D11 at the cap). Tests (`tlk_`): N1–N11. **Behaviour change**: a form
+   past the cap, and a call, comparison or `if` over a parameter that disagrees by form, are refused at
+   the declaration where they were left to the instances.
 2. **TL2 — symbolic value parameters in the definition walk** (`types.sysl`'s `ConstArg` gains the
    term; `type_eq`; `generic.sysl`'s stand-in creation; the `if const N == c` refinement; D1, D2,
    D3). **Behaviour change**: R1, R2 become errors. Runs the org census through marshal with the
