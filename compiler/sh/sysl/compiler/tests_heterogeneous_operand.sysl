@@ -101,20 +101,6 @@ private hop_ir_main(text: string) -> string
                 Some(end_at) -> rest[0..<end_at]
 end hop_ir_main
 
-private hop_count(text: string, part: string) -> int
-    var n = 0
-    var from = text
-
-    loop
-        from.index_of(part) match
-            None -> break
-            Some(at) ->
-                n += 1
-                from = from[(at + part.bytes.len)..]
-
-    n
-end hop_count
-
 // A complex number over `f64`, scalable by a real.
 private hop_complex() -> string = raw"""
     struct C
@@ -204,9 +190,17 @@ hop_a_compound_assignment_updates_through_the_same_implementation()
 hop_and_updates_the_place_from_one_call()
     if !hop_ready() then return
 
-    val out = hop_ir_main(hop_complex() + "var c = C(1.0, 2.0)\nc *= 3.0\n")
-
-    assert_eq(hop_count(out, "@C.mul"), 1)
+    assert_eq(hop_ran(raw"""
+        struct C
+            v: real
+        impl Mul[real] for C
+            mul(self, k: real) -> C
+                print("mul")
+                C(self.v * k)
+        var c = C(2.0)
+        c *= 3.0
+        print(c.v)
+        """), "mul\n6\n")
 
 @test("every binary arithmetic trait takes the right-hand type")
 hop_every_binary_arithmetic_trait_takes_the_right_hand_type()
@@ -309,6 +303,7 @@ hop_a_requirement_carries_the_default_down()
 
 // ---- what the scalars kept
 
+// Kept as IR text: a scalar operator staying an instruction, not a call, is a cost no run can see.
 @test("a scalar operator is still one instruction")
 hop_a_scalar_operator_is_still_one_instruction()
     if !hop_ready() then return
@@ -557,18 +552,6 @@ hop_and_so_does_the_named_call()
         print(show(C(1.0, 2.0).mul(C(3.0, 4.0))))
         print(show(C(1.0, 2.0).mul(2.5)))
         """), "-5 10\n2.5 5\n")
-
-@test("each implementation is a function of its own")
-hop_each_implementation_is_a_function_of_its_own()
-    if !hop_ready() then return
-
-    // On a machine that fuses, both bodies are read at the call for contraction
-    // (`tests_fpo_fp_operators.sysl`); x86-64 does not fuse, so the two calls stay calls.
-    val out = hop_ir(hop_both() + "print(show(C(1.0, 2.0) * C(3.0, 4.0) * 2.5))\n", Some("x86_64-macos"))
-
-    assert(out.contains("define %struct.C @C.mul(%struct.C %self.param, double %k.param)"), out)
-    assert(out.contains("define %struct.C @C.mul.2(%struct.C %self.param, %struct.C %o.param)"), out)
-    assert(out.contains("call %struct.C @C.mul.2(%struct.C %t2, %struct.C %t4)"), out)
 
 @test("a bound asks for the one it names")
 hop_a_bound_asks_for_the_one_it_names()
