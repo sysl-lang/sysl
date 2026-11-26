@@ -1550,9 +1550,10 @@ stores the box through another capture, or hands it to a call that keeps it, doe
 a program, which sees every table there is, each method or closure of that trait at the receiver's own
 arguments; the box stays in the frame where none of them lets it out. A call with no body in sight — a
 C function pointer, an `extern`, a trait object or a callable in a library, which may be handed one
-whose table it never saw — or a recursion still being worked out answers "it may get out", as does a
-task's body and a payload over a kilobyte, which every frame of a recursion would pay for. A
-`&sync T` is never laid in a frame.
+whose table it never saw — answers "it may get out", as does a task's body and a payload over a
+kilobyte, which every frame of a recursion would pay for. **A recursion is settled at a fixed point**:
+a box handed to a recursive function, or to a cycle of functions calling one another, stays in the
+frame unless one of their paths lets it out. A `&sync T` is never laid in a frame.
 
 ```sysl
 trait Reader
@@ -1637,7 +1638,12 @@ counter(n: int) -> &Counter = Counter(n)
 keep(c: &Counter)
     kept = Some(c)
 
-count(n: int, c: &Counter) -> int = if n == 0 then c.n else count(n - 1, c)
+count(n: int, c: &Counter) -> int
+    if n == 0
+        keep(c)
+        return c.n
+
+    count(n - 1, c)
 
 main()
     val a: &Counter = Counter(1)
@@ -1654,15 +1660,18 @@ main()
 
 ```output
 3
-4 2
+4 3
 ```
 
 ```
 $ sysl run --explain-escapes counters.sysl
-counters.sysl:14:23: a 'Counter' is boxed on the heap, because it is stored in 'kept' on line 16
-counters.sysl:17:10: what 'counter' answers is boxed on the heap, because it is handed to 'keep' on line 17, which keeps its parameter 'c' (it is stored in 'kept' on line 9)
-counters.sysl:18:20: a 'Counter' is boxed on the heap, because it is handed to 'count' on line 18, which keeps its parameter 'c' (it is handed to 'count' on line 11, a recursion whose answer is still being worked out)
+counters.sysl:19:23: a 'Counter' is boxed on the heap, because it is stored in 'kept' on line 21
+counters.sysl:22:10: what 'counter' answers is boxed on the heap, because it is handed to 'keep' on line 22, which keeps its parameter 'c' (it is stored in 'kept' on line 9)
+counters.sysl:23:20: a 'Counter' is boxed on the heap, because it is handed to 'count' on line 23, which keeps its parameter 'c' (it is handed to 'keep' on line 13, which keeps its parameter 'c' (it is stored in 'kept' on line 9))
 ```
+
+A recursion is reported by what its body does at the bottom: `count` hands its parameter on to
+itself and lets it out only through `keep`, which is the reason given.
 
 The other reasons a line gives are the rest of the ways out [listed above](#a-box-nothing-keeps-is-laid-in-the-frame):
 stored in a place that is not the frame's own (*"is stored in 'h.c'"*), returned other than as a

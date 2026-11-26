@@ -1,0 +1,356 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.container.{Set, set}
+import sysl.process.capture
+import sysl.text.join
+
+// **A parameter held across a fiber switch is refused on what the compiled body does**
+// (`abandons.sysl`'s `check_switch_kept`, `library/fiber.md § A count held across a switch is
+// refused`), so every way a build compiles a body has to give the same answer: the package compiled
+// with the program from source, compiled into a kept half of a `--lib` root that the program links,
+// the standard module from source (`--no-std-lib`), the text `emit-llvm` prints, and a test build.
+// A half defers a body it would refuse to the program (`library_half_refusals`), which compiles it
+// from source and refuses it there; a body it keeps holds no count of its own across the switch.
+//
+// The package is the shape of avin's runtime: a scheduler handed its contexts by pointer, so nothing
+// in it reaches storage the program fills and its bodies are compiled into the half. `total` walks a
+// list its caller holds (accepted everywhere); `grow` assigns its parameter a string it made (refused
+// everywhere, once the program calls it). **What nothing calls is not lowered, so it is not asked**:
+// `grow` is in the package in every accepted case too, uncalled.
+
+private fps_rt() -> string = raw"""
+    module rt
+
+    import sysl.fiber.{Context, switch}
+
+    struct Pair
+        home: Context
+        away: Context
+
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    wait(q: *Pair)
+        switch(&q.away, &q.home)
+
+    total(q: *Pair, p: Option[&Node]) -> int
+        var sum = 0
+
+        while p is Some(n)
+            sum += n.v
+            p = n.next
+
+        wait(q)
+        sum
+
+    grow(q: *Pair, s: string) -> usize
+        s = s + "x"
+        wait(q)
+        s.len
+
+    plain(s: string) -> usize
+        s = s + "x"
+        s.len
+    """
+
+// The program: a fiber walks a list twice, parking inside `total` each time, while `main` resumes it
+// three times. `extra` is spliced into the fiber's pinned body.
+private fps_main(extra: string) -> string = raw"""
+    import rt.*
+    import sysl.fiber.{Context, Stack, switch}
+
+    var pair = Pair(Context.new(), Context.new())
+
+    @pinned(thread)
+    twice(q: *Pair)
+        val list: Option[&Node] = Some(Node(1, Some(Node(2, None))))
+
+        print(total(q, list))
+        print(total(q, list))
+    """ + extra + raw"""
+
+    body(q: *Pair)
+        twice(q)
+
+        loop
+            wait(q)
+
+    main()
+        val stack = Stack.reserve(64 * 1024).unwrap()
+
+        pair.away = Context.start(stack, &body, &pair)
+
+        for _ in 0..<3
+            switch(&pair.home, &pair.away)
+            print("main again")
+    """
+
+private fps_calls_grow() -> string = "    print(grow(q, \"a\"))\n"
+
+private val fps_ran: string = "main again\n3\nmain again\n3\nmain again\n"
+
+private fps_refusal(said: string)
+    assert(said.contains("'rt.wait' can reach 'sysl.fiber.switch'"), said)
+    assert(said.contains("holds the parameter 's' (kept with a count of its own, taken at entry and given back at the exit) across the call"), said)
+    assert(!said.contains("holds the parameter 'p'"), said)
+
+// A program built with counting on and run: what it printed and what the heap said, or why it was not
+// built.
+private fps_counted(project: string, libs: []string) -> (string, string)
+    val out_dir = lbr_temp("sysl-fps-exe")
+
+    lbr_hand(libs)
+    force_alloc_counting(true)
+
+    val built = build_native_program(project, None, None, DefaultOptimization, Some(s"$out_dir/program"))
+
+    force_alloc_counting(false)
+    reset_search_paths()
+
+    val said = built match
+        Err(why) -> (s"refused: ${failure_text(why)}", "")
+        Ok(made) ->
+            capture(made, [], "", [], true) match
+                Err(_) -> ("could not be started", "")
+                Ok(o) -> (o.text, o.err.unwrap_or(""))
+
+    lbr_drop([out_dir])
+    said
+end fps_counted
+
+private fps_accepted_run(said: (string, string))
+    assert_eq(said.0, fps_ran)
+    assert(!said.1.contains("still live"), said.1)
+
+// The package as the program's own module: everything compiled from source together.
+private fps_own(extra: string) -> (string, string)
+    val project = lbr_project(lbr_two("main.sysl", fps_main(extra), "rt/rt.sysl", fps_rt()))
+    val said = fps_counted(project, [])
+
+    lbr_drop([project])
+    said
+end fps_own
+
+@test("from source: the walking parameter runs, parks, and leaves nothing live")
+fps_own_accepted()
+    if !lbr_ready() then return
+
+    fps_accepted_run(fps_own(""))
+
+@test("from source: the kept parameter is refused once the program calls it")
+fps_own_refused()
+    if !lbr_ready() then return
+
+    fps_refusal(fps_own(fps_calls_grow()).0)
+
+// The package as a `--lib` root whose half is kept in a cache of the case's own, so the program links
+// the half rather than compiling the root.
+private fps_cached(extra: string) -> ((string, string), (int, int, int))
+    val lib = lbr_tree(lbr_one("rt/rt.sysl", fps_rt()))
+    val project = lbr_project(lbr_one("main.sysl", fps_main(extra)))
+    val cache = lbr_temp("sysl-fps-cache")
+
+    use_root_cache_dir(Some(cache))
+    use_c_object_cache_dir(Some(cache))
+    clear_root_artifact_counts()
+
+    val said = fps_counted(project, [lib])
+    val counts = root_artifact_counts()
+
+    use_root_cache_dir(None)
+    use_c_object_cache_dir(None)
+    lbr_drop([lib, project, cache])
+    (said, counts)
+end fps_cached
+
+@test("a --lib root's kept half: the walking parameter runs from the half and leaves nothing live")
+fps_cached_accepted()
+    if !lbr_ready() then return
+
+    val got = fps_cached("")
+
+    fps_accepted_run(got.0)
+    assert_eq((got.1).1, 1)
+    assert_eq((got.1).2, 0)
+
+@test("a --lib root's kept half: the kept parameter's body is deferred to the program, which refuses it")
+fps_cached_refused()
+    if !lbr_ready() then return
+
+    val got = fps_cached(fps_calls_grow())
+
+    fps_refusal((got.0).0)
+    // The half was made (the root is not compiled from source as a whole): only `grow` was deferred.
+    assert_eq((got.1).1, 1)
+    assert_eq((got.1).2, 0)
+
+// The half itself: `total` is compiled into it and advertised, `grow` left to the program.
+@test("the half compiles the walking body and defers the kept one")
+fps_half_split()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("rt/rt.sysl", fps_rt()))
+    val half = lfa_half_here(lib, [])
+    val names = join(half.advertised.view(), " ")
+
+    lbr_drop([lib])
+    assert(!half.text.starts_with("refused"), half.text)
+    assert(names.contains("total"), names)
+    assert(names.contains("wait"), names)
+    assert(names.contains("plain"), names)
+    assert(!names.contains("grow"), names)
+    assert(lfa_defines(half.text, "rt$total"), half.text)
+    assert(!lfa_defines(half.text, "rt$grow"), half.text)
+
+// The half's analysis keeps both parameters' refusals; its first lowering keeps `grow`'s `s` and
+// borrows `total`'s `p`, so `grow` is the one body deferred, and nothing else is a gap.
+@test("the half's lowering answers the kept refusals: only the kept body is deferred")
+fps_half_refusals()
+    if !lbr_ready() then return
+
+    val lib = lbr_tree(lbr_one("rt/rt.sysl", fps_rt()))
+    var said: Buf[string] = buf()
+    val t = host_target()
+
+    lbr_hand([])
+
+    packaged_compilation_of(lib, t) match
+        Err(why) -> said.push(failure_text(why))
+        Ok(c) ->
+            val built = library_build(c.units, c.own, t, Some(project_files(c.units)))
+            var foreign: Set[string] = set()
+
+            for name in built.foreign
+                foreign.add(name)
+
+            val first = codegen_with_gaps(built.program, t, built.promotions, false, Some(foreign))
+
+            for g in first.1
+                said.push(s"gap ${g.0}")
+
+            for h in built.switch_holds
+                said.push(s"hold ${h.key}")
+
+            for r in library_half_refusals(built.switch_holds, first.2)
+                said.push(s"refused ${r.0}")
+
+            said.push(s"total kept ${first.2.kept.has("rt$total|1")}, grow kept ${first.2.kept.has("rt$grow|1")}")
+
+    reset_search_paths()
+    lbr_drop([lib])
+    assert_eq(join(said.view(), "\n"),
+              "hold rt$total|1\nhold rt$grow|1\nrefused rt$grow\ntotal kept false, grow kept true")
+
+// The command line, for the shapes only it reaches: the standard module from source, and `emit-llvm`.
+private fps_cli(command: string, extra: string, flags: []const string) -> (int, string)
+    val lib = lbr_tree(lbr_one("rt/rt.sysl", fps_rt()))
+    val project = lbr_project(lbr_one("main.sysl", fps_main(extra)))
+    var args: Buf[string] = buf()
+
+    args.push("sysl")
+    args.push(command)
+    args.push(project)
+    args.push("--lib")
+    args.push(lib)
+
+    for f in flags
+        args.push(f)
+
+    val got = lbr_cli(args.view())
+
+    lbr_drop([lib, project])
+    got
+end fps_cli
+
+@test("--no-std-lib: the walking parameter builds, and the kept one is refused")
+fps_no_std_lib()
+    if !lbr_ready() then return
+
+    val out_dir = lbr_temp("sysl-fps-nsl")
+    val exe = s"$out_dir/program"
+    val ok = fps_cli("build", "", ["--no-std-lib", "-o", exe])
+
+    assert_eq(ok.0, 0, ok.1)
+
+    capture(exe, [], "", [], true) match
+        Err(_) -> assert(false, "the program that was built could not be started")
+        Ok(o) -> assert_eq(o.text, fps_ran)
+
+    val no = fps_cli("build", fps_calls_grow(), ["--no-std-lib", "-o", exe])
+
+    lbr_drop([out_dir])
+    assert(no.0 != 0, no.1)
+    fps_refusal(no.1)
+
+@test("emit-llvm: the walking parameter's text is printed, and the kept one is refused")
+fps_emit_llvm()
+    if !lbr_ready() then return
+
+    val ok = fps_cli("emit-llvm", "", [])
+
+    assert_eq(ok.0, 0, ok.1)
+    assert(ok.1.contains("define"), ok.1)
+
+    val no = fps_cli("emit-llvm", fps_calls_grow(), [])
+
+    assert(no.0 != 0, no.1)
+    fps_refusal(no.1)
+
+// A test build lowers what its tests reach, so the kept parameter is refused once a test calls it.
+private fps_test_tree(extra: string) -> string = raw"""
+    module app
+
+    import rt.*
+    import sysl.fiber.{Context, Stack, switch}
+
+    var pair = Pair(Context.new(), Context.new())
+
+    @pinned(thread)
+    twice(q: *Pair)
+        val list: Option[&Node] = Some(Node(1, Some(Node(2, None))))
+
+        assert_eq(total(q, list), 3)
+    """ + extra + raw"""
+
+    body(q: *Pair)
+        twice(q)
+
+        loop
+            wait(q)
+
+    // A test body is not `main`: it holds its stack across the switch, so it says it stays put.
+    @test("walks while parked")
+    @pinned(thread)
+    walks()
+        val stack = Stack.reserve(64 * 1024).unwrap()
+
+        pair.away = Context.start(stack, &body, &pair)
+        switch(&pair.home, &pair.away)
+        switch(&pair.home, &pair.away)
+    """
+
+private fps_test_build(extra: string) -> string
+    val project = lbr_project(lbr_two("app/app.sysl", fps_test_tree(extra), "rt/rt.sysl", fps_rt()))
+
+    lbr_hand([])
+
+    val said = test_build_of(project, None) match
+        Err(why) -> s"refused: ${failure_text(why)}"
+        Ok(built) ->
+            if built.emitted.report.is_empty() then s"built ${built.tests.len()}"
+            else analysis_report(built.emitted.report)
+
+    reset_search_paths()
+    lbr_drop([project])
+    said
+end fps_test_build
+
+@test("a test build: the walking parameter builds, and the kept one is refused")
+fps_test_shape()
+    if !lbr_ready() then return
+
+    assert_eq(fps_test_build(""), "built 1")
+    fps_refusal(fps_test_build("    assert_eq(grow(q, \"a\"), 2)\n"))

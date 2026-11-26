@@ -11,9 +11,10 @@ import sysl.fs.{remove_dir_all, write_text}
 //
 // The cells cross each way out (module storage, a field through a reference, a closure's capture, a
 // value with a destructor, a loop's outer local, a table call's keeping body, a direct keeping callee,
-// a recursion, a non-factory's answer, `break`, a weakening, an `async` body, a payload over the
-// limit, a factory with no frame entry, a trait object stored) with the boxes that say nothing (laid
-// in the frame, a factory's own answer, a factory of a factory's call, a capture read beside another,
+// a recursion keeping at its end, a non-factory's answer, `break`, a weakening, an `async` body, a
+// payload over the limit, a factory with no frame entry, a trait object stored) with the boxes that
+// say nothing (laid in the frame, a recursion that only reads, a factory's own answer, a factory of a
+// factory's call, a capture read beside another,
 // a generic built twice saying its one line once), with how a callee is named (a generic instance by
 // its generic, a closure's body as a closure), and with the
 // commands that lower a program (`emit-llvm`, `test`, `build-c`), a program of two files, and a build
@@ -115,7 +116,12 @@ private const xeb_page: string = raw"""
     keep(c: &Counter)
         kept = Some(c)
 
-    count(n: int, c: &Counter) -> int = if n == 0 then c.n else count(n - 1, c)
+    count(n: int, c: &Counter) -> int
+        if n == 0
+            keep(c)
+            return c.n
+
+        count(n - 1, c)
 
     main()
         val a: &Counter = Counter(1)
@@ -130,16 +136,16 @@ private const xeb_page: string = raw"""
         kept = None
     """
 
-@test("the page's example: a store into module storage, a factory call handed to a keeper, a recursion")
+@test("the page's example: module storage, a factory call handed to a keeper, a recursion keeping at its end")
 xeb_the_pages_example()
     xeb_says(xeb_explained(xeb_page), [
         "no arrays were promoted to the heap",
-        s"main.sysl:14:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 16",
-        s"main.sysl:17:10: what 'counter' answers $xeb_heap it is handed to 'keep' on line 17, which keeps " +
+        s"main.sysl:19:23: a 'Counter' $xeb_heap it is stored in 'kept' on line 21",
+        s"main.sysl:22:10: what 'counter' answers $xeb_heap it is handed to 'keep' on line 22, which keeps " +
             "its parameter 'c' (it is stored in 'kept' on line 9)",
-        s"main.sysl:18:20: a 'Counter' $xeb_heap it is handed to 'count' on line 18, which keeps its " +
-            "parameter 'c' (it is handed to 'count' on line 11, a recursion whose answer is still being " +
-            "worked out)"])
+        s"main.sysl:23:20: a 'Counter' $xeb_heap it is handed to 'count' on line 23, which keeps its " +
+            "parameter 'c' (it is handed to 'keep' on line 13, which keeps its parameter 'c' (it is stored " +
+            "in 'kept' on line 9))"])
 
 @test("a build that does not ask says nothing of its boxes")
 xeb_unasked_says_nothing()
@@ -276,9 +282,6 @@ xeb_each_way_out()
         s"main.sysl:64:23: a 'Counter' $xeb_heap it is stored in 'h.c' on line 66",
         s"main.sysl:69:10: what 'counter' answers $xeb_heap it is handed to 'keep' on line 69, which keeps " +
             "its parameter 'c' (it is stored in 'kept' on line 42)",
-        s"main.sysl:70:18: a 'Counter' $xeb_heap it is handed to 'rec' on line 70, which keeps its " +
-            "parameter 'c' (it is handed to 'rec' on line 44, a recursion whose answer is still being " +
-            "worked out)",
         s"main.sysl:77:27: a 'Counter' $xeb_heap it is kept in 'last', which outlives the turn of the loop " +
             "that builds it",
         s"main.sysl:87:18: a 'Counter' $xeb_heap it is handed to 'read' on line 87, which keeps its " +
