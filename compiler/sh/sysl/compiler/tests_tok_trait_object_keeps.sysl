@@ -1,0 +1,363 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An object behind a trait holds a raw pointer only where a type the program erases to that trait
+// does** (`keeps.sysl`'s `may_hold_pointer` and `object_holds`), in a build that sees every table
+// (`Analysis.closed`). Each cell hands a closure a local's address and returns what the closure
+// answered: accepted where no implementation can hold the address, refused where one can, and
+// refused in every build that does not see every table. `reference/memory.md § Only a type that can
+// hold an address carries a loan` is the specification.
+//
+// Axes: what the implementation holds (numbers, a `*T`, a generic field at `*T`, a `&Fn`, another
+// object of the same trait, a cycle through it), how the object is reached (the answer itself, a
+// struct field, an `Option` payload, a `weak` field, a `&sync` object), how the table is made (a
+// plain `impl`, a generic `impl`, an erasure inside a generic function, a generic trait at one
+// argument or another) and the build (a program, `build-c`, `build-lib`).
+//
+// Skipped cells, and why: an object handed to C by an `@export` is the `build-c` cell, since C can
+// only be handed an object that a function of the program made; a supertrait object turned into its
+// supertrait and an `impl` for `*int` are refused by the language before the analysis runs, so each
+// cell pins that refusal; a `*Shape` is a raw pointer whatever its trait, as it was before.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private tok_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-tok").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end tok_outcome
+
+private tok_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = tok_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end tok_prints
+
+private tok_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = tok_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end tok_refused
+
+private val TokReturned = "'f' is returned, but it holds the address of a local of"
+
+private val TokShape = "trait Shape\n    area(self) -> int\n\n"
+
+private val TokSq = "struct Sq\n    s: int\n\nimpl Shape for Sq\n    area(self) -> int = self.s\n\n"
+
+private val TokPt = "struct Pt\n    p: *int\n\nimpl Shape for Pt\n    area(self) -> int = *self.p\n\n"
+
+private val TokThrough = "through(f: &Fn(*int) -> &Shape) -> &Shape\n    var x = 3\n    f(&x)\n\n"
+
+// -- accepted: no implementation can hold the address ----------------------------------------------
+
+@test("tok: an object answered by a closure, made only of numbers, is returned")
+tok_plain_answer()
+    tok_prints(TokShape + TokSq + TokThrough +
+               "main()\n    val s = through((p) -> Sq(*p))\n    print(s.area())\n", "3\n")
+end tok_plain_answer
+
+@test("tok: an object of numbers in a struct field and in an Option, both returned")
+tok_plain_field_and_option()
+    tok_prints(TokShape + TokSq + raw"""
+        struct Holder
+            shape: &Shape
+            n: int
+
+        through(f: &Fn(*int) -> Holder) -> Holder
+            var x = 3
+            f(&x)
+
+        choose(f: &Fn(*int) -> Option[&Shape]) -> Option[&Shape]
+            var x = 4
+            f(&x)
+
+        main()
+            val h = through((p) -> Holder(Sq(*p), *p))
+            val o = choose((p) -> Some(Sq(*p)))
+            print(h.shape.area() + h.n + o.unwrap().area())
+        """, "10\n")
+end tok_plain_field_and_option
+
+@test("tok: a call through a trait object answers what the trait's declaration says, as before")
+tok_table_call_answer()
+    tok_prints(TokShape + TokSq + raw"""
+        trait Maker
+            make(self, p: *int) -> &Shape
+
+        struct M
+            k: int
+
+        impl Maker for M
+            make(self, p: *int) -> &Shape = Sq(*p + self.k)
+
+        through(m: &Maker) -> &Shape
+            var x = 3
+            m.make(&x)
+
+        main()
+            val s = through(M(1))
+            print(s.area())
+        """, "4\n")
+end tok_table_call_answer
+
+@test("tok: a pointer-holding type erased to the trait at other arguments leaves this one plain")
+tok_generic_trait_other_argument()
+    tok_prints(raw"""
+        trait Get[T]
+            get(self) -> T
+
+        struct Sq
+            s: int
+
+        impl Get[int] for Sq
+            get(self) -> int = self.s
+
+        struct Pt
+            p: *int
+
+        impl Get[bool] for Pt
+            get(self) -> bool = *self.p > 0
+
+        through(f: &Fn(*int) -> &Get[int]) -> &Get[int]
+            var x = 3
+            f(&x)
+
+        main()
+            var y = 1
+            val other: &Get[bool] = Pt(&y)
+            val a = through((p) -> Sq(*p))
+            print(a.get(), other.get())
+        """, "3 true\n")
+end tok_generic_trait_other_argument
+
+@test("tok: an object of numbers behind a weak field is returned")
+tok_plain_weak_field()
+    tok_prints(TokShape + TokSq + raw"""
+        struct W
+            w: weak Shape
+            n: int
+
+        through(f: &Fn(*int) -> W) -> W
+            var x = 3
+            f(&x)
+
+        mkw(s: &Shape) -> W = W(s, s.area())
+
+        main()
+            val b = through((p) -> mkw(Sq(*p)))
+            print(b.n)
+        """, "3\n")
+end tok_plain_weak_field
+
+@test("tok: an implementation holding an object of its own trait, all numbers, settles plain")
+tok_plain_cycle()
+    tok_prints(TokShape + TokSq + raw"""
+        struct Nest
+            inner: &Shape
+
+        impl Shape for Nest
+            area(self) -> int = self.inner.area()
+
+        """ + TokThrough + "main()\n    val b = through((p) -> Nest(Nest(Sq(*p))))\n    print(b.area())\n", "3\n")
+end tok_plain_cycle
+
+// -- refused: some implementation can hold it ----------------------------------------------------
+
+@test("tok: one implementation holding a '*int' makes every object of the trait hold one")
+tok_pointer_implementation()
+    tok_refused(TokShape + TokSq + TokPt + TokThrough +
+                "main()\n    val a = through((p) -> Sq(*p))\n    val b = through((p) -> Pt(p))\n" +
+                "    print(a.area() + b.area())\n", TokReturned)
+end tok_pointer_implementation
+
+@test("tok: a generic implementation instantiated at a '*int' holds one")
+tok_generic_implementation()
+    tok_refused(TokShape + raw"""
+        struct Wrap[T]
+            v: T
+
+        impl[T] Shape for Wrap[T]
+            area(self) -> int = 1
+
+        """ + TokThrough + "main()\n    val b = through((p) -> Wrap(p))\n    print(b.area())\n", TokReturned)
+end tok_generic_implementation
+
+@test("tok: a table made only where a generic function erases its argument still counts")
+tok_erased_in_generic()
+    tok_refused(TokShape + TokSq + TokPt + "erase[T: Shape](v: T) -> &Shape = v\n\n" + TokThrough +
+                "main()\n    val a: &Shape = Sq(1)\n    val b = through((p) -> erase(Pt(p)))\n" +
+                "    print(a.area() + b.area())\n", TokReturned)
+end tok_erased_in_generic
+
+@test("tok: a generic trait at the arguments a pointer-holding type is erased at")
+tok_generic_trait_same_argument()
+    tok_refused(raw"""
+        trait Get[T]
+            get(self) -> T
+
+        struct Pt
+            p: *int
+
+        impl Get[int] for Pt
+            get(self) -> int = *self.p
+
+        through(f: &Fn(*int) -> &Get[int]) -> &Get[int]
+            var x = 3
+            f(&x)
+
+        main()
+            val b = through((p) -> Pt(p))
+            print(b.get())
+        """, TokReturned)
+end tok_generic_trait_same_argument
+
+@test("tok: a '&sync' object of a pointer-holding implementation")
+tok_sync_object()
+    tok_refused(TokShape + TokPt + raw"""
+        through(f: &Fn(*int) -> &sync Shape) -> &sync Shape
+            var x = 3
+            f(&x)
+
+        main()
+            val b = through((p) -> Pt(p))
+            print(b.area())
+        """, TokReturned)
+end tok_sync_object
+
+@test("tok: a weak field of a pointer-holding implementation")
+tok_weak_field()
+    tok_refused(TokShape + TokPt + raw"""
+        struct W
+            w: weak Shape
+            n: int
+
+        through(f: &Fn(*int) -> W) -> W
+            var x = 3
+            f(&x)
+
+        mkw(s: &Shape) -> W = W(s, s.area())
+
+        main()
+            val b = through((p) -> mkw(Pt(p)))
+            print(b.n)
+        """, TokReturned)
+end tok_weak_field
+
+@test("tok: an implementation holding a closure may hold what the closure captured")
+tok_closure_field()
+    tok_refused(TokShape + raw"""
+        struct F
+            f: &Fn() -> int
+
+        impl Shape for F
+            area(self) -> int = self.f()
+
+        """ + TokThrough + "main()\n    val b = through((p) -> F(() -> *p))\n    print(b.area())\n", TokReturned)
+end tok_closure_field
+
+@test("tok: an implementation holding an object of its own trait, one of which holds a pointer")
+tok_nested_object()
+    tok_refused(TokShape + TokPt + raw"""
+        struct Nest
+            inner: &Shape
+
+        impl Shape for Nest
+            area(self) -> int = self.inner.area()
+
+        """ + TokThrough + "main()\n    val b = through((p) -> Nest(Nest(Pt(p))))\n    print(b.area())\n", TokReturned)
+end tok_nested_object
+
+@test("tok: a closure answered by a closure may hold anything, whatever it captured")
+tok_callable_answer()
+    tok_refused(raw"""
+        through(f: &Fn(*int) -> &Fn() -> int) -> &Fn() -> int
+            var x = 3
+            f(&x)
+
+        main()
+            val g = through((p) -> () -> 1)
+            print(g())
+        """, TokReturned)
+end tok_callable_answer
+
+@test("tok: a supertrait object is not turned into its supertrait, so no table hides behind one")
+tok_supertrait_refused()
+    tok_refused(TokShape + "trait Sub: Shape\n    tag(self) -> int\n\n" + TokPt +
+                "impl Sub for Pt\n    tag(self) -> int = 0\n\nas_shape(s: &Sub) -> &Shape = s\n\n" + TokThrough +
+                "main()\n    val b = through((p) -> as_shape(Pt(p)))\n    print(b.area())\n",
+                "a &Sub has forgotten which type it holds, so there is nothing for a &Shape to be built from")
+end tok_supertrait_refused
+
+@test("tok: no implementation is written for a pointer type, so no table is built for one")
+tok_pointer_impl_refused()
+    tok_refused(TokShape + "impl Shape for *int\n    area(self) -> int = *self\n\n" + TokThrough +
+                "main()\n    val b = through((p) -> p)\n    print(b.area())\n",
+                "'*int' is a way of holding a int rather than a type of its own")
+end tok_pointer_impl_refused
+
+// -- refused: a build that does not see every table ------------------------------------------------
+
+@test("tok: C's half of a program may be handed an object made where it cannot look")
+tok_c_archive()
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-tok").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", TokShape + TokSq + TokThrough +
+               "@export(\"run\")\nrun() -> int = through((p) -> Sq(*p)).area()\n").unwrap()
+
+    val out = build_c_archive(root, None, None, DefaultOptimization, Some(s"$root/lib.a"), None, (m) -> ()) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "built"
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.index_of(TokReturned).is_some(), out)
+end tok_c_archive
+
+@test("tok: a library may be handed an object of a type it never saw")
+tok_library()
+    if xvr_no_library() then return
+
+    val root = make_temp_dir("sysl-tok").unwrap()
+
+    make_dir_all(s"$root/m").unwrap()
+    write_text(s"$root/m/a.sysl", "module m\n\n" + TokShape + TokSq + TokThrough +
+               "run() -> int = through((p) -> Sq(*p)).area()\n").unwrap()
+
+    val out = build_library_of(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(_) -> "built"
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(out.index_of(TokReturned).is_some(), out)
+end tok_library
