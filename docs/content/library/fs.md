@@ -1094,6 +1094,25 @@ false true 1
 false no such file or directory
 ```
 
+**A path holding a zero byte is refused, with `Other(22)` (`EINVAL`), by every call that takes one** —
+before C is asked, because C reads a path up to its first zero and the call would act on a different
+file than the one named (`open("a\0b")` would open `a`). Only the bytes of the path count, so a slice
+that ends before a zero is a fine path. `exists`, `is_file` and `is_dir` answer `false` for it.
+
+```sysl
+import sysl.fs.{metadata, exists}
+
+val p = "/tmp\0zzz"
+
+print(metadata(p).unwrap_err())
+print(exists(p), exists(p[0..<4]))
+```
+
+```output
+Invalid argument
+false true
+```
+
 **`exists` answers `false` for a path that exists under a directory the program may not search**,
 which is the one way it differs from the question it looks like it is asking. That case cannot be told
 from absence without a second call whose answer would already be stale — and every caller that
