@@ -174,38 +174,14 @@ lit_a_project_may_mix_the_two_kinds_of_file()
     lit_says([("main.lsysl", "The entry point\n\n    import geom.*\n\n    print(area(3, 4))\n"),
               ("geom/area.sysl", "module geom\n\narea(w: int, h: int) -> int = w * h\n")], "", "12")
 
-// The `which` a compilation for x86-64 Linux kept, as the IR it lowered to.
-private lit_which() -> string
-    val root = absolute_path(make_temp_dir("sysl-lit").unwrap())
-    val file = s"$root/cond.lsysl"
-
-    write_text(file, "Two machines\n\n    #if macos\n    which() -> int = 1\n    #else\n    which() -> int = 2\n" +
-        "    #endif\n\n    print(which())\n").unwrap()
-
-    var lines: Buf[string] = buf()
-    val sink = &lines
-
-    run_cli(["sysl", "emit-llvm", "--no-std-lib", "--target", "x86_64-linux", file], (line) -> sink.push(line))
-
-    val ir = join(lines.view(), "\n")
-
-    remove_dir_all(root).unwrap_or(())
-
-    val at = ir.index_of("@which()")
-
-    if at.is_none() then return ir
-
-    val body = ir[at.unwrap()..<ir.bytes.len]
-
-    body[0..<body.index_of("}").unwrap_or(body.bytes.len)]
-end lit_which
+// A literate file whose `which` is chosen by `#if <word>`; the host is a 64-bit machine.
+private lit_which(word: string) -> string =
+    "Two machines\n\n    #if " + word + "\n    which() -> int = 1\n    #else\n    which() -> int = 2\n" +
+    "    #endif\n\n    print(which())\n"
 
 // Tangling runs before the `#if` gate, so what the gate sees is ordinary sysl.
 @test("conditional compilation works inside a literate file")
 lit_conditional_compilation_works_inside_a_literate_file()
-    if std_root().is_err() then return
-
-    val ours = lit_which()
-
-    assert(ours.contains("ret i32 2"), ours)
+    lit_one("cond.lsysl", lit_which("ptr64"), "1")
+    lit_one("cond.lsysl", lit_which("ptr32"), "2")
 end lit_conditional_compilation_works_inside_a_literate_file
