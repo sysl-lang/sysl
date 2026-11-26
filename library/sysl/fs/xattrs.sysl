@@ -1,0 +1,155 @@
+module sysl.fs
+@requires(os)
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.sys as fsys
+import sysl.slices.as_ptr
+
+// Extended attributes: named byte values a filesystem keeps beside a file's contents -- a download's
+// quarantine mark, a backup tool's checksum, an SELinux label.
+//
+// **Every call comes in two, as `metadata` and `link_metadata` do.** The plain one follows a symbolic
+// link at `path` and asks about what it points at; the `link_` one asks about the link itself, which
+// is the C libraries' `XATTR_NOFOLLOW` on macOS and the `l`-prefixed calls on Linux.
+//
+// **A name is text and a value is bytes.** A value may hold any byte, a zero among them, and may be
+// empty; it is passed with its length, never terminated. A name is what the platform says it is:
+// Linux wants a namespace before a dot (`user.`, `trusted.`, `security.`) and refuses a bare one,
+// macOS takes any name and by convention reverse-DNS (`com.apple.quarantine`).
+
+/** The value of the extended attribute `name` of what `path` names, following a symbolic link.
+ *
+ * **An attribute that is not there is `NoAttribute`**, whatever the platform calls it, so a caller
+ * can tell "the file has no such attribute" from "there is no such file" (`NotFound`). A filesystem
+ * that keeps no attributes at all answers its own `ENOTSUP` as an `Other`: 45 on macOS, 95 on Linux.
+ * A name holding a zero byte is refused with `Other(22)`, `EINVAL`, before anything is asked, since
+ * the platform would read it as the shorter name before the zero.
+ *
+ * The value is the platform's copy, and it is asked for twice: once for its size and once for the
+ * bytes. A value that grew between the two asks is asked for again rather than handed back cut short.
+ */
+get_xattr(path: string, name: string) -> Result[[]u8, IoError] = value_of(path, name, 1)
+
+/** `get_xattr` about a symbolic link itself rather than what it points at. On a path that is not a
+ * link, the two are the same question.
+ */
+link_get_xattr(path: string, name: string) -> Result[[]u8, IoError] = value_of(path, name, 0)
+
+/** The extended attribute `name` of what `path` names set to `value`, following a symbolic link. The
+ * attribute is made where it is missing and its value replaced where it is not; an empty value is a
+ * value, and the attribute is there afterwards holding nothing.
+ *
+ * Linux refuses a name outside a namespace it knows (`Other(95)`, `EOPNOTSUPP`), and refuses a `user.`
+ * attribute on anything but a regular file or a directory (`NotPermitted`). A name holding a zero byte
+ * is `Other(22)`, as for `get_xattr`.
+ */
+set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError] =
+    stored(path, name, value, 1)
+
+/** `set_xattr` on a symbolic link itself, leaving what it points at untouched. macOS keeps attributes
+ * on a link; Linux refuses a `user.` attribute there with `NotPermitted`.
+ */
+link_set_xattr(path: string, name: string, value: []const u8) -> Result[unit, IoError] =
+    stored(path, name, value, 0)
+
+/** The extended attribute `name` of what `path` names removed, following a symbolic link. One that is
+ * not there is `NoAttribute` -- removing is not idempotent here, because the platform does not make
+ * it so and a caller that wants it to be matches the case away.
+ */
+remove_xattr(path: string, name: string) -> Result[unit, IoError] = removed(path, name, 1)
+
+/** `remove_xattr` on a symbolic link itself. */
+link_remove_xattr(path: string, name: string) -> Result[unit, IoError] = removed(path, name, 0)
+
+/** The names of every extended attribute of what `path` names, following a symbolic link, in the
+ * order the filesystem keeps them -- which is not sorted and is not promised to be stable. A file with
+ * none answers an empty list.
+ *
+ * **The list holds what this process may see**, not everything there is: Linux leaves out a
+ * `trusted.` attribute for a process without the privilege to read it, and macOS may hold names the
+ * system itself set (`com.apple.provenance`). A name that is not UTF-8 makes the whole call answer
+ * `InvalidUtf8` at the offset within that name, as `entries` does for a directory.
+ */
+list_xattrs(path: string) -> Result[Buf[string], IoError] = names_of(path, 1)
+
+/** `list_xattrs` about a symbolic link itself. */
+link_list_xattrs(path: string) -> Result[Buf[string], IoError] = names_of(path, 0)
+
+/** `ERANGE`, 34 on every platform: the answer has grown past the room it was given. */
+private const grew: int = -34
+
+/** `EINVAL`, 22 on every platform: what a name holding a zero byte is refused with. */
+private const invalid: int = 22
+
+private value_of(path: string, name: string, follow: int) -> Result[[]u8, IoError]
+    if !plain(name) then return Err(Other(invalid))
+
+    fetched((into, room, got) -> fsys.getxattr(as_ptr(path.bytes), path.bytes.len, as_ptr(name.bytes),
+                                               name.bytes.len, follow, into, room, got))
+end value_of
+
+private stored(path: string, name: string, value: []const u8, follow: int) -> Result[unit, IoError]
+    if !plain(name) then return Err(Other(invalid))
+
+    answered(fsys.setxattr(as_ptr(path.bytes), path.bytes.len, as_ptr(name.bytes), name.bytes.len,
+                           as_ptr(value), value.len, follow))
+end stored
+
+private removed(path: string, name: string, follow: int) -> Result[unit, IoError]
+    if !plain(name) then return Err(Other(invalid))
+
+    answered(fsys.removexattr(as_ptr(path.bytes), path.bytes.len, as_ptr(name.bytes), name.bytes.len,
+                              follow))
+end removed
+
+private names_of(path: string, follow: int) -> Result[Buf[string], IoError]
+    val all = fetched((into, room, got) -> fsys.listxattr(as_ptr(path.bytes), path.bytes.len, follow,
+                                                          into, room, got))?
+    var names: Buf[string] = buf()
+    var from: usize = 0
+
+    // Each name is followed by a zero byte, the last one too; a supplier that leaves the last one off
+    // still has its last name read.
+    for i in 0..<all.len
+        if all[i] == 0
+            if i > from then names.push(name_text(all[from..<i])?)
+            from = i + 1
+        end if
+
+    if from < all.len then names.push(name_text(all[from..])?)
+
+    Ok(names)
+end names_of
+
+/** Whether a name can be handed to C as the name it is: no zero byte inside it. */
+private plain(name: string) -> bool
+    for b in name.bytes do if b == 0 then return false
+
+    true
+end plain
+
+/** The answer of a hook that is asked its size with no room and then its bytes, asked again where it
+ * grew between the two. Module-wide so that the tests can hand it a supplier that races.
+ */
+private[fs] fetched(ask: (*u8, usize, *usize) -> int) -> Result[[]u8, IoError]
+    loop
+        var none: u8 = 0
+        var size: usize = 0
+        val sized = ask(&none, 0, &size)
+
+        if sized != 0 then return Err(from_status(sized))
+
+        var out: []u8 = [0; size]
+
+        if size == 0 then return Ok(out)
+
+        var got: usize = 0
+        val code = ask(&out[0], size, &got)
+
+        if code == grew then continue
+        if code != 0 then return Err(from_status(code))
+
+        // A value that shrank between the two asks is handed back at the length it now has; a count
+        // past the room is the supplier's mistake and is held to the room.
+        return Ok(out[0..<(if got > size then size else got)])
+end fetched
