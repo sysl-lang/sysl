@@ -111,8 +111,30 @@ refuse_copy(e: *Emit, ty: Type) =
 
 // Whether the parameter at `j` is a `(self)` receiver that reads: a copy that owns nothing (§ 3). A
 // `@consumes` member takes its receiver, and owns it as any parameter it is handed.
-reads_receiver(f: TFunc, j: usize) -> bool =
-    j == 0 && !f.params.is_empty() && f.params[0].0 == "self" && !f.marks.consumes
+//
+// **Every parameter of a struct's `invariant` clauses is one too** (`predicates.sysl`'s
+// `<Struct>$inv`): the check hands the clauses the fields of a value the struct still owns, so a
+// `@unique` field read there is read where it lies, and never dropped by the check.
+reads_receiver(e: *Emit, f: TFunc, j: usize) -> bool =
+    (j == 0 && !f.params.is_empty() && f.params[0].0 == "self" && !f.marks.consumes) || clause_function(e, f.name)
+
+// Whether a function is the one a struct's `invariant` clauses were made into (`<Struct>$inv`, of a
+// struct of the program, `Emit.clause_names`), or an instance of it (`<Struct>$inv.<arguments>`).
+private clause_function(e: *Emit, name: string) -> bool
+    val n = name.bytes.len
+    var from: usize = 0
+
+    loop
+        val found = name[from..<n].index_of("$inv")
+
+        if found.is_none() then return false
+
+        val end_at = from + found.unwrap() + 4
+
+        if (end_at == n || name.bytes[end_at] == u8('.')) && e.clause_names.has(name[0..<end_at]) then return true
+
+        from = end_at
+end clause_function
 
 // -- which locals may move ---------------------------------------------------------------------------
 
@@ -171,6 +193,7 @@ private note_read(e: *Emit, reads: &UniqueReads, x: TExpr) = *x.kind match
     TStore(place, _, _, _) -> reached_at(e, reads, place)
     TUpdate(place, _, _, _, _, _, _) -> reached_at(e, reads, place)
     TIncDec(place, _, _, _, _) -> reached_at(e, reads, place)
+    TRecheck(_, recv, _, _) -> reached_at(e, reads, recv)
     TMatch(scrutinee, _, _) -> reached_at(e, reads, scrutinee)
     _ -> ()
 

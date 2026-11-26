@@ -2603,7 +2603,9 @@ after
 
 - **A temporary is dropped at the end of its statement**, a value made only to be handed to a call
   among them.
-- **Assigning to a variable drops what it held**, at the assignment.
+- **Assigning to a variable drops what it held**, at the assignment. A write to a field of a struct
+  with an `invariant` drops it once the struct has been re-checked
+  ([errors](/reference/errors/#what-a-write-replaces-is-released-after-the-check)).
 - **Taking a value out of an enum, or binding it in a `match`, shares it** rather than moving it, and
   a closure holds what it captured until it is itself dropped; the value goes once, with the last share.
 - **Every way out of a block drops what it holds** — its end, a `return`, a `?`, a `break`, a

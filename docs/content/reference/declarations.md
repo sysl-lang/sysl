@@ -3961,7 +3961,8 @@ told apart by what follows it.
 A condition every value of the struct must satisfy, re-checked whenever the struct is built or one of
 its fields is written. Bare field names are in scope inside it. A multiple assignment re-checks it
 **once**, after every write has landed, which is what lets two fields that relate to each other be
-changed together.
+changed together. What a write replaces is released only after the check
+([errors](/reference/errors/#what-a-write-replaces-is-released-after-the-check)).
 
 `invariant` is a contextual word — an ordinary identifier everywhere else. See
 [errors and contracts](/reference/errors/) for what happens when one is broken.
