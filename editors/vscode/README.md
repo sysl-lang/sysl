@@ -13,7 +13,7 @@ the compiler's own diagnostics as you type, hover and go-to-definition.
 
 ## Install
 
-Download `sysl-<version>.vsix` from the [releases page](https://github.com/sysl-lang/vscode-extension/releases),
+Download `sysl-<version>.vsix` from the [releases page](https://github.com/sysl-lang/sysl/releases),
 then:
 
 ```
@@ -41,14 +41,11 @@ Tasks, a test explorer, debugging and Marketplace publishing. The language featu
 
 ## Grammar
 
-`syntaxes/sysl.tmLanguage.json` is a byte-identical copy of the compiler's
-`docs/grammars/sysl.tmLanguage.json` at sysl commit
-[`faf3b48a`](https://github.com/sysl-lang/sysl/commit/faf3b48a1a50cd8a3a184c8d6db00b876d2c37b0) —
-the grammar the documentation site renders with, and which a sysl release ships as
-`share/sysl/editors/sysl.tmLanguage.json`. A change to it is made there and copied here. It is
-tested against the language's lexical rules in
-[`sysl-lang/highlighter`](https://github.com/sysl-lang/highlighter) (`sysl_grammar_tests.sysl`):
-nested block comments, text blocks and their holes, number suffixes, `:=`, the contextual words.
+`syntaxes/sysl.tmLanguage.json` is a byte-identical copy of this repository's
+`docs/grammars/sysl.tmLanguage.json` — the grammar the documentation site renders with, and which a
+sysl release ships as `share/sysl/editors/sysl.tmLanguage.json`. A change to it is made there and
+copied here; the compiler's `tests_lit_grammar.sysl` fails if the two differ, and checks the
+grammar's keywords against the lexer's reserved and contextual words in both directions.
 
 ## Development
 

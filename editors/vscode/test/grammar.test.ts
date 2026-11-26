@@ -95,3 +95,12 @@ test("a keyword inside a string stays a string", async () => {
     assert.ok(scopes.includes("string.quoted.double.sysl"))
     assert.ok(!scopes.includes("keyword.control.sysl"))
 })
+
+test("errdefer is a keyword like defer", async () => {
+    assert.ok((await scopesOf("errdefer cleanup()", "errdefer")).includes("keyword.control.sysl"))
+    assert.ok((await scopesOf("defer cleanup()", "defer")).includes("keyword.control.sysl"))
+})
+
+test("a contextual word is a keyword where it reads as one", async () => {
+    assert.ok((await scopesOf("val x: some Shape = y", "some")).includes("keyword.other.sysl"))
+})
