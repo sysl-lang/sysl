@@ -1194,6 +1194,11 @@ panic aborts when the hook returns. **Whatever an override does, the program sti
 follows the call, so an override that only counts or logs and then returns stops the program where
 it was. On a freestanding target the default writes nothing and returns.
 
+**An allocation refused inside an export marked `@out_of_memory(value)` is no failure, and calls no
+hook**: the call is unwound back to the export, which answers the value
+([ffi](/reference/ffi/#an-export-that-answers-out-of-memory)). Only a refusal outside every such
+export reaches `sysl_trap`, as `out of memory`.
+
 **A shared library's `sysl_trap` is its own.** `sysl build-c --shared` offers the loader only the
 module's public exports, and the hook is part of the runtime each library carries, so it is not
 among them: a host's definition replaces the hook of a program or an archive it links, never the one

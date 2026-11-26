@@ -1,0 +1,754 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **An export that answers out of memory** (`reference/ffi.md § An export that answers out of
+// memory`, `oom_boundary.sysl`): an allocation refused anywhere inside an `@export` marked
+// `@out_of_memory(value)` unwinds every frame back to the export by returning -- deferred statements,
+// `errdefer`s and destructors running, everything owned given back -- and the C caller receives the
+// value. Found by TernDB (`docs/spec/c-api.md` § 14 item 12): its C API could not raise `C2001`.
+//
+// The axes, and the cell each assertion below names:
+// - what is refused: a box, a buffer's growth, a concatenation, an interpolation, a rendering that
+//   spills, a copy, a `Map`'s storage, `to_string` (the swept program refuses each in turn);
+// - where: in the export, in a callee, in a generic, through a trait object, through a closure, in
+//   the standard module's own bodies (`Map`, `to_string`);
+// - what the way out runs: `defer`, an `errdefer` (an unbinding one runs, a binding one is skipped),
+//   a destructor, a lock's `defer`'d release; and a second refusal while it runs, which traps;
+// - the value: a constant, a `@no_alloc` call over the parameters writing an out-parameter, an
+//   aggregate result returned through storage;
+// - who is outside a boundary: a direct sysl call, a thread started inside, a fiber started inside, a
+//   callback C makes from inside, an export C calls from inside that did not opt in -- each traps --
+//   and one that did, which answers its own value;
+// - the caller: sysl through an `extern` of the export's symbol, and a C program linking `build-c`'s
+//   archive;
+// - the build: hosted (a thread-local word), `thumb-freestanding` and `wasm32-freestanding` (a plain
+//   one), a build with no opted export (no trace of any of it in the module), the standard module's
+//   own key;
+// - where it may be written, and what the value may be (each refusal).
+//
+// **Two programs carry the run-time cells**, each built once and run once per cell with the cell's
+// name as its argument: a build against the manifest's heap builds the standard module for that heap
+// first, and a dozen tests each building their own would build it a dozen times at once.
+//
+// Cells skipped: an `async` body (outside the set by rule -- its way out is its task's, so a refusal
+// in one traps -- and LLVM may elide a task's frame, so the refusal cannot be placed on a call, as
+// `tests_fal_fallible_alloc.sysl` found); `wasm32-wasi` (its C needs the WASI SDK's sysroot, which a
+// machine may not have; the plain `wasm32` row checks the same lowering).
+
+private oom_ready() -> bool = std_root().is_ok() && clang_available()
+
+// The heap the projects below name: libc's pair underneath, the blocks live, and two ways to refuse
+// -- `refuse(k)` refuses the k-th allocation from now, once, and `fail_from_now()` refuses every one
+// until `heal()`. The C beside it calls a function pointer back, which is a callback C makes.
+private val oom_heap: string = raw"""
+    module theap
+
+    extern "malloc" c_malloc(n: usize) -> *u8
+    extern "free" c_free(p: *u8)
+
+    var live: int = 0
+    var countdown: int = 0
+    var refused: int = 0
+    var failing: bool = false
+
+    refuse(k: int)
+        countdown = k
+        refused = 0
+
+    fail_from_now()
+        failing = true
+
+    heal()
+        failing = false
+
+    @export("t_alloc")
+    t_alloc(n: usize, align: usize) -> *u8
+        if failing then return null
+
+        if countdown > 0
+            countdown -= 1
+
+            if countdown == 0
+                refused += 1
+                return null
+        end if
+
+        live += 1
+        c_malloc(n)
+    end t_alloc
+
+    @export("t_free")
+    t_free(p: *u8, n: usize, align: usize)
+        if p != null then live -= 1
+
+        c_free(p)
+    """
+
+private val oom_heap_c: string = raw"""
+    void oom_call_back(void (*f)(void)) { f(); }
+    """
+
+// A project naming `theap`'s pair, with `main` as its program, built once and run once for each of
+// `cells`: each run's status as the shell hears it, and its standard output, by cell.
+private oom_runs(main: string, cells: []const string) -> Buf[(string, int, string)]
+    val root = make_temp_dir("sysl-oom").unwrap()
+    val exe = s"$root/out"
+    var out: Buf[(string, int, string)] = buf()
+
+    write_text(s"$root/sysl.hocon", "package { name = \"oomp\", version = \"0.1.0\" }\n" +
+               "allocator { alloc = \"t_alloc\", free = \"t_free\" }\n").unwrap()
+    write_text(s"$root/main.sysl", main).unwrap()
+    make_dir_all(s"$root/theap").unwrap()
+    write_text(s"$root/theap/theap.sysl", oom_heap).unwrap()
+    write_text(s"$root/theap/callback.c", oom_heap_c).unwrap()
+
+    val (code, said, err) = clx_ran(["sysl", "build", root, "-o", exe])
+
+    use_allocator(("malloc", "free"))
+
+    for cell in cells
+        if code != 0 then out.push((cell, -1, s"build failed: $said$err"))
+        else capture(exe, [cell], "", [], true) match
+            Err(_) -> out.push((cell, -1, "did not run"))
+            Ok(o) -> out.push((cell, shell_status(o.status), o.text))
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end oom_runs
+
+// One cell's run held to its status and its whole output.
+private oom_expect(runs: Buf[(string, int, string)], cell: string, code: int, text: string)
+    for item in runs
+        if item.0 == cell
+            assert_eq(s"$cell: ${item.1}", s"$cell: $code", item.2)
+            assert_eq(s"$cell:\n${item.2}", s"$cell:\n$text")
+            return
+        end if
+
+    assert(false, s"no run of $cell")
+end oom_expect
+
+// What `sysl build` says of a single-file program, where it refuses it.
+private oom_refused(main: string) -> string
+    val root = make_temp_dir("sysl-oom-refused").unwrap()
+
+    write_text(s"$root/main.sysl", main).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build", s"$root/main.sysl", "-o", s"$root/out"])
+
+    remove_dir_all(root).unwrap_or(())
+    if code == 0 then "built" else s"$out$err"
+end oom_refused
+
+// -- the cells that answer ---------------------------------------------------------------------------------
+
+private val oom_answering: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.container.{Map, map}
+    import sysl.threads.Mutex
+    import theap.{fail_from_now, heal, live, refuse, refused}
+
+    // sweep: every allocation, refused in turn.
+    struct Node
+        v: int
+        name: string
+
+    trait Shape
+        area(self) -> int
+
+    struct Sq
+        s: int
+
+    impl Shape for Sq
+        area(self) -> int
+            val words = s"side ${self.s} of a square whose name is long enough to spill the scratch"
+
+            int(words.len) + self.s * self.s
+
+    first[T](xs: Buf[T]) -> T = xs[0]
+
+    build(n: int) -> Buf[&Node]
+        var b: Buf[&Node] = buf()
+
+        for i in 0..<n
+            b.push(Node(i, s"node-$i"))
+
+        b
+    end build
+
+    @export("work")
+    @out_of_memory(-1)
+    work(n: i32) -> i32
+        val nodes = build(int(n))
+        val joined = first(nodes).name + "/" + nodes[1].name
+        var m: Map[string, int] = map()
+
+        m.put(joined.copy(), 1)
+
+        val sh: &Shape = Sq(3)
+        val f = (x: int) -> x + int(nodes.len())
+        val text = (5).to_string()
+
+        i32(sh.area() + f(1) + int(text.len) + int(m.len()))
+    end work
+
+    extern "work" c_work(n: i32) -> i32
+
+    sweep()
+        val base = live
+
+        print("whole", c_work(4), live - base)
+
+        var k = 1
+
+        loop
+            refuse(k)
+
+            val r = c_work(4)
+
+            if refused == 0 then break
+            if r != -1 || live != base then print("refusal", k, "answered", r, "left", live - base)
+
+            k += 1
+
+        refuse(0)
+        print("refusals unwound:", k > 12, "left:", live - base)
+    end sweep
+
+    // order: what the way out runs, and in which order.
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self)
+            print("drop", self.name)
+
+    step(i: int) -> Result[int, string]
+        errdefer print("errdefer", i)
+        errdefer e -> print("bound", e)
+
+        val r: &Res = Res("step")
+
+        defer print("defer", i)
+        fail_from_now()
+
+        val s = s"value $i of a step"
+
+        Ok(int(s.len) + int(r.name.len))
+    end step
+
+    @export("ordered")
+    @out_of_memory(-7)
+    ordered() -> i32
+        val outer: &Res = Res("outer")
+
+        defer print("outer defer")
+
+        val k = step(1) match
+            Ok(n) -> n
+            Err(_) -> 0
+
+        print("never here", k)
+        i32(k)
+    end ordered
+
+    extern "ordered" c_ordered() -> i32
+
+    // lock: a lock taken inside is let go of.
+    var names: Mutex[Map[string, int]] = Mutex.new(map())
+
+    @export("note")
+    @out_of_memory(-1)
+    note(n: i32) -> i32
+        names.with((t) -> t.put(s"key $n", int(n)))
+        0
+
+    extern "note" c_note(n: i32) -> i32
+
+    // value: a @no_alloc call over the parameters, and an aggregate result.
+    struct Triple
+        a: i64
+        b: i64
+        c: i64
+
+    @no_alloc
+    failed(code: *i32) -> Triple
+        *code = 2001
+        Triple(-1, -2, -3)
+
+    @export("triple")
+    @out_of_memory(failed(code))
+    triple(code: *i32, n: i64) -> Triple
+        val s = s"$n"
+
+        Triple(n, i64(s.len), 0)
+
+    extern "triple" c_triple(code: *i32, n: i64) -> Triple
+
+    main(args: []string)
+        val cell = args[1]
+
+        if cell == "sweep" then sweep()
+
+        if cell == "order"
+            val r = c_ordered()
+
+            heal()
+            print("answered", r)
+        end if
+
+        if cell == "lock"
+            fail_from_now()
+
+            val r = c_note(1)
+
+            heal()
+            print(r, names.try_with((t) -> t.len()).is_some())
+            print(c_note(2), names.with((t) -> t.len()))
+        end if
+
+        if cell == "value"
+            var code: i32 = 0
+            val ok = c_triple(&code, 42)
+
+            print(ok.a, ok.b, ok.c, code)
+            fail_from_now()
+
+            val bad = c_triple(&code, 42)
+
+            heal()
+            print(bad.a, bad.b, bad.c, code)
+        end if
+    end main
+    """
+
+@test("every refusal inside an opted export unwinds to its value, running what the way out owes and freeing everything")
+oom_answering_cells()
+    if !oom_ready() then return
+
+    val runs = oom_runs(oom_answering, ["sweep", "order", "lock", "value"])
+
+    // Every allocation, refused in turn, answers the value and leaves nothing allocated.
+    oom_expect(runs, "sweep", 0, "whole 81 0\nrefusals unwound: true left: 0\n")
+
+    // Each defer, each unbinding errdefer and each destructor, in reverse; a binding errdefer skipped.
+    oom_expect(runs, "order", 0, "defer 1\ndrop step\nerrdefer 1\nouter defer\ndrop outer\nanswered -7\n")
+
+    // The lock is released on the way out, and the next call takes it.
+    oom_expect(runs, "lock", 0, "-1 true\n0 1\n")
+
+    // The value reads the parameters through a `@no_alloc` call; an aggregate crosses through storage.
+    oom_expect(runs, "value", 0, "42 2 0 0\n-1 -2 -3 2001\n")
+end oom_answering_cells
+
+// -- the cells that trap -------------------------------------------------------------------------------------
+
+private val oom_trapping: string = raw"""
+    import sysl.fiber.{Context, Stack, switch}
+    import sysl.threads.spawn
+    import theap.{fail_from_now, heal}
+
+    // direct: the export's function called from sysl, which is no boundary.
+    @export("named")
+    @out_of_memory(-1)
+    named(n: i32) -> i32 = i32((n * 7).to_string().len)
+
+    // cleanup: a refusal while the way out runs.
+    say(n: i32)
+        val m = (n * 1000).to_string()
+
+        print("deferred", m)
+
+    @export("messy")
+    @out_of_memory(-1)
+    messy(n: i32) -> i32
+        defer say(n)
+        fail_from_now()
+
+        val s = (99).to_string()
+
+        i32(s.len)
+    end messy
+
+    extern "messy" c_messy(n: i32) -> i32
+
+    // thread: a thread started inside.
+    var shared = 5
+
+    grow(p: *int)
+        fail_from_now()
+
+        val s = (*p * 11).to_string()
+
+        *p = int(s.len)
+
+    @export("threaded")
+    @out_of_memory(-1)
+    threaded() -> i32
+        val t = spawn(&grow, &shared).unwrap()
+
+        t.join()
+        i32(shared)
+
+    extern "threaded" c_threaded() -> i32
+
+    // fiber: a fiber started inside.
+    var home = Context.new()
+    var away = Context.new()
+    var unused = 6
+
+    @pinned(thread)
+    run(p: *int)
+        fail_from_now()
+
+        val s = (*p * 11).to_string()
+
+        print(s)
+
+        loop
+            switch(&away, &home)
+
+    @export("fibered")
+    @out_of_memory(-1)
+    @pinned(thread)
+    fibered() -> i32
+        val stack = Stack.reserve(64 * 1024).unwrap()
+
+        away = Context.start(stack, &run, &unused)
+        switch(&home, &away)
+        0
+
+    extern "fibered" c_fibered() -> i32
+
+    // callback: C calling back into sysl from inside.
+    extern "oom_call_back" call_back(f: *extern() -> unit)
+
+    called()
+        fail_from_now()
+        print((77).to_string())
+
+    @export("calling")
+    @out_of_memory(-1)
+    calling() -> i32
+        call_back(&called)
+        0
+
+    extern "calling" c_calling() -> i32
+
+    // nested: an export C calls from inside -- one that opted in, then one that did not.
+    @export("inner_opted")
+    @out_of_memory(-5)
+    inner_opted() -> i32
+        fail_from_now()
+        i32((12345).to_string().len)
+
+    @export("inner_plain")
+    inner_plain() -> i32
+        fail_from_now()
+        i32((12345).to_string().len)
+
+    extern "inner_opted" c_inner_opted() -> i32
+    extern "inner_plain" c_inner_plain() -> i32
+
+    @export("outer")
+    @out_of_memory(-9)
+    outer(plain: bool) -> i32
+        val a = c_inner_opted()
+
+        heal()
+        print("inner answered", a)
+
+        val t = s"after $a"
+
+        if plain then return c_inner_plain()
+
+        i32(t.len)
+    end outer
+
+    extern "outer" c_outer(plain: bool) -> i32
+
+    main(args: []string)
+        val cell = args[1]
+
+        print("before")
+
+        if cell == "direct"
+            print(named(3))
+            fail_from_now()
+            print(named(4))
+        end if
+
+        if cell == "cleanup" then print(c_messy(3))
+        if cell == "thread" then print(c_threaded())
+        if cell == "fiber" then print(c_fibered())
+        if cell == "callback" then print(c_calling())
+
+        if cell == "nested"
+            print(c_outer(false))
+            print(c_outer(true))
+        end if
+    end main
+    """
+
+@test("a refusal outside every boundary traps: a direct call, the way out, a thread, a fiber, a C callback, an unopted export")
+oom_trapping_cells()
+    if !oom_ready() then return
+
+    val runs = oom_runs(oom_trapping, ["direct", "cleanup", "thread", "fiber", "callback", "nested"])
+
+    // The function called from sysl rather than through its export is outside the boundary.
+    oom_expect(runs, "direct", 133, "before\n2\n")
+
+    // An allocation refused while the way out runs.
+    oom_expect(runs, "cleanup", 133, "before\n")
+
+    // A thread started inside the export begins outside the boundary.
+    oom_expect(runs, "thread", 133, "before\n")
+
+    // So does a fiber started inside it.
+    oom_expect(runs, "fiber", 133, "before\n")
+
+    // And a sysl function C calls back from inside it.
+    oom_expect(runs, "callback", 133, "before\n")
+
+    // An opted export C calls from inside answers its own value; one that did not opt in traps.
+    oom_expect(runs, "nested", 133, "before\ninner answered -5\n8\ninner answered -5\n")
+end oom_trapping_cells
+
+// -- a C caller ---------------------------------------------------------------------------------------------
+
+@test("a C program linking the archive gets the value from a capped heap, and the next call succeeds")
+oom_c_caller()
+    if !oom_ready() then return
+
+    val root = make_temp_dir("sysl-oom-c").unwrap()
+    val pkg = s"$root/pkg"
+
+    make_dir_all(pkg).unwrap()
+    write_text(s"$pkg/sysl.hocon", "package { name = \"pkg\" }\n\nallocator { alloc = \"cap_alloc\", free = \"cap_free\" }\n").unwrap()
+    write_text(s"$pkg/main.sysl", raw"""
+        struct Node
+            v: int
+
+        impl Drop for Node
+            drop(self)
+                print("dropped", self.v)
+
+        @export("probe_open")
+        @out_of_memory(-2001)
+        probe_open(n: i32) -> i32
+            val held: &Node = Node(7)
+
+            defer print("deferred")
+
+            val t = s"name-$n".copy()
+
+            i32(t.len) + i32(held.v)
+        """).unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", pkg, "-o", s"$root/pkg.a"])
+
+    assert_eq(code, Fine, s"$out$err")
+    write_text(s"$root/main.c", raw"""
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        static int budget = 0;
+        static int live = 0;
+
+        void *cap_alloc(size_t n, size_t align) {
+            if (budget-- <= 0) return NULL;
+            live++;
+            return malloc(n);
+        }
+        void cap_free(void *p, size_t n, size_t align) { live--; free(p); }
+
+        int probe_open(int n);
+
+        int main(void) {
+            int r = probe_open(42);
+            fflush(stdout);
+            printf("refused %d live %d\n", r, live);
+            budget = 100;
+            r = probe_open(42);
+            fflush(stdout);
+            printf("granted %d live %d\n", r, live);
+            return 0;
+        }
+        """).unwrap()
+
+    val linked = capture("clang", [s"$root/main.c", s"$root/pkg.a", "-lm", "-o", s"$root/app"], "", [], true)
+
+    assert(linked.is_ok() && linked.unwrap().status.ok(), "the link failed")
+
+    val ran = capture(s"$root/app", [], "", [], true).unwrap()
+
+    assert_eq(ran.text, "deferred\ndropped 7\nrefused -2001 live 0\ndeferred\ndropped 7\ngranted 14 live 0\n")
+    remove_dir_all(root).unwrap_or(())
+end oom_c_caller
+
+// -- the builds ------------------------------------------------------------------------------------------------
+
+private oom_archive_ir(target: string, opted: bool) -> (int, string, string)
+    val root = make_temp_dir("sysl-oom-ir").unwrap()
+    val pkg = s"$root/pkg"
+    val mark = if opted then "@out_of_memory(-1)\n" else ""
+
+    make_dir_all(pkg).unwrap()
+    write_text(s"$pkg/sysl.hocon", "package { name = \"pkg\" }\n\nallocator { alloc = \"k_alloc\", free = \"k_free\" }\n").unwrap()
+    write_text(s"$pkg/main.sysl",
+        "import sysl.buf.{Buf, buf}\n\n" +
+        "extern \"k_note\" note(n: i32)\n\n" +
+        "@export(\"k_alloc\")\nk_alloc(n: usize, align: usize) -> *u8 = null\n\n" +
+        "@export(\"k_free\")\nk_free(p: *u8, n: usize, align: usize) = ()\n\n" +
+        "struct Node\n    v: int\n\n" +
+        "@export(\"k_work\")\n" + mark + "k_work(n: i32) -> i32\n" +
+        "    var b: Buf[&Node] = buf()\n\n" +
+        "    defer note(n)\n" +
+        "    b.push(Node(int(n)))\n" +
+        "    note(n)\n" +
+        "    i32(b.len())\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "build-c", pkg, "--target", target, "-o", s"$root/pkg.a",
+                                    "--emit-llvm", s"$root/out.ll"])
+    val text = read_text(s"$root/out.ll").unwrap_or("")
+    val archived = is_file(s"$root/pkg.a")
+
+    remove_dir_all(root).unwrap_or(())
+    (if code == 0 && archived then 0 else 1, text, s"$out$err")
+end oom_archive_ir
+
+// The word declared as plain storage: `external`, whatever linkage words follow, and not thread-local.
+private oom_plain_word(text: string) -> bool
+    for line in text.split("\n")
+        if line.starts_with("@sysl_oom_state = external") && !line.contains("thread_local") then return true
+
+    false
+end oom_plain_word
+
+@test("a hosted build keeps the state word per thread and hides the count across a call to C")
+oom_hosted_word_is_thread_local()
+    if !oom_ready() then return
+
+    val (code, text, said) = oom_archive_ir("aarch64-macos", true)
+
+    assert_eq(code, 0, said)
+    assert(text.contains("@sysl_oom_state = external thread_local global i32"), "no thread-local word")
+    assert(text.contains("oom.unwind"), "no test after a call")
+    assert(text.contains("oom.refused"), "no refused arm")
+    assert(text.contains("store i32 0, ptr"), "the count is not hidden across the call to C")
+end oom_hosted_word_is_thread_local
+
+@test("a thumb-freestanding build keeps one plain word for the image, and builds")
+oom_thumb_word_is_plain()
+    if !oom_ready() then return
+
+    val (code, text, said) = oom_archive_ir("thumb-freestanding", true)
+
+    assert_eq(code, 0, said)
+    assert(oom_plain_word(text), "no plain word")
+    assert(!text.contains("thread_local"), "a thread-local word on a bare board")
+    assert(text.contains("oom.unwind"), "no test after a call")
+end oom_thumb_word_is_plain
+
+@test("a wasm32-freestanding build keeps one plain word, and builds")
+oom_wasm_word_is_plain()
+    if !oom_ready() then return
+
+    val (code, text, said) = oom_archive_ir("wasm32-freestanding", true)
+
+    assert_eq(code, 0, said)
+    assert(oom_plain_word(text), "no plain word")
+    assert(text.contains("oom.unwind"), "no test after a call")
+end oom_wasm_word_is_plain
+
+@test("a build with no opted export lowers nothing of it: no word, no test, no hidden count")
+oom_unopted_build_untouched()
+    if !oom_ready() then return
+
+    for target in ["aarch64-macos", "thumb-freestanding"]
+        val (code, text, said) = oom_archive_ir(target, false)
+
+        assert_eq(code, 0, said)
+        assert(!text.contains("sysl_oom_state"), s"$target: the word is named")
+
+        for mark in ["oom.unwind", "oom.refused", "oom.got", "sysl.oom.refuse", "oom.answer"]
+            assert(!text.contains(mark), s"$target: $mark")
+end oom_unopted_build_untouched
+
+@test("the standard module a program with an opted export links is keyed apart")
+oom_std_keyed_apart()
+    want_oom_std(false)
+
+    val plain = std_artifact_path(host_target(), "fp")
+
+    want_oom_std(true)
+
+    val unwinding = std_artifact_path(host_target(), "fp")
+
+    want_oom_std(false)
+    assert(!plain.contains("-oom/"), plain)
+    assert(unwinding.contains("-oom/"), unwinding)
+end oom_std_keyed_apart
+
+// -- where it may be written ----------------------------------------------------------------------------------
+
+@test("beside a function that is not an export, it is refused")
+oom_refused_off_an_export()
+    if !oom_ready() then return
+
+    val said = oom_refused("@out_of_memory(-1)\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(said.contains("'@out_of_memory' says what an export answers its C caller"), said)
+end oom_refused_off_an_export
+
+@test("beside an export with no result, it is refused")
+oom_refused_without_a_result()
+    if !oom_ready() then return
+
+    val said = oom_refused("@export(\"f\")\n@out_of_memory(-1)\nf()\n    print(1)\n\nf()\n")
+
+    assert(said.contains("writes no result to put it in"), said)
+end oom_refused_without_a_result
+
+@test("with no value, it is refused")
+oom_refused_bare()
+    if !oom_ready() then return
+
+    val said = oom_refused("@export(\"f\")\n@out_of_memory\nf() -> int = 1\n\nprint(f())\n")
+
+    assert(said.contains("names the value the export answers in parentheses"), said)
+end oom_refused_bare
+
+@test("a value that allocates is refused, since there is no memory left to make it with")
+oom_refused_allocating_value()
+    if !oom_ready() then return
+
+    val said = oom_refused("@export(\"f\")\n@out_of_memory(i32((5).to_string().len))\nf() -> i32 = 1\n\nprint(f())\n")
+
+    assert(said.contains("'f''s '@out_of_memory' value is answered when an allocation has just been refused"), said)
+end oom_refused_allocating_value
+
+@test("a value of another type than the result is refused")
+oom_refused_wrong_type()
+    if !oom_ready() then return
+
+    val said = oom_refused("@export(\"f\")\n@out_of_memory(\"no\")\nf() -> i32 = 1\n\nprint(f())\n")
+
+    assert(said != "built", said)
+    assert(said.contains("string"), said)
+end oom_refused_wrong_type
+
+@test("above an extern, it is refused")
+oom_refused_on_an_extern()
+    if !oom_ready() then return
+
+    val said = oom_refused("@out_of_memory(-1)\nextern f() -> int\n\nprint(f())\n")
+
+    assert(said != "built", said)
+end oom_refused_on_an_extern

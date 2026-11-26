@@ -476,6 +476,7 @@ parse_attribute(p: *Parser) -> Option[Attr]
     // declaration could name.
     if word == "track_caller" then return no_inlining_args(p, TrackCaller, "the location it hands on is the line of each call, which the call supplies")
     if word == "frame_limit" then return parse_frame_limit_attr(p)
+    if word == "out_of_memory" then return Some(parse_out_of_memory_attr(p, at))
     if word == "annotation" then return no_inlining_args(p, AnnotationMark, "what a use of the annotation says is written where it is used, as the values of the struct's fields")
     if word == "renamed" || word == "removed" then return parse_gone_attr(p, at, word)
 
@@ -809,6 +810,21 @@ private parse_align_attr(p: *Parser) -> Attr
     p.expect_kw(")")
     Align(bound)
 end parse_align_attr
+
+// `@out_of_memory(value)` -- what an export answers its C caller where an allocation inside the call
+// is refused (`oom_boundary.sysl`). The value is an expression over the export's parameters, read as
+// any other.
+private parse_out_of_memory_attr(p: *Parser, at: Span) -> Attr
+    if !p.accept_kw("(")
+        p.fault(p.here(), "'@out_of_memory' names the value the export answers in parentheses — '@out_of_memory(-1)', or a call of a '@no_alloc' function over the export's parameters. There is no bare form: a C caller reads the failure out of the result, so the result has to be said")
+        return OutOfMemory(expr(p.here(), Bad), at)
+    end if
+
+    val value = parse_expr(p)
+
+    p.expect_kw(")")
+    OutOfMemory(value, at.to(p.just_taken()))
+end parse_out_of_memory_attr
 
 // `@byte_order(big)` or `@byte_order(little)` -- the order a struct's integer fields keep their bytes
 // in. The word is read as a word rather than as an expression: it names one of two orders, and
@@ -1200,6 +1216,7 @@ apply_func_attrs(f: *FuncDecl, attrs: Buf[Attr])
                 None -> f.marks.frame_exempt = true
             Scoped(ns) -> f.marks.scoped = ns
             Bounded(ns) -> f.marks.bounded = ns
+            OutOfMemory(v, _) -> f.marks.out_of_memory = Some(v)
             _ -> ()
 end apply_func_attrs
 

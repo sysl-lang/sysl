@@ -18,6 +18,7 @@ has a name and a spelling of its own:
 | `@needs(...)` | an **annotation** — the capabilities reaching the declaration under it requires; with `@abandons` and `@keeps`, one of the three an `extern` takes | the grammar |
 | `@packed`, `@align(n)`, `@section("...")` | an **annotation** — where the declaration under it is laid out, or where it lands | the grammar |
 | `@export("...", weak)`, `@export(weak)` on a function | an **annotation** — the export is a default a strong definition of the symbol replaces at the link; see [a weak export](/reference/ffi/#a-weak-export) | the grammar |
+| `@out_of_memory(value)` beside an `@export` | an **annotation** — what the export answers its C caller where an allocation inside the call is refused, in place of a trap; see [an export that answers out of memory](/reference/ffi/#an-export-that-answers-out-of-memory) | the grammar, then the analyzer |
 | `@export("...")` on a `struct` | an **annotation** — the name the type carries in a generated C header | the grammar |
 | `@renamed("...", "...")`, `@removed("...", "...")` | an **annotation** — the declaration under it is a tombstone, a name that is gone; see [`@renamed` and `@removed`](#renamed-and-removed-a-name-that-is-gone-and-what-became-of-it) | the grammar |
 | `@export("...")` on a module `var` or `val` | an **annotation** — the C symbol the storage is published under | the grammar |
