@@ -104,6 +104,15 @@ private align_attrs(align: int) -> Buf[IrAttr]
     out
 end align_attrs
 
+// One call C receives. Inside a body that unwinds a refused allocation the boundary count is hidden
+// for its length (`oom_boundary.sysl`): what C calls back starts outside every boundary.
+private emit_c_call(e: *Emit, call: Inst)
+    val saved = oom_hide(e, call)
+
+    emit(e, call)
+    oom_unhide(e, saved)
+end emit_c_call
+
 // Lowers a call to a foreign function. `what` is what the `call` names between the keyword and the
 // callee -- the result type, or the callee's whole function type where it is variadic. `abandons`
 // is a callee declared `@abandons`, before which the frame gives back what it holds. `kept` flags the
@@ -161,14 +170,14 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
     // to read back: the call is made in C's shape and the value is the type's only one.
     if zero_sized(ty) && c_hollow(e.layout, ty, e.target).is_some()
         result match
-            CrCoerced(_) -> emit(e, form_call(what, Some(fresh_reg(e)), callee, arguments, twice))
-            _ -> emit(e, form_call(what, None, callee, arguments, twice))
+            CrCoerced(_) -> emit_c_call(e, form_call(what,Some(fresh_reg(e)), callee, arguments, twice))
+            _ -> emit_c_call(e, form_call(what,None, callee, arguments, twice))
 
         return zero_of(e, ty)
 
     result match
         CrSret(coerced, _) ->
-            emit(e, form_call(what, None, callee, arguments, twice))
+            emit_c_call(e, form_call(what,None, callee, arguments, twice))
 
             val r = fresh_reg(e)
 
@@ -178,7 +187,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
         CrCoerced(coerced) ->
             val r = fresh_reg(e)
 
-            emit(e, form_call(what, Some(r), callee, arguments, twice))
+            emit_c_call(e, form_call(what,Some(r), callee, arguments, twice))
 
             // A homogeneous floating aggregate comes back under its own type, so there is nothing to
             // reinterpret and the round trip through memory would be a copy for its own sake.
@@ -190,7 +199,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
             if no_value(ty)
                 if abandons then release_all(e)
 
-                emit(e, form_call(what, None, callee, arguments, twice))
+                emit_c_call(e, form_call(what,None, callee, arguments, twice))
 
                 if ty == Never then emit_term(e, InUnreachable)
 
@@ -198,7 +207,7 @@ gen_foreign_call(e: *Emit, what: CallForm, callee: Val, args: Buf[TExpr], ty: Ty
             else
                 val r = fresh_reg(e)
 
-                emit(e, form_call(what, Some(r), callee, arguments, twice))
+                emit_c_call(e, form_call(what,Some(r), callee, arguments, twice))
                 own_temp(e, from_c(e, r, ty), ty)
 end gen_foreign_call
 

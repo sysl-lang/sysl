@@ -1,0 +1,675 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+
+// **An exported alias and a measured `c type` are their base under a second name** (`reference/ffi.md
+// § Naming a type in the header`, `§ c type`): a sysl caller is unaffected, and the name flows to and
+// from its base with no conversion. Both used to reach every analysis as a name-only constrained type,
+// and every `match` on a type that did not see through it treated the name differently from what it
+// names -- a float alias had no `sqrt`, a `bool` alias's two literal arms were not exhaustive, a `for`
+// over two integer-alias bounds was refused, an `impl` for the one was not found on the other, and a
+// function returning the address of a local through a pointer alias slipped past the escape check.
+// Resolution now hands analysis the base itself, and only the header re-reads the name.
+//
+// **Every cell runs one body twice**: once under exported names (or a `c type` block), and once under
+// the same names declared as plain aliases -- the base itself, spelled the same way -- and the two must
+// say the same thing, which is the claim. The last cells hold the header to still spelling each name.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private xal_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end xal_ready
+
+// The names every cell builds on, exported.
+private xal_exported() -> string = raw"""
+    @export("xal_n")
+    type N = i32
+
+    @export("xal_u")
+    type U = u8
+
+    @export("xal_sz")
+    type Sz = usize
+
+    @export("xal_f")
+    type F = f64
+
+    @export("xal_g")
+    type G = f32
+
+    @export("xal_c")
+    type C = char
+
+    @export("xal_flag")
+    type Flag = bool
+
+    @export("xal_data")
+    type Data = *u8
+
+    @export("xal_ip")
+    type IP = *i32
+
+    @export("xal_cb")
+    type Cb = *extern(i32) -> i32
+
+    @export("xal_reg")
+    type Reg = *volatile u32
+
+    """ + xal_shared()
+
+// The same names as plain aliases: each IS its base, which is the control every cell is held to.
+private xal_plain() -> string = raw"""
+    type N = i32
+    type U = u8
+    type Sz = usize
+    type F = f64
+    type G = f32
+    type C = char
+    type Flag = bool
+    type Data = *u8
+    type IP = *i32
+    type Cb = *extern(i32) -> i32
+    type Reg = *volatile u32
+
+    """ + xal_shared()
+
+private xal_shared() -> string = raw"""
+    @export("xal_pt")
+    struct Pt
+        x: i32
+        y: i32
+
+    type PtRef = *Pt
+
+    @export("xal_twice")
+    twice(n: i32) -> i32 = n * 2
+
+    """
+
+// One program built with `sysl build`'s own path and run: its status and what it printed.
+private xal_run(text: string) -> (bool, string)
+    val root = make_temp_dir("sysl-xal-").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    val result = built match
+        Err(why) -> (false, failure_text(why))
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> (false, "the program that was built could not be run")
+            Ok(out) -> (xal_exited_zero(out.status), out.text)
+
+    remove_dir_all(root).unwrap_or(())
+    result
+end xal_run
+
+private xal_exited_zero(s: Status) -> bool = s match
+    Exited(code) -> code == 0
+    _ -> false
+
+// `body` under both sets of names prints `expected`, and exits normally.
+private xal_same(body: string, expected: string)
+    if !xal_ready() then return
+
+    val exported = xal_run(xal_exported() + body)
+    val plain = xal_run(xal_plain() + body)
+
+    assert(plain.0, s"the plain control failed: ${plain.1}")
+    assert_eq(plain.1, expected)
+    assert(exported.0, s"under exported names: ${exported.1}")
+    assert_eq(exported.1, expected)
+end xal_same
+
+// `body` under both sets of names is refused, each saying `message`.
+private xal_both_refused(body: string, message: string)
+    if !xal_ready() then return
+
+    for prelude in [xal_exported(), xal_plain()]
+        val root = make_temp_dir("sysl-xal-").unwrap()
+        val src = s"$root/main.sysl"
+
+        make_dir_all(root).unwrap()
+        write_text(src, prelude + body).unwrap()
+
+        val said = emit_llvm_text(src, None) match
+            Err(why) -> failure_text(why)
+            Ok(made) -> analysis_report(made.report)
+
+        remove_dir_all(root).unwrap_or(())
+        assert(said.contains(message), said)
+    end for
+end xal_both_refused
+
+// -- integers -------------------------------------------------------------------------------------
+
+@test("an exported integer alias does every operation its base does, indexes, counts and matches")
+xal_integer()
+    xal_same(raw"""
+        import sysl.buf.{Buf, buf}
+
+        take(n: N) -> N = n + 1
+
+        gen[T](x: T) -> T = x
+
+        main()
+            var n: N = 5
+            val m: N = 7
+            print(n + m, n - m, n * m, m / n, m % n)
+            print(n < m, n <= m, n > m, n >= m, n == m, n != m)
+            print(n & m, n | m, n ^ m, n << 2, m >> 1, ~n, -n)
+            n += 3
+            n -= 1
+            n *= 2
+            n <<= 1
+            n |= 1
+            print(n)
+            print(n +% m, n *% m)
+            val arr = [10, 20, 30, 40]
+            val i: Sz = 2
+            print(arr[i])
+            var b = buf[i32]()
+            b.push(1)
+            b.push(2)
+            print(b[i - 1])
+            for k in 0..<m
+                if k == 2 then print(k)
+            print(i64(n), f64(m), u8(m))
+            print(N(3), take(4), gen(n))
+            print(m match
+                7 -> "seven"
+                _ -> "other")
+            print(n match
+                0..10 -> "low"
+                _ -> "high")
+            val c: U = u8('a')
+            print(c == u8('a'), c + 1)
+            print(s"interp $n ${m}")
+            print(n.abs(), m.min(n), m.to_string())
+        """, "12 -2 35 1 2\ntrue true false false false true\n5 7 2 20 3 -6 -5\n29\n36 203\n30\n2\n2\n" +
+        "29 7 7\n3 5 29\nseven\nhigh\ntrue 98\ninterp 29 7\n29 7 7\n")
+
+@test("two integer-alias bounds make a counted 'for', a range value, a slice and a zero 'var'")
+xal_ranges()
+    xal_same(raw"""
+        main()
+            val lo: N = 1
+            val hi: N = 4
+            var s = 0
+            for k in lo..<hi
+                s += k
+            print(s)
+            var t = 0
+            for k in lo..hi
+                t += k
+            print(t)
+            val text = "hello world"
+            val a: Sz = 2
+            val b: Sz = 5
+            print(text[a..<b])
+            var z: N
+            var p: Data
+            print(z, p == null)
+        """, "6\n10\nllo\n0 true\n")
+
+@test("a literal that does not fit an integer alias is refused as it is for the base")
+xal_literal_refused()
+    xal_both_refused(raw"""
+        main()
+            val a: U = 300
+            print(a)
+        """, "the literal 300 does not fit U (aka byte)")
+
+// `text` built as a debug build and run: its status, its standard output and its standard error.
+private xal_run_debug(text: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-xal-").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = ["--debug"]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, DefaultOptimization, Some(exe))
+
+    reset_search_paths()
+
+    val result = built match
+        Err(why) -> (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> capture(exe, [], "", [], true) match
+            Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+            Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+
+    remove_dir_all(root).unwrap_or(())
+    result
+end xal_run_debug
+
+@test("arithmetic on an integer alias traps on overflow in a debug build, as its base does")
+xal_overflow_traps()
+    if !xal_ready() then return
+
+    for prelude in [xal_exported(), xal_plain()]
+        val (state, printed, err) = xal_run_debug(prelude + raw"""
+            bump(u: U) -> U = u + 1
+
+            main()
+                print(bump(254))
+                print(bump(255))
+            """)
+
+        assert(state == Status.Signalled(5), s"stopped with $state, having printed '$printed': $err")
+        assert_eq(printed, "255\n")
+        assert(err.starts_with("integer overflow: "), err)
+    end for
+end xal_overflow_traps
+
+// -- floats, `char`, `bool` -----------------------------------------------------------------------
+
+@test("an exported float, char and bool alias compute, convert, interpolate and match as their bases")
+xal_float_char_bool()
+    xal_same(raw"""
+        half(x: F) -> F = x / 2.0
+
+        main()
+            var x: F = 1.5
+            val y: F = 2
+            print(x + y, x - y, x * y, y / x, -x)
+            print(x < y, x == y, x != y)
+            x += 0.5
+            x *= 2.0
+            print(x, half(3.0), F(4), i32(y), f32(x))
+            val g: G = 1.25
+            print(g * 2.0)
+            print(s"$x and ${y} $g")
+            print(if x > 1.0 then x else y)
+            val ch: C = 'z'
+            print(ch, ch == 'z', ch < 'a', u32(ch))
+            print(ch match
+                'z' -> "zed"
+                _ -> "other")
+            val f: Flag = true
+            assert(f)
+            val nf: Flag = !f
+            print(nf, f && nf, f || nf, s"$f", f.to_string())
+        """, "3.5 -0.5 3 1.3333333333333333 -1.5\ntrue false true\n4 1.5 4 2 4\n2.5\n" +
+        "4 and 2 1.25\n4\nz true false 122\nzed\nfalse false true true true\n")
+
+@test("an alias receiver finds its base's methods, and an impl for either name serves both")
+xal_methods()
+    xal_same(raw"""
+        import sysl.math.Float
+
+        trait Shout
+            shout(self) -> string
+
+        impl Shout for i32
+            shout(self) -> string = s"i32 $self!"
+
+        impl Shout for real
+            shout(self) -> string = s"real $self!"
+
+        trait Tag
+            tag(self) -> string
+
+        impl Tag for N
+            tag(self) -> string = s"tagged $self"
+
+        root[T: Float](x: T) -> T = x.sqrt()
+
+        show_tag[T: Tag](x: T) -> string = x.tag()
+
+        main()
+            val x: F = 2.25
+            val g: G = 6.25
+            print(x.sqrt(), g.sqrt(), x.floor(), x.abs())
+            print(root(x), root(g))
+            val n: N = 4
+            print(n.shout(), x.shout())
+            val plain: i32 = 6
+            print(n.tag(), plain.tag(), show_tag(n), show_tag(plain))
+            val ch: C = 'q'
+            print(ch.is_digit(), x.to_string(), ch.to_string())
+        """, "1.5 2.5 2 2.25\n1.5 2.5\ni32 4! real 2.25!\ntagged 4 tagged 6 tagged 4 tagged 6\n" +
+        "false 2.25 q\n")
+
+@test("an impl for an exported alias beside one for its base is one type implemented twice")
+xal_impl_twice_refused()
+    xal_both_refused(raw"""
+        trait Tag
+            tag(self) -> string
+
+        impl Tag for N
+            tag(self) -> string = "alias"
+
+        impl Tag for i32
+            tag(self) -> string = "base"
+
+        main() = print(i32(1).tag())
+        """, "'int' already implements 'Tag'")
+
+@test("a match over an exported bool or byte alias is exhaustive where its base's would be")
+xal_exhaustive()
+    xal_same(raw"""
+        main()
+            val f: Flag = true
+            print(f match
+                true -> "yes"
+                false -> "no")
+            val o: Option[Flag] = Some(false)
+            print(o match
+                Some(true) -> "st"
+                Some(false) -> "sf"
+                None -> "none")
+            val pair: (Flag, Flag) = (true, false)
+            print(pair match
+                (true, _) -> "t_"
+                (false, _) -> "f_")
+            val u: U = 200
+            print(u match
+                0..<128 -> "low"
+                128..255 -> "high")
+            val ch: C = 'm'
+            print(ch match
+                'a'..'z' -> "lower"
+                _ -> "other")
+            if f is true then print("is-true")
+        """, "yes\nsf\nt_\nhigh\nlower\nis-true\n")
+
+// -- pointers -------------------------------------------------------------------------------------
+
+@test("an exported pointer alias indexes, writes through, compares, converts and calls as its base")
+xal_pointer()
+    xal_same(raw"""
+        import sysl.raw.ptr_cast
+
+        apply(f: Cb, n: i32) -> i32 = f(n)
+
+        main()
+            var a = [1, 2, 3, 4]
+            var p: IP = &a[0]
+            print(p[1], *p)
+            p[2] = 30
+            *p = 10
+            p[3] += 5
+            print(a[0], a[2], a[3])
+            val d: Data = ptr_cast(p)
+            print(d[0])
+            var pt = Pt(1, 2)
+            val r: PtRef = &pt
+            r.x = 5
+            r.y += 1
+            print(pt.x, r.y, (*r).x)
+            val f: Cb = &twice
+            print(f(3), apply(f, 4), apply(&twice, 5))
+            val fs = [f, f]
+            print(fs[0](7))
+            val o: Option[Cb] = Some(f)
+            o match
+                Some(h) -> print(h(8))
+                None -> ()
+            val pp: *IP = &p
+            print((*pp)[1])
+            val z: IP = null
+            print(z == null, p == null)
+            val v: *u8 = d
+            val d2: Data = v
+            print(d2 == d, sizeof(Option[IP]) == sizeof(Option[*i32]))
+            var cell: u32 = 3
+            val reg: Reg = ptr_cast(&cell)
+            *reg = 9
+            print(*reg, cell)
+        """, "2 1\n10 30 9\n10\n5 3 5\n6 8 10\n14\n16\n2\ntrue false\ntrue true\n9 9\n")
+
+@test("the address of a local returned through an exported pointer alias is refused")
+xal_dangle_refused()
+    xal_both_refused(raw"""
+        dangle() -> IP
+            var x: i32 = 5
+            &x
+
+        main() = print(*dangle())
+        """, "the address of 'x' is returned, but 'x' is a local of this function")
+
+// -- storage, C calls, and the rest ---------------------------------------------------------------
+
+@test("exported aliases in consts, module storage, fields, array lengths and sizeof")
+xal_module_storage()
+    xal_same(raw"""
+        const K: Sz = 4
+        const sq(x: N) -> N = x * x
+        val ARR: [K]i32 = [1, 2, 3, 4]
+        val HALF: F = 0.5
+        val ON: Flag = true
+        val NOWHERE: Data = null
+        val NOFN: Cb = null
+        val SQ: N = sq(5)
+        var count: N = 3
+
+        struct Cfg
+            n: N
+            f: F
+            on: Flag
+
+        main()
+            print(ARR.len, HALF, ON, NOWHERE == null, NOFN == null, SQ, count)
+            count += 1
+            print(count)
+            val c = Cfg(7, 1.5, false)
+            print(c.n, c.f, c.on)
+            val arr2: [sq(2)]u8 = [0, 0, 0, 0]
+            print(arr2.len)
+            print(sizeof(N), sizeof(F), sizeof(Flag), sizeof(Data))
+        """, "4 0.5 true true true 25 3\n4\n7 1.5 false\n4\n4 8 1 8\n")
+
+@test("exported aliases cross to C as their bases: libm, a struct of two, and printf's promotions")
+xal_c_calls()
+    xal_same(raw"""
+        struct Cx
+            re: F
+            im: F
+
+        struct Cf
+            re: G
+            im: G
+
+        extern sqrt(x: F) -> F
+        extern sqrtf(x: G) -> G
+        extern abs(x: N) -> N
+        extern cabs(z: Cx) -> F
+        extern cabsf(z: Cf) -> G
+        extern printf(fmt: *u8, ...) -> i32
+
+        main()
+            print(sqrt(2.25), sqrtf(6.25), abs(-3))
+            print(cabs(Cx(3.0, 4.0)), cabsf(Cf(6.0, 8.0)))
+            val g: G = 1.5
+            val u: U = 200
+            val n: N = -9
+            printf(c"%f %d %d %f\n", g, u, n, F(2.5))
+        """, "1.5 2.5 3\n5 10\n1.500000 200 -9 2.500000\n")
+
+@test("exported aliases in atomics, generics, closures, results, loops, options and defer")
+xal_more()
+    xal_same(raw"""
+        import sysl.sync.*
+        import sysl.buf.{Buf, buf}
+
+        sum[T: Add](xs: Buf[T], zero: T) -> T
+            var acc = zero
+            for x in xs
+                acc = acc + x
+            acc
+        end sum
+
+        main()
+            var a = Atomic[N](5)
+            a.store(7, Relaxed)
+            print(a.load(Relaxed))
+            var fl = Atomic[Flag](false)
+            fl.store(true, Relaxed)
+            print(fl.load(Relaxed))
+            var xs: Buf[F] = buf()
+            xs.push(1.5)
+            xs.push(2.0)
+            print(sum(xs, 0.0))
+            val n: N = 4
+            val add = (x: N) -> x + n
+            print(add(3))
+            val res: Result[N, string] = Ok(3)
+            res match
+                Ok(v) -> print(v + 1)
+                Err(e) -> print(e)
+            val on: Flag = n > 3
+            var cnt: N = 0
+            while cnt < 3
+                cnt += 1
+            print(on, cnt)
+            val maybe: Option[Data] = None
+            if maybe is None then print("none")
+            val flags: [3]Flag = [true, false, true]
+            var k = 0
+            for f in flags
+                if f then k += 1
+            print(k, n == 4 && on)
+            defer print("bye")
+        """, "7\ntrue\n3.5\n7\n4\ntrue 3\nnone\n2 true\nbye\n")
+
+// -- a measured `c type` is the same kind of name -------------------------------------------------
+
+private xal_c_types() -> string = raw"""
+    @include("<stddef.h>")
+    @include("<stdbool.h>")
+
+    c type
+        Size = "size_t"
+        Dbl = "double"
+        Truth = "bool"
+
+    """
+
+private xal_c_bases() -> string = raw"""
+    type Size = u64
+    type Dbl = f64
+    type Truth = bool
+
+    """
+
+// A measured `c type` is still a name-only constrained type in the analysis, because it is NOT wholly
+// its base: a value of another integer type reaches it only through a written conversion (`§ c type`),
+// which a dissolved name would lose. So it keeps every divergence an exported alias had.
+// TODO: un-ignore when the c type representation question (keep the written-conversion rule, lose the
+// divergences) is settled.
+@test("a measured c type counts, has its base's methods and matches exhaustively, as its base",
+      ignore: "a c type is still a name-only constrained type to the analysis")
+xal_c_type()
+    if !xal_ready() then return
+
+    val body = raw"""
+        main()
+            val lo: Size = 1
+            val hi: Size = 4
+            var s: Size = 0
+            for k in lo..<hi
+                s += k
+            print(s)
+            val x: Dbl = 2.25
+            print(x.sqrt())
+            val f: Truth = true
+            print(f match
+                true -> "yes"
+                false -> "no")
+        """
+
+    val measured = xal_run(xal_c_types() + body)
+    val plain = xal_run(xal_c_bases() + body)
+
+    assert(plain.0, plain.1)
+    assert_eq(plain.1, "6\n1.5\nyes\n")
+    assert(measured.0, measured.1)
+    assert_eq(measured.1, "6\n1.5\nyes\n")
+end xal_c_type
+
+// -- the header still spells every name -----------------------------------------------------------
+
+private xal_header_library() -> string = raw"""
+    module mylib
+
+    @include("<stddef.h>")
+
+    c type
+        Size = "size_t"
+
+    @export("xal_n")
+    type N = i32
+
+    @export("xal_flag")
+    type Flag = bool
+
+    @export("xal_cb")
+    type Cb = *extern(N) -> Flag
+
+    @export("xal_pt")
+    struct Pt
+        x: N
+        on: Flag
+        f: Cb
+
+    @export("xal_pt_ref")
+    type PtRef = *Pt
+
+    @export("xal_count")
+    var count: N = 0
+
+    @export("xal_make")
+    make(n: N, size: Size) -> Pt = Pt(n + i32(size), true, null)
+
+    @export("xal_first")
+    first(p: PtRef) -> N = p.x
+    """
+
+@test("the generated header still declares and spells every exported alias and c type by its name")
+xal_header_spells_names()
+    if !xal_ready() then return
+
+    val root = make_temp_dir("sysl-xal-").unwrap()
+
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/lib.sysl", xal_header_library()).unwrap()
+
+    val got = c_header_of(root, None)
+
+    remove_dir_all(root).unwrap_or(())
+
+    val header = got match
+        Ok(text) -> text
+        Err(why) -> failure_text(why)
+
+    assert(header.contains("typedef int32_t xal_n;"), header)
+    assert(header.contains("typedef bool xal_flag;"), header)
+    assert(header.contains("typedef xal_flag (*xal_cb)(xal_n);"), header)
+    assert(header.contains("xal_n x;"), header)
+    assert(header.contains("xal_flag on;"), header)
+    assert(header.contains("xal_cb f;"), header)
+    assert(header.contains("typedef xal_pt * xal_pt_ref;") || header.contains("typedef xal_pt *xal_pt_ref;"),
+           header)
+    assert(header.contains("extern xal_n xal_count;"), header)
+    assert(header.contains("xal_pt xal_make(xal_n n, size_t size);"), header)
+    assert(header.contains("xal_n xal_first(xal_pt_ref p);"), header)
+end xal_header_spells_names

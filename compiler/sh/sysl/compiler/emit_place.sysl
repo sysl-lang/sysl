@@ -640,7 +640,7 @@ store_over(e: *Emit, place: TExpr, p: Val, v: Val, cur: Option[Val]) -> unit = b
                     if contains_counted(ty)
                         retain_value(e, ty, v)
                         emit(e, InStore(lty(e, ty), v, p, acc, None))
-                        release_value(e, ty, old)
+                        give_up(e, ty, old)
                     else emit(e, InStore(lty(e, ty), v, p, acc, None))
 
 private lent_local(e: *Emit, place: TExpr) -> bool = *place.kind match
@@ -654,10 +654,14 @@ private lent_local(e: *Emit, place: TExpr) -> bool = *place.kind match
 // **A `@unique` value with a destructor** (`emit_unique.sysl`) is moved in rather than counted, and
 // what the place held is dropped first -- after the right side is worked out, before the new value
 // lands (§ 2) -- where its drop flag says it holds one. A local's flag is set again once it does.
+//
+// **Where an `invariant` re-check follows the write, what the place held is given up after the
+// clause has held instead** (`give_up`, `give_up_at`): it is taken out of the place here, and let go
+// of once the check has passed.
 store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
     if value_drops(e, ty)
         retain_stored(e, ty, v)
-        release_at(e, ty, p)
+        give_up_at(e, ty, p)
         emit(e, InStore(lty(e, ty), v, p, acc, None))
         mark_held(e, p)
         return
@@ -674,7 +678,7 @@ store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
     // a licence the back end may decline, so the aggregate written at its address goes without it.
     if e.layout.indirect(ty) && is_plain_access(acc)
         retain_value(e, ty, v)
-        release_at(e, ty, p)
+        give_up_at(e, ty, p)
         emit(e, InStore(lty(e, ty), v, p, AccPlain, None))
         return
 
@@ -683,8 +687,49 @@ store_into(e: *Emit, ty: Type, p: Val, v: Val, acc: IrAccess)
     emit(e, InLoad(old, lty(e, ty), p, acc, None))
     retain_stored(e, ty, v)
     emit(e, InStore(lty(e, ty), v, p, acc, None))
-    release_value(e, ty, old)
+    give_up(e, ty, old)
 end store_into
+
+// The old value a write lets go of: released here, or -- across the store of a write an `invariant`
+// re-check follows (`e.late_on`) -- kept for the check's lowering to release once the clause holds.
+private give_up(e: *Emit, ty: Type, old: Val)
+    if e.late_on then e.late_releases.push((old, ty, false)) else release_value(e, ty, old)
+
+// The same for what is still at `p`, about to be written over. Kept for later, it is taken out first:
+// read into a register, or -- a large aggregate, which is never one -- copied into a stack slot of
+// its own, released at that address. A slot with a drop flag is a whole local, which no re-check
+// follows, and is let go of here as before.
+private give_up_at(e: *Emit, ty: Type, p: Val)
+    if !e.late_on || held_flag(e, p).is_some()
+        release_at(e, ty, p)
+        return
+    end if
+
+    if !owns_value(e, ty) then return
+
+    if holds_no_bytes(ty)
+        e.late_releases.push((if zero_sized(ty) then zero_of(e, ty) else VZero, ty, false))
+        return
+    end if
+
+    if e.layout.indirect(ty)
+        val slot = alloca(e, fresh_reg(e), lty(e, ty))
+
+        emit_memcpy(e, slot, p, int(e.layout.size(ty)), int(e.layout.claim(ty)))
+        e.late_releases.push((slot, ty, true))
+        return
+    end if
+
+    val old = fresh_reg(e)
+
+    emit(e, InLoad(old, lty(e, ty), p, AccPlain, None))
+    e.late_releases.push((old, ty, false))
+end give_up_at
+
+// What the writes an `invariant` re-check followed gave up, let go of in the order they gave it up.
+release_late(e: *Emit, late: Buf[(Val, Type, bool)])
+    for item in late
+        if item.2 then release_unflagged(e, item.1, item.0) else release_value(e, item.1, item.0)
 
 // -- the bit ranges of a bitfield struct's container --------------------------------------------------
 

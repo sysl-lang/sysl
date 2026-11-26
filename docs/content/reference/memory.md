@@ -248,6 +248,12 @@ buffer never given storage.
 The twins are written over two raw-tier forms, `try_slot_storage(n)` and `try_heap(v)`
 ([below](#slot-storage-room-that-holds-no-value-yet)); a program writes the twins.
 
+**An export can answer every refusal inside its call instead.** `@out_of_memory(value)` beside an
+`@export` turns an allocation refused anywhere the call reaches, a twin or not, into `value` for the
+export's C caller. Every frame in between is unwound by returning, its `defer`s, `errdefer`s and
+destructors run, and nothing it made stays allocated. That is the form for a library whose C API
+answers an out-of-memory status ([ffi](/reference/ffi/#an-export-that-answers-out-of-memory)).
+
 ### References compare through their referent
 
 **`==` and `!=` on two `&T`s (or two `&sync T`s) compare the objects as `T` does wherever `T` has an
@@ -2599,7 +2605,9 @@ after
 
 - **A temporary is dropped at the end of its statement**, a value made only to be handed to a call
   among them.
-- **Assigning to a variable drops what it held**, at the assignment.
+- **Assigning to a variable drops what it held**, at the assignment. A write to a field of a struct
+  with an `invariant` drops it once the struct has been re-checked
+  ([errors](/reference/errors/#what-a-write-replaces-is-released-after-the-check)).
 - **Taking a value out of an enum, or binding it in a `match`, shares it** rather than moving it, and
   a closure holds what it captured until it is itself dropped; the value goes once, with the last share.
 - **Every way out of a block drops what it holds** — its end, a `return`, a `?`, a `break`, a

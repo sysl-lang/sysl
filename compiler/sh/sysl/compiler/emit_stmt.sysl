@@ -529,9 +529,17 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
         fused.push(f.is_some())
         vals.push(if f.is_some() then f.unwrap() else held_for_statement_from(e, w.value))
 
+    // What an arm a re-check follows gives up is let go of after the checks, in the arms' order; an
+    // arm no clause covers lets go of its old value at its store, as a single write does.
+    val saved = e.late_releases
+
+    e.late_releases = buf()
+
     for i in 0..<writes.len()
         val w = writes[i]
         val p = addrs[i]
+
+        e.late_on = !w.check.is_empty()
 
         if !nowhere(p)
             if w.op == "="
@@ -547,6 +555,8 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
 
                 store_over(e, w.place, p, updated, Some(curs[i]))
 
+        e.late_on = false
+
     // One check per struct however many of its fields were written: two arms writing two fields of
     // one value each owe the same re-read of the same clause, and running it twice would say nothing
     // the first did not.
@@ -559,6 +569,11 @@ private gen_multi_assign(e: *Emit, writes: Buf[TWrite])
             val c = checks[k]
 
             if not_seen(&done, c) then emit_inv_check(e, gen_expr(e, c.value), c.decl, c.inv_fn, c.value.span)
+
+    val late = e.late_releases
+
+    e.late_releases = saved
+    release_late(e, late)
 end gen_multi_assign
 
 // Whether this is the first time the check has been asked for, recording it either way.

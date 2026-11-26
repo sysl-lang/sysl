@@ -1194,6 +1194,11 @@ panic aborts when the hook returns. **Whatever an override does, the program sti
 follows the call, so an override that only counts or logs and then returns stops the program where
 it was. On a freestanding target the default writes nothing and returns.
 
+**An allocation refused inside an export marked `@out_of_memory(value)` is no failure, and calls no
+hook**: the call is unwound back to the export, which answers the value
+([ffi](/reference/ffi/#an-export-that-answers-out-of-memory)). Only a refusal outside every such
+export reaches `sysl_trap`, as `out of memory`.
+
 **A shared library's `sysl_trap` is its own.** `sysl build-c --shared` offers the loader only the
 module's public exports, and the hook is part of the runtime each library carries, so it is not
 among them: a host's definition replaces the hook of a program or an archive it links, never the one
@@ -2404,6 +2409,76 @@ print(w.lo, w.hi)
 This matters when the two writes cross: `w.lo = 12` followed by `w.hi = 14` traps at the first
 write, because 12 is briefly above the 10 still in `hi`. `w.lo, w.hi = 12, 14` does not, and the
 two writes take a struct that was valid before to one that is valid after.
+
+### What a write replaces is released after the check
+
+**A write to a struct with an invariant stores the new values, re-checks the struct, and only then
+releases the old values**, in the order the writes gave them up. Releasing a value may run a
+destructor, and a destructor that ran between the store and the check could read the struct with
+its clause broken. This holds for a single write and a multiple assignment, through `self`, `*self`
+or `&self`, to a local or down a field path, and whatever the old value is — a `&T` whose count
+reaches zero, a `Buf` whose elements have destructors:
+
+```sysl
+struct Noisy
+    n: int
+
+struct Pair
+    lo: int
+    item: &Noisy
+    hi: int
+    invariant lo <= hi
+
+var g = Pair(0, Noisy(1), 1)
+
+impl Drop for Noisy
+    drop(self) = print("drop", self.n, "sees", g.lo, g.hi)
+
+main()
+    g.lo, g.item, g.hi = 5, Noisy(2), 6
+    print("after")
+```
+
+```output
+drop 1 sees 5 6
+after
+```
+
+**A check that fails traps, and a trap runs nothing**: the old value is never released, and the
+destructor never sees the broken struct. Here the last write empties a buffer the count still
+claims an element of, and the element is not dropped:
+
+```sysl
+import sysl.buf.{Buf, buf}
+
+struct Noisy
+    n: int
+
+struct Bag
+    count: usize
+    items: Buf[&Noisy]
+    invariant count <= items.len()
+
+var b = Bag(0, buf())
+
+impl Drop for Noisy
+    drop(self) = print("drop", self.n, b.count <= b.items.len())
+
+main()
+    b.items.push(Noisy(1))
+    b.count = 1
+    print("kept")
+    b.items = buf()
+    print("not reached")
+```
+
+```output trap
+kept
+```
+
+A struct with no invariant has nothing to check, so each write releases what it replaced at its
+own store, as any assignment does. A whole-struct assignment checks the new value as it is built,
+before anything is stored.
 
 ### When a struct cannot be updated one field at a time
 

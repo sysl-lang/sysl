@@ -215,7 +215,9 @@ this moves 'w.t' out of what 'w' points at, and 'Token' is '@unique' — only a 
 `sysl.mem` gives the three ways, each a move through a pointer: `replace(p: *T, v: T) -> T`,
 `swap(a: *T, b: *T)`, `forget(x: T)`; and `Option.take(*self) -> Option[T]` leaves `None` behind.
 
-**Assignment drops what was there**, after the right side is evaluated and before it lands:
+**Assignment drops what was there**, after the right side is evaluated and before it lands — except
+a write to a field of a struct with an `invariant`, which drops it after the new value has landed and
+the struct has been re-checked, so the destructor never sees the clause broken:
 
 ```sysl
 @unique

@@ -208,7 +208,11 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
     TUpdate(place, op, value, ty, dispatch, check, yields) ->
         val ex = if check.is_some() then None else update_expansion_at(e, x.span, place, value, ty, dispatch, yields)
 
-        if ex.is_some() then gen_expr(e, ex.unwrap())
+        // An operator read as its body is arithmetic over a type with no destructor: what its write
+        // gives up runs nothing, so it is given up at the store as written.
+        if ex.is_some()
+            e.late_next = false
+            gen_expr(e, ex.unwrap())
         else yielded(yields, gen_update(e, place, op, value, ty, dispatch, check))
     TIncDec(place, op, pre, ty, check) -> gen_inc_dec(e, place, op, pre, ty, check, x.span)
 
@@ -496,13 +500,7 @@ private gen_expr_kind(e: *Emit, x: TExpr) -> Val = *x.kind match
         emit_inv_check(e, v, decl, inv_fn, x.span)
         v
 
-    // The write or the call runs first, yielding the value the expression is, and then the struct it
-    // could have changed is re-read so the invariant sees the new fields.
-    TRecheck(after, recv, decl, inv_fn) ->
-        val v = gen_expr(e, after)
-
-        emit_inv_check(e, gen_expr(e, recv), decl, inv_fn, x.span)
-        v
+    TRecheck(_, _, _, _) -> gen_recheck(e, x)
     TMatch(scrutinee, arms, ty) -> gen_match(e, scrutinee, arms, ty)
     TUnreachable ->
         emit_term(e, InUnreachable)
@@ -1211,7 +1209,65 @@ end operand_arg
 // place does not, so whatever keeps it takes one.
 private yielded(yields: bool, v: Val) -> Val = if yields then v else VNothing
 
+// **A write to a field of a struct with an `invariant`, and the re-checks it owes** -- one per struct
+// its place lies in, innermost first. The write or the call runs first, yielding the value the
+// expression is, and then each struct it could have changed is re-read so its clause sees the new
+// fields.
+//
+// **What the write gave up is let go of only after every clause has held** (`store_into`'s
+// `give_up`): letting go of it may run a destructor, and a destructor that ran between the store and
+// the check could read the struct with its clause broken -- which the optimizer is told never
+// happens. A check that fails traps, and a trap runs nothing, so the old value is then never let go
+// of. Only the write the re-checks are for is held back; one inside its right side is its own.
+private gen_recheck(e: *Emit, x: TExpr) -> Val
+    var rechecks: Buf[TExpr] = buf()
+    var core = x
+
+    loop
+        *core.kind match
+            TRecheck(after, _, _, _) ->
+                rechecks.push(core)
+                core = after
+            _ -> break
+
+    val saved = e.late_releases
+
+    e.late_releases = buf()
+    e.late_next = *core.kind match
+        TStore(_, _, _, _) -> true
+        TUpdate(_, _, _, _, _, _, _) -> true
+        _ -> false
+
+    val v = gen_expr(e, core)
+
+    e.late_next = false
+
+    for i in 0..<rechecks.len()
+        val r = rechecks[rechecks.len() - 1 - i]
+
+        *r.kind match
+            TRecheck(_, recv, decl, inv_fn) -> emit_inv_check(e, gen_expr(e, recv), decl, inv_fn, r.span)
+            _ -> ()
+
+    val late = e.late_releases
+
+    e.late_releases = saved
+    release_late(e, late)
+    v
+end gen_recheck
+
+// Whether the write being lowered is one a re-check follows, asked once, at its start -- before its
+// right side, whose own writes are not.
+private takes_late(e: *Emit) -> bool
+    val late = e.late_next
+
+    e.late_next = false
+    late
+end takes_late
+
 private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
+    val late = takes_late(e)
+
     if zero_sized(ty)
         gen_expr(e, value)
         address(e, place)
@@ -1221,13 +1277,17 @@ private gen_store(e: *Emit, place: TExpr, value: TExpr, ty: Type) -> Val
     val p = place_addr(e, place)
 
     e.moves.source = Some(value)
+    e.late_on = late
     store_place(e, place, p, v)
+    e.late_on = false
     e.moves.source = None
     v
 end gen_store
 
 private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
                    dispatch: Option[TDispatch], check: Option[Type]) -> Val
+    val late = takes_late(e)
+
     // **A place reached through a call -- a container's `index_place` -- is addressed after the
     // value is computed**, as a plain store's is: the value may grow the container, and an address
     // taken first would then name the storage the growth gave up. A fused dot product reads the
@@ -1254,7 +1314,9 @@ private gen_update(e: *Emit, place: TExpr, op: string, value: TExpr, ty: Type,
         Some(c) -> emit_constraint_checks(e, updated, c)
         None -> ()
 
+    e.late_on = late
     store_over(e, place, p, updated, Some(cur))
+    e.late_on = false
     updated
 end gen_update
 
@@ -2001,6 +2063,7 @@ gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: 
             all.push(arg_val)
 
         emit(e, InCall(None, LVoid, callee, all, no_ir_attrs(), fnty, no_fast_math(), false))
+        oom_after_indirect(e, callee)
 
         if dest.is_some() then return VNothing
 
@@ -2011,6 +2074,7 @@ gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: 
 
     if no_value(ty)
         emit(e, InCall(None, LVoid, callee, arg_vals, no_ir_attrs(), fnty, no_fast_math(), false))
+        oom_after_indirect(e, callee)
 
         if ty == Never then emit_term(e, InUnreachable)
 
@@ -2020,6 +2084,7 @@ gen_sysl_call_into(e: *Emit, callee: Val, arg_vals: Buf[IrArg], ty: Type, dest: 
 
     emit(e, InCall(Some(r), lty(e, ty), callee, arg_vals, c_extension(ty, e.target), fnty,
                    no_fast_math(), false))
+    oom_after_indirect(e, callee)
     own_temp(e, r, ty)
 end gen_sysl_call_into
 

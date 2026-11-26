@@ -585,6 +585,32 @@ struct Emit
     switch_lowered: Set[string]
     switch_kept: Set[string]
 
+    // An export answering out of memory (`oom_boundary.sysl`). `oom_scope` holds the symbols of every
+    // function such an export can reach, and `oom_whole` says every function is among them (the
+    // standard module's artifact for such a build). `oom_here` says the body being written is one,
+    // `oom_quiet` counts the ways out being laid inside it, where no test of the state is made, and
+    // `oom_named` says the module reads the state word.
+    oom_scope: Set[string]
+    oom_whole: bool
+    oom_here: bool
+    oom_quiet: int
+    oom_named: bool
+
+    // **A write an `invariant` re-check follows gives up its old value only once the clause has
+    // held** (`emit_expr.sysl`'s `gen_recheck`, `gen_multi_assign`): the value it lets go of may run
+    // a destructor, and that destructor must never see the struct with its clause broken.
+    // `late_next` tells the write about to be lowered that it is one; `late_on` is set across its
+    // store alone; `late_releases` holds what the store gave up -- a value, or the address of a
+    // stack copy of one (`true`) -- in the order it gave them up.
+    late_next: bool
+    late_on: bool
+    late_releases: Buf[(Val, Type, bool)]
+
+    // The name of every struct's `invariant` function (`<Struct>$inv`, `note_struct_decls`), whose
+    // parameters read the fields of a value the struct still owns (`emit_unique.sysl`'s
+    // `reads_receiver`).
+    clause_names: Set[string]
+
     // The `extern`s written `@unchecked`, whose `*nonnull T` answers are taken on trust rather than
     // checked for null at each call (`nonnull_checks.sysl`).
     trusted: Set[string]
@@ -811,7 +837,8 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
           held_args_none(), PeelNone, set(), false, false, map(), map(), map(), no_stack_boxes(), buf(), buf(),
-          None, buf(), set(), set(), buf(), map(), set(), map(), map(), set(), set(), set(), set())
+          None, buf(), set(), set(), buf(), map(), set(), map(), map(), set(), set(), set(),
+          set(), false, false, 0, false, false, false, buf(), set(), set())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -900,6 +927,8 @@ start_function(e: *Emit)
     e.held_args = held_args_none()
     e.moved_locals = set()
     e.drop_flags = map()
+    e.oom_here = false
+    e.oom_quiet = 0
 end start_function
 
 // A register nothing else in this function uses.
@@ -926,6 +955,10 @@ emit(e: *Emit, i: Inst)
         Aarch64 -> emit_plain_access(e, j, false)
         Thumb -> emit_plain_access(e, j, true)
         _ -> e.current.push(j)
+
+    // A call that can come back from a refused allocation is tested on the spot, before anything
+    // reads its answer (`oom_boundary.sysl`).
+    if oom_watches(e, j) then oom_after_call(e)
 end emit
 
 // **An ordinary load or store inside a `@packed` struct's storage is at no boundary** (`align 1`): a
@@ -1184,11 +1217,14 @@ slot_align(e: *Emit, ty: LType) -> Option[int] = ty match
     LArr(_, elem) -> slot_align(e, *elem)
     _ -> None
 
-// Records every struct of the program under the name LLVM knows it by (`Emit.struct_decls`).
+// Records every struct of the program under the name LLVM knows it by (`Emit.struct_decls`), and the
+// name its `invariant` function would have (`Emit.clause_names`).
 note_struct_decls(e: *Emit, p: TProgram)
     for item in p.structs
         item match
-            Struct(d) -> e.struct_decls.put(l_render(struct_lty(d)), d)
+            Struct(d) ->
+                e.struct_decls.put(l_render(struct_lty(d)), d)
+                e.clause_names.add(inv_key(d.base))
             _ -> ()
 
 // Records the boundary of every struct and data enum of the program that holds a raised

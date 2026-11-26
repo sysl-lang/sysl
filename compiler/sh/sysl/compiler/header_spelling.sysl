@@ -1,0 +1,151 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **The types a generated C header spells, as against the ones the program is checked at.**
+//
+// An exported alias is its base to the whole compiler (`reference/ffi.md § Naming a type in the
+// header`): a second name, interchangeable with the base both ways, checking nothing. So resolution
+// hands every analysis the base itself, and nothing downstream of it has a name to see through. The
+// header is the one reader that wants the name back -- `slate_value` where the author wrote `Handle`
+// -- so it re-reads the written types of what it declares under `Analysis.header_spelling`, which keeps
+// the alias as the named type `c_header.sysl` spells. (A measured `c type` is not dissolved, so it
+// reaches the header as it always did, `TickType_t` for `Tick`.)
+//
+// What is re-read is every position the header writes: an exported function's parameters and result,
+// an exported variable's type, and the fields of every struct those reach. A re-reading is taken only
+// where it is the analysis's own type with the names put back -- anything else (a member, a generic
+// instantiation, a declaration this compilation did not read) keeps the type it was checked at, which
+// is the base, still a correct C spelling.
+//
+// The re-reading says nothing: every complaint it could make was made, or not, by the analysis.
+
+// The exported functions as the header declares them.
+header_exports(a: &Analysis, funcs: Buf[TFunc]) -> Buf[TFunc]
+    val mark = a.complaints()
+    val was = a.header_spelling
+    var structs: Buf[(string, Type)] = buf()
+    var out: Buf[TFunc] = buf()
+
+    a.header_spelling = true
+
+    for f in funcs
+        out.push(spelled_func(a, f, &structs))
+
+    a.header_spelling = was
+    a.restore_complaints(mark)
+    out
+end header_exports
+
+// The exported variables as the header declares them.
+header_storage(a: &Analysis, vals: Buf[TVal]) -> Buf[TVal]
+    val mark = a.complaints()
+    val was = a.header_spelling
+    var structs: Buf[(string, Type)] = buf()
+    var out: Buf[TVal] = buf()
+
+    a.header_spelling = true
+
+    for v in vals
+        val decl = a.tables.vals.get(v.symbol)
+
+        if decl.is_none() || decl.unwrap().typ.is_none()
+            out.push(v)
+            continue
+        end if
+
+        val d = decl.unwrap()
+        val ty = respelled(a, v.ty, resolve_type(a, d.scope, d.typ.unwrap(), no_bindings()), &structs)
+
+        out.push(v with { ty = ty })
+    end for
+
+    a.header_spelling = was
+    a.restore_complaints(mark)
+    out
+end header_storage
+
+private spelled_func(a: &Analysis, f: TFunc, structs: *Buf[(string, Type)]) -> TFunc
+    val found = a.tables.funcs.get(f.name)
+
+    if found.is_none() then return f
+
+    val d = found.unwrap().decl
+    val scope = found.unwrap().scope
+
+    if d.params.len() != f.params.len() || !d.tparams.is_empty() then return f
+
+    var params: Buf[(string, Type)] = buf()
+
+    for i in 0..<f.params.len()
+        val written = resolve_type(a, scope, d.params[i].typ, no_bindings())
+
+        params.push((f.params[i].0, respelled(a, f.params[i].1, written, structs)))
+
+    val ret = d.ret_type match
+        Some(t) -> respelled(a, f.ret_ty, resolve_result(a, scope, t, no_bindings()), structs)
+        None -> f.ret_ty
+
+    f with { params = params, ret_ty = ret }
+end spelled_func
+
+// The type the header writes where the analysis checked `checked` and the header's reading gave
+// `written`: the written one, its structs spelled the same way, where it is the checked one with names
+// put back -- and the checked one, its structs spelled, otherwise.
+private respelled(a: &Analysis, checked: Type, written: Type, structs: *Buf[(string, Type)]) -> Type =
+    if type_eq(nameless(written), checked) then spelled(a, written, structs) else spelled(a, checked, structs)
+
+// A type with every struct in it replaced by the header's copy, whose fields are spelled as the header
+// writes them. A struct is copied once, and filed before its fields are read, so one that reaches
+// itself through a pointer finds the copy in progress.
+private spelled(a: &Analysis, t: Type, structs: *Buf[(string, Type)]) -> Type = t match
+    Ptr(inner, ro, nn) -> Ptr(spelled(a, *inner, structs), ro, nn)
+    Volatile(inner) -> Volatile(spelled(a, *inner, structs))
+    Array(n, elem, term) -> Array(n, spelled(a, *elem, structs), term)
+    CFn(ps, r, keeps) ->
+        var params: Buf[Type] = buf()
+
+        for p in ps
+            params.push(spelled(a, p, structs))
+
+        CFn(params, spelled(a, *r, structs), keeps)
+    Constrained(d) ->
+        if !name_only(d) then t
+        else Constrained(ConstrainedType(d.name, spelled(a, d.base, structs), d.derived, d.lo, d.hi,
+                                         d.exclusive_hi, d.pred_fn, d.cname, d.wrapping, d.generic,
+                                         d.targs, d.c_spelling))
+    Struct(d) -> spelled_struct(a, t, d, structs)
+    _ -> t
+
+private spelled_struct(a: &Analysis, t: Type, d: &StructType, structs: *Buf[(string, Type)]) -> Type
+    if !d.targs.is_empty() || is_tuple(d) then return t
+
+    for item in *structs
+        if item.0 == d.base then return item.1
+
+    val decl = a.tables.types.get(d.base)
+
+    if decl.is_none() then return t
+
+    val written = decl.unwrap().kind match
+        StructOf(sd) -> sd
+        _ -> return t
+
+    if written.fields.len() != d.fields.len() then return t
+
+    val copy: &StructType = StructType(d.base, d.targs, buf(), d.packed, d.min_align, d.cname, d.opaque,
+                                       d.big_endian, d.guarded, d.union_layout, d.c_bits, d.promised,
+                                       d.unique)
+    val made = Struct(copy)
+
+    structs.push((d.base, made))
+
+    for i in 0..<d.fields.len()
+        val checked = d.fields[i].1
+        val reread = resolve_qualified(a, decl.unwrap().scope, written.fields[i].typ, no_bindings())
+
+        copy.fields.push((d.fields[i].0, respelled(a, checked, reread, structs)))
+    end for
+
+    made
+end spelled_struct
