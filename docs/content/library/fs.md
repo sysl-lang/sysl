@@ -43,7 +43,7 @@ decides which modules exist at all — there is no half of `sysl.fs` that works 
 |---|---|---|
 | whole file | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `append_text`, `append_bytes`, `write_text_atomic`, `write_bytes_atomic` | storage the size of the file — allocates by nature |
 | open file | `open`, `create`, `append`, `open_update`, `create_update`, and `File`'s members | a buffer the caller already has |
-| path | `exists`, `readable`, `writable`, `executable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified`, `set_times`, `link_set_times`, `space`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `get_xattr`, `set_xattr`, `remove_xattr`, `list_xattrs` and their `link_` forms, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `make_temp_dir` | one C call each, or a loop over them |
+| path | `exists`, `readable`, `writable`, `executable`, `is_file`, `is_dir`, `is_link`, `size_of`, `metadata`, `link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified`, `set_times`, `link_set_times`, `space`, `symlink`, `read_link`, `hard_link`, `canonicalize`, `get_xattr`, `set_xattr`, `remove_xattr`, `list_xattrs` and their `link_` forms, `make_dir`, `make_dir_all`, `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `pending_name`, `publish_file`, `publish_dir`, `copy_file`, `truncate`, `current_dir`, `set_current_dir`, `temp_root`, `temp_dir`, `make_temp_dir` | one C call each, or a loop over them |
 
 **Reading a whole file *is* asking for storage the size of the file**, so the top tier could not have
 been written any other way. Keeping it apart from `File` is what lets the middle tier stay honest:
@@ -255,7 +255,7 @@ current and a program could not extend — and the number is what a reader looks
 first is an operation this process may not perform at all, the second a file whose mode or owner refuses it.
 
 **`InvalidUtf8` is the one case no `errno` produces.** It is what `read_text`, `entries`, `read_link`,
-`canonicalize`, `current_dir` and `make_temp_dir` answer when bytes that had to be text are not UTF-8,
+`canonicalize`, `current_dir`, `temp_dir` and `temp_file` answer when bytes that had to be text are not UTF-8,
 and its `offset` is the byte at which the decode stopped. Its `code()` is `EILSEQ` (92 on macOS, 84 on
 Linux); two of them are equal when they stopped at the same byte, and one is never equal to an `Other`.
 
@@ -1565,11 +1565,6 @@ for again rather than handed back cut short.
 the thing to know before reaching for the second: a library that changes it changes it for every
 thread and every other library in the program. Prefer building an absolute path.
 
-**`make_temp_dir` makes a directory nobody else can take**, inside whatever `TMPDIR` names. It is
-*created* rather than named, which is the whole point: inventing a path and then making it leaves a
-gap in which somebody else can take the name on a shared `/tmp`. Removing it is the caller's, and
-`defer remove_dir_all(d)` is the idiom.
-
 **`copy_file`** is a read-and-write loop rather than a platform fast path, which is a decision:
 `copyfile(3)` and `copy_file_range(2)` have different names, different signatures and different
 failure modes, and what is here is correct everywhere. It does **not** carry the permission bits
@@ -1579,6 +1574,60 @@ over — a caller that wants them reads `metadata(from).permissions()` and write
 **`truncate`** cuts a file to a length, or extends it to one with zeroes, and makes nothing: a path
 that is not there reports `NotFound`. `File.truncate` is the same on an open file, and **does not
 move the position** — which is what makes it usable in the middle of writing.
+
+### Temporary files and directories
+
+**`temp_root()` is where temporary things go**: `TMPDIR` where it is set and not empty; otherwise, on
+macOS, the per-user directory `confstr(_CS_DARWIN_USER_TEMP_DIR)` names (`/var/folders/…/T`, the
+one `NSTemporaryDirectory` answers, which only this user can write in); otherwise `/tmp`. Trailing
+slashes are dropped — macOS's own `TMPDIR` ends in one — so a name joined to it with one `/` is the
+path the system reports back. It is read afresh at every call and is not checked: a root that is not
+there is the failure of the call that tries to make something in it.
+
+**`temp_dir(prefix)` makes a directory nobody else can take**, mode `0700`, and **`temp_file(prefix)`
+makes a file nobody else can take**, mode `0600`, answered open for reading and writing with its
+path. Each name is the prefix (empty by default) and six characters chosen to make it unique. Both are
+*created* rather than named, which is the whole point: inventing a path and then making it leaves a
+gap in which somebody else can take the name on a shared `/tmp` — and for a file, plant a link there
+for `create` to follow. The file is made with `O_CREAT | O_EXCL` in the same step that opens it, as
+`mkstemp` does; the umask can narrow either mode and never widens it. `make_temp_dir` is `temp_dir`
+under its first name.
+
+```sysl
+import sysl.fs.{metadata, read_text, remove_dir_all, remove_file, temp_dir, temp_file, temp_root}
+import sysl.path.{file_name, parent}
+
+val d = temp_dir("sysl-fs-doc-").unwrap()
+defer remove_dir_all(d).unwrap()
+
+var (f, p) = temp_file("sysl-fs-doc-").unwrap()
+defer remove_file(p).unwrap()
+
+f.write("draft".bytes)
+f.close().unwrap()
+
+print(parent(d).unwrap() == temp_root(), parent(p).unwrap() == temp_root())
+print(file_name(p).unwrap().len, metadata(d).unwrap().permissions() == 0o700,
+      metadata(p).unwrap().permissions() == 0o600)
+print(read_text(p).unwrap())
+```
+
+```output
+true true
+18 true true
+draft
+```
+
+**Nothing removes them but the caller**, and `defer` is the idiom, as above: nothing in this module
+runs at the end of a scope that the scope did not say, so neither answer is a guard that deletes on
+drop. The `File` closes when its last copy goes, like any other; the file it was open on stays. A
+root that is not there answers `NotFound`, one this process may not write in `PermissionDenied`, one
+that is a file `NotADirectory`, and a prefix that makes the name too long for the system the
+platform's `ENAMETOOLONG` as an `Other`. **A prefix holding a `/` or a NUL is refused** with
+`Other(22)`, `EINVAL`, before anything is made: it would name something other than one entry of the
+root. A root whose name is not UTF-8 makes a path no `string` can
+hold: the two calls take back what they made and answer `InvalidUtf8`, and `temp_root` answers
+`/tmp` for it.
 
 ### Where a directory *belongs*
 
@@ -1964,7 +2013,7 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
 `extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit and, from `open_with`, an exclusive, a sync, a dsync and a nofollow bit),
 `_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_rename_no_replace` (asked only by a program that calls `rename_no_replace`), `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_lchown` and `_space` (asked only by a program that calls `set_link_owner` or `space`), `_opendir`,
-`_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
+`_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_root`, `_temp_dir`, `_temp_file`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
 which refuse a link with `ELOOP` and an escape with `EXDEV`, and for the extended attributes `_getxattr`, `_setxattr`,
 `_removexattr` and `_listxattr`, each taking a `follow` flag (non-zero follows a link) and the two that answer bytes asked
@@ -2004,7 +2053,9 @@ a file is asked nothing.
 **Every call on this page is there for such a program**, the reading ones included: `metadata`,
 `link_metadata`, `set_permissions`, `set_owner`, `set_link_owner`, `set_modified`, `set_times`, `link_set_times` and `space` are one `stat`, `chmod`, `chown`, `lchown`, `utimensat`, `set_times` or `statvfs` hook, `executable` is the `access` hook `readable` and `writable` are, the walk and `remove_dir_all`,
 `copy_dir_all` and `publish_dir` are `entries` and `link_metadata` with a leaf action, and
-`make_temp_dir` and `canonicalize` are the `temp_dir` and `realpath` hooks. A supplier fills `Stat`'s
+`temp_root`, `temp_dir` and `canonicalize` are the `temp_root`, `temp_dir` and `realpath` hooks
+(`temp_dir` asks `rmdir` too, and `temp_file` its own hook with `unlink`, for a root no `string` can
+name), and `temp_root` answers `/tmp` where its hook fails. A supplier fills `Stat`'s
 sixteen numbers in POSIX's shape and leaves zero what it has nothing to say about — a birth time it
 does not know is three zeros, which reads as `created == None`; a hook it answers
 `UNSUPPORTED` comes back from these calls as *not supported on this target*. The one exception is
