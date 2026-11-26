@@ -102,6 +102,8 @@ private fsh_hooks(left_out: []string) -> string
     rows.push(("getcwd", "into: *u8, room: usize, got: *usize"))
     rows.push(("chdir", "path: *u8, len: usize"))
     rows.push(("temp_dir", "prefix: *u8, len: usize, into: *u8, room: usize, got: *usize"))
+    rows.push(("temp_file", "prefix: *u8, len: usize, into: *u8, room: usize, got: *usize, fd: *int"))
+    rows.push(("temp_root", "into: *u8, room: usize, got: *usize"))
     rows.push(("symlink", "target: *u8, target_len: usize, link: *u8, link_len: usize"))
     rows.push(("link", "existing: *u8, existing_len: usize, fresh: *u8, fresh_len: usize"))
     rows.push(("readlink", "path: *u8, len: usize, into: *u8, room: usize, got: *usize"))
@@ -1005,6 +1007,93 @@ fsh_reading_surface_links_freestanding()
 
     lbr_drop([p, out])
 end fsh_reading_surface_links_freestanding
+
+// -- the temporary root, directory and file ----------------------------------------------------------
+
+// A program asking for the three temporary calls: the root, a directory and a file, so the temp
+// hooks are reached together with the `rmdir` and `unlink` that take back a name no `string` holds,
+// and the `write` and `close` the `File` is dropped through.
+private val fsh_makes_temps: string = raw"""
+    import sysl.fs.{temp_dir, temp_file, temp_root}
+    import sysl.fs.sys.Stat
+
+    run() -> int
+        var n = int(temp_root().len)
+
+        if temp_dir("t").is_ok() then n += 1
+        if temp_file("t").is_ok() then n += 1
+
+        n
+    """
+
+@test("a freestanding program making temporaries links once it answers the temp hooks, with no libc")
+fsh_temps_link_freestanding()
+    if !fsh_link_ready() then return
+
+    val p = fsh_tree(fsh_makes_temps + fsh_runtime + fsh_hooks([]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 == 0, said.1)
+
+    val elf = s"$out/img.elf"
+    val all = fsh_symbols(elf, false)
+
+    assert_eq(fsh_symbols(elf, true).trim(), "")
+
+    for name in ["temp_root", "temp_dir", "temp_file"]
+        assert(all.contains(s" T sysl_fs_$name") || all.contains(s" T k_$name"),
+               s"'sysl_fs_$name' is not the program's: $all")
+
+    for name in ["mkdtemp", "mkostemp", "mkstemp", "confstr", "getenv", "sysl_fs_host_temp_root",
+                 "sysl_fs_host_temp_file"]
+        assert(!fsh_names(all, name), s"'$name' is in the image")
+
+    lbr_drop([p, out])
+end fsh_temps_link_freestanding
+
+@test("a freestanding program leaving the temp hooks unanswered is refused naming each it reaches")
+fsh_temps_unanswered_are_refused()
+    if !lbr_ready() then return
+
+    val p = fsh_tree(fsh_makes_temps + fsh_runtime + fsh_hooks(["temp_root", "temp_dir", "temp_file"]))
+    val (said, out) = fsh_build(p)
+
+    assert(said.0 != 0, "built with the temp hooks unanswered")
+    assert(said.1.contains("define 'sysl_fs_temp_dir', 'sysl_fs_temp_file', 'sysl_fs_temp_root' with"),
+           said.1)
+    assert(!said.1.contains("undefined symbol"), said.1)
+    lbr_drop([p, out])
+
+@test("a temp_root hook answering UNSUPPORTED is /tmp, and the temp hooks' failures are their IoError")
+fsh_temp_hooks_unsupported()
+    if !lbr_ready() then return
+
+    val p = lbr_program(raw"""
+        import sysl.fs.{IoError, temp_dir, temp_file, temp_root}
+
+        @export("sysl_fs_temp_root")
+        no_root(into: *u8, room: usize, got: *usize) -> int = -38
+
+        @export("sysl_fs_temp_file")
+        no_file(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize, fd: *int) -> int = -13
+
+        @export("sysl_fs_temp_dir")
+        no_dir(prefix: *u8, len: usize, into: *u8, room: usize, got: *usize) -> int = -38
+
+        print(temp_root())
+
+        temp_dir("x") match
+            Ok(_) -> print("temp_dir answered")
+            Err(e) -> print(s"temp_dir: $e")
+
+        temp_file("x") match
+            Ok(_) -> print("temp_file answered")
+            Err(e) -> print(s"temp_file: ${e == IoError.PermissionDenied}")
+        """)
+
+    assert_eq(lbr_run(p, []), "/tmp\ntemp_dir: not supported on this target\ntemp_file: true\n")
+    lbr_drop([p])
+end fsh_temp_hooks_unsupported
 
 @test("a hook answering UNSUPPORTED reaches metadata, the walk, remove_dir_all and canonicalize as 'not supported'")
 fsh_unsupported_hook_is_an_io_error()
