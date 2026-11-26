@@ -13,7 +13,9 @@ import sysl.fs.{remove_dir_all, write_text}
 // value with a destructor, a loop's outer local, a table call's keeping body, a direct keeping callee,
 // a recursion, a non-factory's answer, `break`, a weakening, an `async` body, a payload over the
 // limit, a factory with no frame entry, a trait object stored) with the boxes that say nothing (laid
-// in the frame, a factory's own answer, a generic built twice saying its one line once), and with the
+// in the frame, a factory's own answer, a factory of a factory's call, a capture read beside another,
+// a generic built twice saying its one line once), with how a callee is named (a generic instance by
+// its generic, a closure's body as a closure), and with the
 // commands that lower a program (`emit-llvm`, `test`, `build-c`), a program of two files, and a build
 // without the flag.
 //
@@ -407,6 +409,60 @@ xeb_payloads_and_entries()
         s"main.sysl:37:23: a 'Counter' $xeb_heap it is stored in 'h.c' on line 39",
         s"main.sysl:45:13: what 'from_wide' answers $xeb_heap 'from_wide' has no frame entry, since its " +
             "parameter 'w' is lent by address"])
+
+// A closure's environment read per capture, and a factory of a factory: the pool `fill` fills through
+// a closure beside the node it keeps, and the factory call `pool_of` answers, say nothing; the node,
+// the one call of `pool_of` kept past its frame, and nothing inside `pool_of`, say why.
+private const xeb_chained: string = raw"""
+    struct Node
+        n: int
+
+    struct Pool
+        last: Option[&Node]
+        count: int
+
+        keep(&self, a: &Node)
+            self.last = Some(a)
+            self.count += 1
+
+    var kept: Option[&Pool] = None
+
+    pool() -> &Pool = Pool(None, 0)
+
+    pool_of(n: int) -> &Pool
+        val p = pool()
+
+        p.count = n
+        p
+
+    each(xs: []int, f: int -> unit) =
+        for x in xs
+            f(x)
+
+    fill(xs: []int, a: &Node, pl: &Pool) = each(xs, x -> pl.keep(a))
+
+    main()
+        val a: &Node = Node(4)
+        val pl = pool()
+
+        fill([1, 2, 3], a, pl)
+
+        val framed = pool_of(2)
+        val leaked = pool_of(3)
+
+        kept = Some(leaked)
+        print(pl.count + pl.last.unwrap().n, framed.count, kept.unwrap().count)
+        kept = None
+    """
+
+@test("a capture read beside another, a factory of a factory, a closure and a generic named as written")
+xeb_closures_and_chained_factories()
+    xeb_says(xeb_explained(xeb_chained), [
+        s"main.sysl:29:20: a 'Node' $xeb_heap it is handed to 'fill' on line 32, which keeps its parameter " +
+            "'a' (it is handed to 'each' on line 26, which keeps its parameter 'f' (it is handed to a closure " +
+            "on line 24, which keeps its parameter 'self' (it is handed to 'keep' on line 26, which keeps its " +
+            "parameter 'a' (it is stored in 'self.last' on line 9))))",
+        s"main.sysl:35:18: what 'pool_of' answers $xeb_heap it is stored in 'kept' on line 37"])
 
 // -- the commands and the files ---------------------------------------------------------------------
 

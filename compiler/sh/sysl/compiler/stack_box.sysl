@@ -194,7 +194,10 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
             val w = follow_site(cx, f, site.0, true, false)
 
             if w.escaped
-                if noting then note_box(cx, f, site.0, factory_subject(site.1), w.why.unwrap_or(WhyUnknown))
+                // A factory of a factory hands its own caller's slot on to this call, as a factory
+                // lays its own box: each of its calls says where the box went.
+                if noting && !is_factory_site(cx, f, site.0) then
+                    note_box(cx, f, site.0, factory_subject(site.1), w.why.unwrap_or(WhyUnknown))
 
                 continue
             end if
@@ -1394,7 +1397,8 @@ private push_box_note(f: TFunc, at: Span, what: string, because: string)
     sb_notes.push(LocalNote(src.name, at.start, s"$key: $what is boxed on the heap, because $because"))
 end push_box_note
 
-// Whether `at` is the one box a factory answers, which its frame entry lays in its caller's slot.
+// Whether `at` is the one box a factory answers, or the one factory call a factory of a factory
+// answers, which its frame entry lays in its caller's slot.
 private is_factory_site(cx: &BoxCx, f: TFunc, at: Span) -> bool = cx.factories.get(f.name) match
     Some(s) -> s == at
     None -> false
@@ -1408,13 +1412,13 @@ private factory_subject(name: string) -> string = s"what '${said_func(name)}' an
 private box_why_said(cx: &BoxCx, why: BoxWhy, f: TFunc) -> string = why match
     WhyStored(at) -> s"it is stored in '${said_text(f, at)}'${said_line(f, at)}"
     WhySetter(at) -> s"it is handed to the setter of '${said_text(f, at)}'${said_line(f, at)}"
-    WhyReturned(at) -> s"it is returned from '${said_func(f.name)}'${said_line(f, at)}"
+    WhyReturned(at) -> s"it is returned from ${said_callee(f.name)}${said_line(f, at)}"
     WhyHanded(at, callee, k, key) -> handed_said(cx, at, callee, k, key, f)
     WhyRecursive(at, callee) ->
-        s"it is handed to '${said_func(callee)}'${said_line(f, at)}, a recursion whose answer is still " +
+        s"it is handed to ${said_callee(callee)}${said_line(f, at)}, a recursion whose answer is still " +
             "being worked out"
     WhyUnseen(at, callee) ->
-        s"it is handed to '${said_func(callee)}'${said_line(f, at)}, ${unseen_said(cx, callee)}"
+        s"it is handed to ${said_callee(callee)}${said_line(f, at)}, ${unseen_said(cx, callee)}"
     WhyBoxed(at, closure) ->
         if closure then s"it is captured by the closure${said_line(f, at)}"
         else s"it is built into another box${said_line(f, at)}"
@@ -1441,7 +1445,7 @@ private handed_said(cx: &BoxCx, at: Span, callee: string, k: usize, key: string,
     val param = if k < g.params.len() then said_local(g.params[k].0) else s"#${k + 1}"
     val inner = box_why_said(cx, cx.whys.get(key).unwrap(), g)
 
-    s"it is handed to '${said_func(callee)}'${said_line(f, at)}, which keeps its parameter '$param' ($inner)"
+    s"it is handed to ${said_callee(callee)}${said_line(f, at)}, which keeps its parameter '$param' ($inner)"
 end handed_said
 
 private unseen_said(cx: &BoxCx, callee: string) -> string = cx.index.get(callee) match
@@ -1490,14 +1494,20 @@ private said_text(f: TFunc, at: Span) -> string = f.src match
         if at.end > src.bytes.len || at.start >= at.end then "a place" else from_utf8_unchecked(src.text(at))
     None -> "a place"
 
-// A function as the reader wrote it: the last part of its qualified name.
+// A function as the reader wrote it: the last part of its qualified name -- an instance of a generic
+// by the generic's (`frame_limit.sysl`'s `instance_base`).
 private said_func(name: string) -> string
-    val q = qualified_name(name)
+    val q = qualified_name(instance_base(name))
 
     q.last_index_of(".") match
         Some(at) -> q[at + 1..<q.bytes.len]
         None -> q
 end said_func
+
+// A callee as a line names it: a function by its name in quotes, a closure's body (`$closure0.call`,
+// reached through a `&Fn`) as such.
+private said_callee(name: string) -> string =
+    if qualified_name(instance_base(name)).contains("$closure") then "a closure" else s"'${said_func(name)}'"
 
 // A local as the reader wrote it: a shadowing declaration's own name carries a `.N` the reader never
 // wrote.
