@@ -37,6 +37,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.fs.errtext`](sysl-fs-errtext/) |  |
 | [`sysl.fs.hosted`](sysl-fs-hosted/) |  |
 | [`sysl.fs.sys`](sysl-fs-sys/) |  |
+| [`sysl.fs.watch`](sysl-fs-watch/) | Watching files and directories for changes: a `Watcher` holding any number of watches, whose descriptor is readable while it has something to report, and a `read` that answers what changed. |
 | [`sysl.harness`](sysl-harness/) | A test framework that runs on the target. |
 | [`sysl.hint`](sysl-hint/) | Hints to the optimizer that change what it may assume, never what a program computes. |
 | [`sysl.io`](sysl-io/) | The byte surface a program reads through, and the line cursor over it. |

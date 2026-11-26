@@ -377,6 +377,19 @@ create(path: string, mode: u32 = 0o666) -> Result[File, IoError] // makes one, o
 append(path: string, mode: u32 = 0o666) -> Result[File, IoError] // writes at the end
 open_update(path: string) -> Result[File, IoError]   // read and write; fails if it is not there
 create_update(path: string, mode: u32 = 0o666) -> Result[File, IoError] // read and write; empties what was there
+open_with(path: string, options: OpenOptions) -> Result[File, IoError] // exactly the options asked
+
+struct OpenOptions                                   // open_options() is the empty set
+    read(self) -> OpenOptions
+    write(self) -> OpenOptions
+    append(self) -> OpenOptions                      // implies write
+    truncate(self) -> OpenOptions                    // needs write
+    create(self) -> OpenOptions                      // O_CREAT
+    create_new(self) -> OpenOptions                  // O_CREAT | O_EXCL
+    sync(self) -> OpenOptions                        // O_SYNC
+    dsync(self) -> OpenOptions                       // O_DSYNC
+    nofollow(self) -> OpenOptions                    // O_NOFOLLOW
+    mode(self, bits: u32) -> OpenOptions             // a created file's permission bits
 ```
 
 **A `File` is a descriptor from `sysl.fs.sys` with a buffer in front of it, and the buffer is
@@ -415,6 +428,94 @@ remove_file(path).unwrap()
 
 ```output
 true true kept
+```
+
+### Saying the options one at a time
+
+**`open_with` opens a file with exactly the options in an `OpenOptions`**, for the combinations the five
+names above do not cover. `open_options()` is the empty set, and each member answers the set with one
+more thing asked, so a set reads as a chain and is a value a program can keep and open several files
+with. **Every option reaches the operating system or the open fails**; none is dropped quietly.
+
+- `read` and `write` say how the file is used; asking neither reads it. `append` writes at the end of
+  whatever is there at each write and implies `write`.
+- `truncate` empties a file that is there, and needs `write`: without it the open is refused with
+  `Other(22)` before the file is touched, since POSIX leaves `O_TRUNC` on a read-only open unspecified.
+- `create` makes the file where it is missing. **`create_new` makes it and fails with `AlreadyExists`
+  where anything is there** — a file, a directory, a symbolic link, even a dangling one — with the
+  check and the making one step (`O_CREAT | O_EXCL`). It is what a lock file or a never-overwrite
+  save needs, and what `exists` followed by `create` is not.
+- `sync` makes each write wait until the data and the metadata needed to read it back are on the
+  device (`O_SYNC`); `dsync` waits for the data, and the metadata only where reading the data needs it
+  (`O_DSYNC`, or `O_SYNC` where a C library has no `O_DSYNC`). They are the per-write form of
+  `full_sync` and `sync_data` below.
+- **`nofollow` refuses a symbolic link at the last component** (`O_NOFOLLOW`), and the error answers
+  `refused_link()`, as a `Dir`'s refusals do. A link in a directory above the last component is still
+  followed — confining a whole path is [`Dir`](#confined-to-one-directory)'s work — and a chain of
+  links that loops is refused the same way, since the kernel gives the two one code. Without
+  `nofollow` such a loop is an ordinary `Other` with the platform's `ELOOP`.
+- `mode` is the permission bits a file this open creates is born with, `0o666` unless asked and
+  narrowed by the umask, exactly as `create`'s; it applies only when the file is created, and bits
+  above the twelve permission bits are dropped.
+
+A target whose C library has no `O_SYNC` or no `O_NOFOLLOW` answers *not supported on this target* to
+an open asking for it.
+
+```sysl
+import sysl.fs.{open_with, open_options, metadata, read_text, remove_file, symlink, write_text}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-new-${pid()}.txt"
+val link = s"/tmp/sysl-fs-doc-new-${pid()}.link"
+val fresh = open_options().write().create_new().mode(0o600)
+
+var f = open_with(path, fresh).unwrap()
+
+f.write("first".bytes)
+f.close().unwrap()
+
+print(metadata(path).unwrap().permissions() == 0o600)
+print(open_with(path, fresh).unwrap_err())
+
+symlink(path, link).unwrap()
+
+val refused = open_with(link, open_options().write().truncate().nofollow()).unwrap_err()
+
+print(refused.refused_link(), refused)
+print(read_text(path).unwrap())
+
+remove_file(link).unwrap()
+remove_file(path).unwrap()
+```
+
+```output
+true
+already exists
+true the path goes through a symbolic link
+first
+```
+
+A file opened with `sync` or `dsync` is an ordinary `File`; each write that reaches the descriptor
+returns once it is on the device, so a buffered write is durable from the `flush` that sends it.
+
+```sysl
+import sysl.fs.{open_with, open_options, read_text, remove_file}
+import sysl.process.pid
+
+val path = s"/tmp/sysl-fs-doc-dsync-${pid()}.log"
+
+var log = open_with(path, open_options().append().create().dsync()).unwrap()
+
+log.write("entry 1\n".bytes)
+log.flush().unwrap()
+log.close().unwrap()
+
+print(read_text(path).unwrap() == "entry 1\n")
+remove_file(path).unwrap()
+```
+
+```output
+true
 ```
 
 ### It is a `Reader` and a `Writer`, whole
@@ -906,6 +1007,25 @@ false true 1
 false no such file or directory
 ```
 
+**A path holding a zero byte is refused, with `Other(22)` (`EINVAL`), by every call that takes one** —
+before C is asked, because C reads a path up to its first zero and the call would act on a different
+file than the one named (`open("a\0b")` would open `a`). Only the bytes of the path count, so a slice
+that ends before a zero is a fine path. `exists`, `is_file` and `is_dir` answer `false` for it.
+
+```sysl
+import sysl.fs.{metadata, exists}
+
+val p = "/tmp\0zzz"
+
+print(metadata(p).unwrap_err())
+print(exists(p), exists(p[0..<4]))
+```
+
+```output
+Invalid argument
+false true
+```
+
 **`exists` answers `false` for a path that exists under a directory the program may not search**,
 which is the one way it differs from the question it looks like it is asking. That case cannot be told
 from absence without a second call whose answer would already be stale — and every caller that
@@ -923,6 +1043,41 @@ which is why it is read through a call rather than written as a literal.
 concerned when both paths are on the same filesystem, and *fails* rather than copying when they are
 not. That is `rename(2)`'s contract and worth knowing, since a program moving a file across devices
 has to read and write it itself.
+
+**`rename_no_replace` moves a path only where nothing is at the destination**, and reports
+`AlreadyExists` where anything is — a file, a directory, a dangling link, and the moved file itself
+by the same path or a hard link, where `rename` succeeds doing nothing — leaving both names as they
+were. The check and the move are one step in the kernel: `renamex_np` with `RENAME_EXCL` on macOS,
+`renameat2` with `RENAME_NOREPLACE` on Linux. `exists` followed by `rename` is a race that replaces
+whatever appears between the two, so **a target with neither call answers *not supported on this
+target*** rather than that, and a Linux filesystem that cannot make the promise answers `Other(22)`
+(`EINVAL`).
+
+```sysl
+import sysl.fs.{read_text, remove_file, rename_no_replace, write_text}
+import sysl.process.pid
+
+val a = s"/tmp/sysl-fs-doc-rn-a-${pid()}.txt"
+val b = s"/tmp/sysl-fs-doc-rn-b-${pid()}.txt"
+val c = s"/tmp/sysl-fs-doc-rn-c-${pid()}.txt"
+
+write_text(a, "from").unwrap()
+write_text(b, "to").unwrap()
+
+print(rename_no_replace(a, b).unwrap_err(), read_text(b).unwrap())
+
+rename_no_replace(a, c).unwrap()
+
+print(read_text(c).unwrap())
+
+remove_file(b).unwrap()
+remove_file(c).unwrap()
+```
+
+```output
+already exists to
+from
+```
 
 **`make_dir` makes one directory and needs its parent to be there.** It asks for `0o777`, letting the
 process umask narrow it: asking for less would override the environment's decision rather than defer
@@ -1079,10 +1234,11 @@ false true
 **`Meta.owner` and `Meta.group` are `u32`s, the type [`sysl.process.user()`](/library/process/#who-the-program-is)
 answers**, so "is this file mine" is one comparison with nothing converted on either side.
 `set_owner(path, owner, group)` is the writing half, beside `set_permissions` and over one `chown`:
-it sets both, so a program changing only one passes the other as `metadata` read it.
+it sets both, and a program changing only one passes `unchanged` for the other, the `4294967295` that
+`chown(2)` reads as "leave this id as it is".
 
 ```sysl
-import sysl.fs.{write_text, metadata, set_owner, remove_file}
+import sysl.fs.{write_text, metadata, set_owner, remove_file, unchanged}
 import sysl.process.{pid, user}
 
 val path = s"/tmp/sysl-fs-doc-owner-${pid()}.txt"
@@ -1096,10 +1252,18 @@ print(m.owner == user())
 set_owner(path, m.owner, m.group).unwrap()
 print(metadata(path).unwrap().owner == m.owner)
 
+set_owner(path, unchanged, m.group).unwrap()
+print(metadata(path).unwrap().owner == m.owner)
+
+set_owner(path, unchanged, unchanged).unwrap()
+print(unchanged == 4294967295)
+
 remove_file(path).unwrap()
 ```
 
 ```output
+true
+true
 true
 true
 ```
@@ -1638,8 +1802,8 @@ and outlives it; the `Dir`'s descriptor is closed when its last reference goes.
 ## Answering the filesystem on a freestanding target
 
 **Everything above reaches the filesystem through `sysl.fs.sys` and through nothing else**: one
-`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit),
-`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_lchown` and `_space` (asked only by a program that calls `set_link_owner` or `space`), `_opendir`,
+`extern` per call — `sysl_fs_open`, `_read`, `_write`, `_pread`, `_pwrite`, `_sync`, `_close`, `_seek`, `_fstat`, `_ftruncate`, `_map`, `_unmap`, `_advise` and `_page_size` (the last two asked only by a program that advises a mapping; `_page_size` answers `usize`, zero meaning 4096; `_sync_data`, `_full_sync`, `_map_shared` and `_msync` asked only by a program that calls `sync_data`, `full_sync`, `map_mut` or a flush, and the `open` flags carry an uncached bit and, from `open_with`, an exclusive, a sync, a dsync and a nofollow bit),
+`_stat`, `_truncate`, `_mkdir`, `_rmdir`, `_unlink`, `_rename`, `_rename_no_replace` (asked only by a program that calls `rename_no_replace`), `_access`, `_chmod`, `_fchmod` (asked only by a program that calls `File.set_permissions`), `_chown`, `_lchown` and `_space` (asked only by a program that calls `set_link_owner` or `space`), `_opendir`,
 `_readdir`, `_closedir`, `_getcwd`, `_chdir`, `_temp_dir`, `_symlink`, `_link`, `_readlink` and
 `_realpath`, and for a `Dir` `_dir_open`, `_open_beneath`, `_stat_beneath` and `_unlink_beneath`,
 which refuse a link with `ELOOP` and an escape with `EXDEV`. Each answers an `int` by the contract every `*.sys` module has
