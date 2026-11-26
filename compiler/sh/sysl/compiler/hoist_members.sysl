@@ -1194,8 +1194,17 @@ private bounded_pass(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: B
                      others: Buf[Binding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
+    // A value parameter's symbol is its place among every value parameter in reach, the enclosing
+    // block's first, so a member's own `M` is never the block's `N`.
+    var values = 0
+
     for item in outer
         out.push(item)
+
+        item.ty match
+            ConstArg(_, _, true, _) -> values += 1
+            _ -> ()
+    end for
 
     for tp in tparams
         val written = binding_named(tvalues, tp)
@@ -1205,7 +1214,8 @@ private bounded_pass(a: &Analysis, scope: Scope, tparams: Buf[string], bounds: B
         // that checks a generic body read `[N]T` as an array and `N` as a `usize`.
         if written.is_some()
             out.push(Binding(tp, ConstArg(from_int(0), resolve_type(a, scope, written.unwrap(),
-                                                                    others), true, term_symbol(tp))))
+                                                                    others), true, term_param(values, tp))))
+            values += 1
         else if holds_string(tpacks, tp)
             // A **pack** stands at **two** types, each carrying the pack's own bounds, because an
             // unrolled loop has no fixed length for this walk to run at. Two rather than one is what
