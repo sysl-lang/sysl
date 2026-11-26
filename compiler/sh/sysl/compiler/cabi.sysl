@@ -99,6 +99,11 @@ c_result(l: TargetLayout, t: Type, target: Target) -> CResult
 
     if !c_aggregate(l, t) then return CrPlain
 
+    // **An `Option` of a pointer that is never null is C's nullable `T *`**, so it comes back as the
+    // pointer C declares -- `ptr`, as clang's does -- and not as a one-word struct coerced to an
+    // integer, which is the same register on the hosted machines but not the same declaration.
+    if option_of_nonnull_pointer(t) then return CrCoerced(LPtr)
+
     c_shape(l, t, target) match
         CsMemory -> CrSret(c_lty(l, t), int(l.align(t)))
         CsSplit(_) -> CrSret(c_lty(l, t), int(l.align(t)))
@@ -113,6 +118,15 @@ c_param(l: TargetLayout, t: Type, target: Target) -> CParam
         None -> ()
 
     if !c_aggregate(l, t) then return CpPlain
+
+    // C's nullable `T *` crosses as the pointer, on a convention that passes a one-word struct in whole
+    // words (AAPCS32) as much as on one that reads its pieces.
+    if option_of_nonnull_pointer(t)
+        var one: Buf[IrParam] = buf()
+
+        one.push(IrParam(LPtr, no_ir_attrs(), None))
+        return CpCoerced(one)
+    end if
 
     c_shape(l, t, target) match
         CsMemory -> c_stack_copy(l, t, target) match
@@ -730,7 +744,7 @@ private c_walk(l: TargetLayout, t: Type, at: usize, acc: *Buf[(usize, Type)], vi
         // A null-niche enum is one address, and travels as the nullable pointer C declares.
         Enum(d) ->
             if d.simple then acc.push((at, underlying(t)))
-            else if null_niche(d) then acc.push((at, Ptr(byte_type(), false)))
+            else if null_niche(d) then acc.push((at, Ptr(byte_type(), false, false)))
             else
                 val unit = max_usize_c(1, l.payload_align(d))
                 val start = at + round_up(4, unit)
@@ -748,12 +762,12 @@ private c_walk(l: TargetLayout, t: Type, at: usize, acc: *Buf[(usize, Type)], vi
 
         VaList ->
             for i in 0..<4
-                acc.push((at + usize(i) * l.pointer_bytes(), Ptr(byte_type(), false)))
+                acc.push((at + usize(i) * l.pointer_bytes(), Ptr(byte_type(), false, false)))
 
         p ->
             if erased(p) || c_erased_weak(p)
-                acc.push((at, Ptr(byte_type(), false)))
-                acc.push((at + l.pointer_bytes(), Ptr(byte_type(), false)))
+                acc.push((at, Ptr(byte_type(), false, false)))
+                acc.push((at + l.pointer_bytes(), Ptr(byte_type(), false, false)))
             else acc.push((at, p))
 end c_walk
 
@@ -876,8 +890,8 @@ end c_zero_blocks
 private c_walk_view(l: TargetLayout, at: usize, acc: *Buf[(usize, Type)])
     val w = l.pointer_bytes()
 
-    acc.push((at, Ptr(byte_type(), false)))
-    acc.push((at + w, Ptr(byte_type(), false)))
+    acc.push((at, Ptr(byte_type(), false, false)))
+    acc.push((at + w, Ptr(byte_type(), false, false)))
     acc.push((at + w * 2, usize_type(int(l.word_bits))))
 end c_walk_view
 
@@ -892,7 +906,7 @@ private c_floating(t: Type) -> bool = underlying(t) match
     _ -> false
 
 private c_address(t: Type) -> bool = underlying(t) match
-    Ptr(_, _) -> true
+    Ptr(_, _, _) -> true
     Ref(_, _) -> true
     Weak(_) -> true
     CFn(_, _, _) -> true

@@ -1,0 +1,54 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **The two places a `*nonnull T` is C's promise rather than sysl's proof**
+// (`reference/ffi.md § A pointer C never makes null`): the answer of an `extern` (or of a call through
+// a `*extern` pointer) and a parameter of an `@export` a C caller fills. Each is checked where C hands
+// it over -- one compare against null and a trap naming who broke the promise -- so a wrong binding
+// stops at the boundary instead of reading as a `None` made out of a `Some` somewhere later. `@unchecked`
+// above the declaration takes the promise on trust and drops the check.
+//
+// Everywhere sysl itself made the pointer -- an `&x`, a `.nonnull()` matched, an `into_raw` -- the
+// type is the proof, and the emitted LLVM says so: `nonnull` on such a parameter (`emit_sig.sysl`'s
+// `frame_attrs`), on an argument handed to C, and on an answer taken on trust, and `!nonnull` on a
+// plain load of one (`emit_place.sysl`'s `load_place`). A checked answer or entry carries no such
+// attribute, which would let the optimizer fold the check away.
+
+// The value C answered at type `ty`, checked not to be null where `ty` is a pointer that is never
+// null; `callee` names whoever answered it in the trap's report. Any other type comes back untouched,
+// and nothing is emitted for it.
+checked_answer(e: *Emit, v: Val, ty: Type, callee: string) -> Val
+    if !never_null_pointer(ty) then return v
+
+    val ok = fresh_reg(e)
+
+    emit(e, InIntCmp(ok, INe, LPtr, v, VNull))
+    trap_unless(e, ok, "nonnull_answer", callee)
+    v
+end checked_answer
+
+// The same at an export's entry: `v` is the register a C caller put a parameter of type `ty` in, and
+// `symbol` the export it called.
+checked_entry(e: *Emit, v: Val, ty: Type, symbol: string)
+    if !never_null_pointer(ty) then return
+
+    val ok = fresh_reg(e)
+
+    emit(e, InIntCmp(ok, INe, LPtr, v, VNull))
+    trap_unless(e, ok, "nonnull_entry", symbol)
+end checked_entry
+
+// The attributes of a value of type `ty` that sysl proved, with `nonnull` among them where `ty` is a
+// pointer that is never null.
+proved_nonnull(attrs: Buf[IrAttr], ty: Type) -> Buf[IrAttr]
+    if !never_null_pointer(ty) then return attrs
+
+    var out: Buf[IrAttr] = buf()
+
+    for a in attrs
+        out.push(a)
+
+    out.push(AttrNonNull)
+    out
+end proved_nonnull

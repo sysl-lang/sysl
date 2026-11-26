@@ -1,0 +1,316 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.replace_all
+
+// **The C boundary of a `*nonnull T`** (`reference/ffi.md § A pointer C never makes null`): every
+// position is a plain `T *`, and `Option[*nonnull T]` is C's nullable `T *`, `NULL` for `None`. Where
+// C hands sysl a promise it cannot verify -- an `extern`'s answer, a C caller's argument to an
+// `@export` -- the pointer is checked and a null traps naming the declaration; `@unchecked` above it
+// drops the check. Where sysl proved it -- an argument handed to C, an export's answer -- LLVM is told
+// `nonnull`.
+//
+// The axes: the four positions of the design's table at both types; the declare line against
+// clang's for the same C; the check's trap and its absence under `@unchecked`; the `nonnull`
+// attribute where sysl proved it and its absence where a check follows; a call through a
+// `*extern` pointer; the header an export publishes; the refusal of `Option[*T]`, now offering the
+// matched form; a freestanding target.
+//
+// Skipped cells: a 32-bit hosted target, whose declare differs from the 64-bit one only in the word
+// it does not name (`ptr` is width-free).
+
+// -- the four positions ----------------------------------------------------------------------------
+
+@test("an extern answering Option[*nonnull T] is matched; one taking it is handed NULL for None")
+tnn_extern_option()
+    tnn_prints(raw"""
+        extern strchr(s: *nonnull u8, c: i32) -> Option[*nonnull u8]
+        extern c_len_or(s: Option[*nonnull u8]) -> i32
+
+        for c in ['l', 'z']
+            strchr(c"hello", i32(c)) match
+                Some(at) -> print(at[0], c_len_or(Some(at)))
+                None -> print("absent", c_len_or(None))
+        """, raw"""
+        #include <stdint.h>
+        #include <string.h>
+
+        int32_t c_len_or(const char *s) { return s ? (int32_t) strlen(s) : -1; }
+        """, "108 3\nabsent -1\n")
+
+@test("an extern answering *nonnull T is checked at the call, and a NULL traps naming it")
+tnn_extern_answer_checked()
+    if !tnn_ready() then return
+
+    val out = tnn_outcome(raw"""
+        extern c_give(ok: i32) -> *nonnull i32
+
+        print(*c_give(1))
+        print(*c_give(0))
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
+
+        static int32_t seven = 7;
+        int32_t *c_give(int32_t ok) { return ok ? &seven : NULL; }
+        """)
+
+    assert_eq(out.1, 133)
+    tnn_says(out.0, "7\n")
+    tnn_says(out.0, "'c_give' answered null for its '*nonnull' result")
+
+@test("@unchecked above the extern drops the check, and the answer is said to be nonnull")
+tnn_extern_unchecked()
+    tnn_prints(raw"""
+        @unchecked
+        extern c_give(ok: i32) -> *nonnull i32
+
+        print(*c_give(1))
+        """, raw"""
+        #include <stdint.h>
+
+        static int32_t seven = 7;
+        int32_t *c_give(int32_t ok) { return &seven; }
+        """, "7\n")
+
+    if std_root().is_err() then return
+
+    val trusted = tnn_build("@unchecked\nextern c_give(ok: i32) -> *nonnull i32\n\nprint(*c_give(1))\n", host_target())
+
+    assert_eq(trusted.0, "")
+    tnn_says(trusted.1, "call nonnull ptr @c_give(")
+    tnn_lacks(trusted.1, "answered_null")
+
+    val checked = tnn_build("extern c_give(ok: i32) -> *nonnull i32\n\nprint(*c_give(1))\n", host_target())
+
+    assert_eq(checked.0, "")
+    tnn_lacks(checked.1, "call nonnull ptr @c_give(")
+    tnn_says(checked.1, "answered_null_for_its")
+
+@test("an @export taking *nonnull T checks a C caller's NULL at entry; @unchecked drops it")
+tnn_export_entry_checked()
+    if !tnn_ready() then return
+
+    val out = tnn_outcome(raw"""
+        extern c_call_with(ok: i32) -> i32
+
+        @export("s_read")
+        read(p: *nonnull i32) -> i32 = *p
+
+        print(c_call_with(1))
+        print(c_call_with(0))
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
+
+        int32_t s_read(int32_t *p);
+        static int32_t five = 5;
+        int32_t c_call_with(int32_t ok) { return s_read(ok ? &five : NULL); }
+        """)
+
+    assert_eq(out.1, 133)
+    tnn_says(out.0, "5\n")
+    tnn_says(out.0, "C handed null to a '*nonnull' parameter of 's_read'")
+
+    if std_root().is_err() then return
+
+    val trusted = tnn_build("@unchecked\n@export(\"s_read\")\nread(p: *nonnull i32) -> i32 = *p\n", host_target())
+
+    assert_eq(trusted.0, "")
+    tnn_lacks(trusted.1, "handed_null")
+
+@test("an @export answering Option[*nonnull T] answers NULL for None; one taking it is matched")
+tnn_export_option()
+    tnn_prints(raw"""
+        extern c_round(x: i32) -> i32
+
+        @export("s_find")
+        find(at: *nonnull i32, want: i32) -> Option[*nonnull i32] = if *at == want then Some(at) else None
+
+        @export("s_or")
+        or_minus(p: Option[*nonnull i32]) -> i32 = p match
+            Some(q) -> *q
+            None -> -1
+
+        print(c_round(4), c_round(5))
+        """, raw"""
+        #include <stdint.h>
+        #include <stddef.h>
+
+        int32_t *s_find(int32_t *at, int32_t want);
+        int32_t s_or(int32_t *p);
+        static int32_t four = 4;
+        int32_t c_round(int32_t x) { int32_t *p = s_find(&four, x); return p == NULL ? 100 + s_or(NULL) : s_or(p); }
+        """, "4 99\n")
+
+@test("a bare @unchecked above a function that is not exported is refused")
+tnn_unchecked_needs_export()
+    tnn_refused("@unchecked\n@inline\nread(p: *nonnull i32) -> i32 = *p\n",
+                "'@unchecked' above a function drops the null check an '@export' makes of a '*nonnull' parameter C hands it, and this function is not exported")
+
+// -- what LLVM is told ------------------------------------------------------------------------------
+
+@test("an argument sysl hands C as *nonnull T carries nonnull; a *T argument does not")
+tnn_extern_argument_attr()
+    if std_root().is_err() then return
+
+    val b = tnn_build(raw"""
+        extern c_take(p: *nonnull i32, q: *i32)
+
+        var x: i32 = 1
+
+        c_take(&x, &x)
+        """, host_target())
+
+    assert_eq(b.0, "")
+    tnn_says(b.1, "(ptr nonnull ")
+    tnn_lacks(b.1, ", ptr nonnull ")
+
+@test("a sysl function's *nonnull T parameter carries nonnull, and a load of one carries !nonnull")
+tnn_define_attr()
+    if std_root().is_err() then return
+
+    val b = tnn_build(raw"""
+        struct Holder
+            at: *nonnull i32
+
+        @noinline
+        read(p: *nonnull i32) -> i32 = *p
+
+        @noinline
+        through(h: *Holder) -> i32 = *h.at
+
+        var x: i32 = 3
+        var h = Holder(&x)
+
+        print(read(&x), through(&h))
+        """, host_target())
+
+    assert_eq(b.0, "")
+    tnn_says(b.1, "ptr nonnull %")
+    tnn_says(b.1, "!nonnull !{}")
+
+// -- against clang ---------------------------------------------------------------------------------
+
+private tnn_clang() -> Option[string]
+    for cc in ["/opt/homebrew/opt/llvm/bin/clang", "clang"]
+        val got = capture(cc, ["--version"], "", [], true)
+
+        got match
+            Ok(out) -> if out.status.ok() then return Some(cc)
+            Err(_) -> ()
+
+    None
+end tnn_clang
+
+// A declare line with the facts that are not the convention's answer taken away: linkage, attribute
+// groups, `noundef` and `nonnull`, which sysl puts at the call rather than on the declaration.
+private tnn_declare(ir: string, symbol: string) -> string
+    for l in lines_of(ir)
+        if l.starts_with("declare") && l.contains(s"@$symbol(")
+            var s = l
+
+            for junk in ["dso_local ", " #99", " #0", " #1", " #2", "noundef ", " noundef", " nonnull", "nonnull "]
+                s = replace_all(s, junk, "")
+
+            return s
+        end if
+
+    ""
+end tnn_declare
+
+@test("the declare of an extern over *nonnull T and Option[*nonnull T] is clang's for the same C")
+tnn_against_clang()
+    if std_root().is_err() then return
+
+    val cc = tnn_clang()
+
+    if cc.is_none() then return
+
+    val root = make_temp_dir("sysl-tnn-cc").unwrap()
+
+    write_text(s"$root/x.c", raw"""
+        #include <stdint.h>
+        extern char *find(char *s, int32_t c);
+        extern char *maybe(char *s, int (*cb)(int));
+        void go(void) { find(0, 0); maybe(0, 0); }
+        """).unwrap()
+
+    val t = host_target()
+    val got = capture(cc.unwrap(), [s"--target=${t.triple}", "-S", "-emit-llvm", "-O0", "-o", "-", s"$root/x.c"],
+                      "", [], true).unwrap()
+
+    remove_dir_all(root).unwrap_or(())
+    assert(got.status.ok(), "clang refused the C")
+
+    val b = tnn_build(raw"""
+        extern find(s: *nonnull u8, c: i32) -> Option[*nonnull u8]
+        extern maybe(s: Option[*nonnull u8], cb: *nonnull extern(i32) -> i32) -> *nonnull u8
+
+        twice(n: i32) -> i32 = n * 2
+
+        print(find(c"x", 0).is_none(), usize(maybe(None, &twice)))
+        """, t)
+
+    assert_eq(b.0, "")
+    assert_eq(tnn_declare(b.1, "find"), tnn_declare(got.text, "find"))
+    assert_eq(tnn_declare(b.1, "maybe"), tnn_declare(got.text, "maybe"))
+
+@test("an export's header spells *nonnull T and Option[*nonnull T] as the plain T *")
+tnn_header()
+    if std_root().is_err() then return
+
+    val root = make_temp_dir("sysl-tnn-h").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", "module mylib\n\n@export(\"s_pick\")\n" +
+               "pick(p: *nonnull i32, q: Option[*nonnull i32]) -> Option[*nonnull i32] = q\n").unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [3]string = ["sysl", "emit-header", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var text = ""
+
+    for item in said
+        text = text + item + "\n"
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0)
+    tnn_says(text, "int32_t * s_pick(int32_t * p, int32_t * q);")
+
+// -- the refusal of Option[*T] ---------------------------------------------------------------------
+
+@test("an extern naming Option[*T] is still refused, now offering Option[*nonnull T], matched")
+tnn_option_ptr_offers()
+    tnn_refused("extern strchr(s: *u8, c: i32) -> Option[*u8]\n",
+                "A pointer C may make null is a plain '*byte', compared with 'null', or an 'Option[*nonnull byte]', matched")
+    tnn_refused("@export(\"s_pick\")\npick(p: Option[*i32]) -> int = 0\n",
+                "or an 'Option[*nonnull int]', matched")
+
+// -- a freestanding target -------------------------------------------------------------------------
+
+@test("on thumb-freestanding the checks and the niche build with nothing extern but the trap hook")
+tnn_freestanding()
+    if std_root().is_err() then return
+
+    val b = tnn_build(raw"""
+        extern c_give() -> *nonnull u32
+        extern c_take(p: Option[*nonnull u32])
+
+        @export("go")
+        go(p: *nonnull u32) -> u32
+            c_take(None)
+            *c_give() + *p
+        """, target_named("thumb-freestanding").unwrap())
+
+    assert_eq(b.0, "")
+    tnn_says(b.1, "void @c_take(ptr)")
+    tnn_says(b.1, "call void @c_take(ptr ")
+    tnn_says(b.1, "icmp ne ptr")
+    tnn_says(b.1, "define dso_local i32 @go$$sysl(ptr nonnull %p.param)")

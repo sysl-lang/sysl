@@ -98,7 +98,7 @@ mentions_abstract(t: Type) -> bool = t match
     Results(parts) -> any_mentions_abstract(parts.targs)
     // A `new` type's parameters are carried for typing alone, and still make it generic.
     Constrained(d) -> any_mentions_abstract(d.targs)
-    Ptr(inner, _) -> mentions_abstract(*inner)
+    Ptr(inner, _, _) -> mentions_abstract(*inner)
     Ref(inner, _) -> mentions_abstract(*inner)
     Weak(inner) -> mentions_abstract(*inner)
     Array(_, elem, _) -> mentions_abstract(*elem)
@@ -129,7 +129,7 @@ stand_in_tag(t: Type) -> string = t match
     Struct(d) -> if is_closure_literal(t) then s"{${d.base}}" else tag_list(d.targs)
     Enum(d) -> tag_list(d.targs)
     Results(parts) -> tag_list(parts.targs)
-    Ptr(inner, _) -> stand_in_tag(*inner)
+    Ptr(inner, _, _) -> stand_in_tag(*inner)
     Ref(inner, _) -> stand_in_tag(*inner)
     Weak(inner) -> stand_in_tag(*inner)
     // A length's form likewise, so `[N]T` and `[M]T` are two.
@@ -193,7 +193,7 @@ mentions_unknown(t: Type) -> bool = t match
     Struct(d) -> any_mentions_unknown(d.targs)
     Enum(d) -> any_mentions_unknown(d.targs)
     Results(parts) -> any_mentions_unknown(parts.targs)
-    Ptr(inner, _) -> mentions_unknown(*inner)
+    Ptr(inner, _, _) -> mentions_unknown(*inner)
     Ref(inner, _) -> mentions_unknown(*inner)
     Weak(inner) -> mentions_unknown(*inner)
     Array(_, elem, _) -> mentions_unknown(*elem)
@@ -272,7 +272,7 @@ nameless(t: Type) -> Type = if !holds_name_only(t) then t else stripped_names(t)
 // Whether there is anything for `nameless` to take off, so the common case allocates nothing.
 private holds_name_only(t: Type) -> bool = t match
     Constrained(d) -> name_only(d)
-    Ptr(inner, _) -> holds_name_only(*inner)
+    Ptr(inner, _, _) -> holds_name_only(*inner)
     Ref(inner, _) -> holds_name_only(*inner)
     Weak(inner) -> holds_name_only(*inner)
     Array(_, elem, _) -> holds_name_only(*elem)
@@ -292,7 +292,7 @@ end any_name_only
 
 private stripped_names(t: Type) -> Type = t match
     Constrained(d) -> if name_only(d) then nameless(d.base) else t
-    Ptr(inner, ro) -> Ptr(nameless(*inner), ro)
+    Ptr(inner, ro, nn) -> Ptr(nameless(*inner), ro, nn)
     Ref(inner, sync) -> Ref(nameless(*inner), sync)
     Weak(inner) -> Weak(nameless(*inner))
     Array(n, elem, term) -> Array(n, nameless(*elem), term)
@@ -434,7 +434,7 @@ read_only_view(t: Type) -> bool = t match
 
 // Whether the type is a `*const T`, whatever name it is reached under.
 read_only_pointer(t: Type) -> bool = repr(t) match
-    Ptr(_, ro) -> ro
+    Ptr(_, ro, _) -> ro
     _ -> false
 
 // Whether the type is a view at all: a slice, or the string that is one over bytes.
@@ -457,7 +457,7 @@ const_view(t: Type) -> Type = t match
 // What a `TConstView` makes of its operand: the read-only view of a view, and the `*const T` of a
 // pointer.
 read_only_of(t: Type) -> Type = t match
-    Ptr(e, _) -> Ptr(e, true)
+    Ptr(e, _, nn) -> Ptr(e, true, nn)
     _ -> const_view(t)
 
 // The element of anything indexable.
@@ -466,7 +466,7 @@ element(t: Type) -> Option[Type] = t match
     Vector(_, e, _) -> Some(*e)
     Slice(e, _) -> Some(*e)
     Str -> Some(byte_type())
-    Ptr(e, _) -> Some(*e)
+    Ptr(e, _, _) -> Some(*e)
     // An exported alias of a pointer is indexed as the pointer it names.
     Constrained(d) -> if name_only(d) then element(d.base) else None
     _ -> None
@@ -481,7 +481,7 @@ pointee(t: Type) -> Option[Type]
     if erased(t) then return None
 
     t match
-        Ptr(inner, _) -> Some(*inner)
+        Ptr(inner, _, _) -> Some(*inner)
         Ref(inner, _) -> Some(*inner)
         Constrained(d) ->
             if d.cname.is_some() && !d.derived && d.lo.is_none() && d.hi.is_none() &&
@@ -495,12 +495,12 @@ end pointee
 // table, and not a second reference, which a member call does not reach past either.
 bound_referent(t: Type) -> Option[Type]
     val inner = t match
-        Ptr(i, _) -> *i
+        Ptr(i, _, _) -> *i
         Ref(i, _) -> *i
         _ -> return None
 
     inner match
-        Ptr(_, _) -> None
+        Ptr(_, _, _) -> None
         Ref(_, _) -> None
         Trait(_, _, _) -> None
         Pack(_) -> None
@@ -513,7 +513,7 @@ erased(t: Type) -> bool = erased_trait(t).is_some()
 
 // The trait an erased pointer was made against.
 erased_trait(t: Type) -> Option[Type] = t match
-    Ptr(inner, _) -> if is_trait(*inner) then Some(*inner) else None
+    Ptr(inner, _, _) -> if is_trait(*inner) then Some(*inner) else None
     Ref(inner, _) -> if is_trait(*inner) then Some(*inner) else None
     _ -> None
 
@@ -559,7 +559,7 @@ is_equatable(t: Type) -> bool
     // A pointer to a trait compares by its address, as any pointer does; a reference to one has
     // forgotten the type that would say what equal means.
     if erased(t) then return underlying(t) match
-        Ptr(_, _) -> true
+        Ptr(_, _, _) -> true
         _ -> false
 
     // A constrained type compares as its base does: a name-only one (an exported alias over a pointer
@@ -567,7 +567,7 @@ is_equatable(t: Type) -> bool
     t match
         Constrained(d) -> is_equatable(d.base)
         Bool -> true
-        Ptr(_, _) -> true
+        Ptr(_, _, _) -> true
         Ref(_, _) -> true
         CFn(_, _, _) -> true
         Enum(d) -> d.simple
@@ -615,8 +615,10 @@ has_zero(t: Type) -> bool = t match
     Fixed(_, _, _) -> true
     Char -> true
     Bool -> true
-    Ptr(_, _) -> true
-    CFn(_, _, _) -> true
+    // A pointer that is never null has no zero, as a `&T` has none: its one forbidden value is the
+    // all-zero bytes.
+    Ptr(_, _, nn) -> !nn
+    CFn(_, _, marks) -> !marks_nonnull(marks)
     VaList -> true
     Slice(_, _) -> true
     Str -> true

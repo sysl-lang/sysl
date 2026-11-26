@@ -455,10 +455,23 @@ private null_literal(cx: &Analyzer, span: Span, expected: Option[Type]) -> TExpr
     val want = expected.unwrap()
 
     nameless(want) match
-        Ptr(_, _) -> TExpr(span, TNullLit(want))
-        CFn(_, _, _) -> TExpr(span, TNullLit(want))
+        Ptr(_, _, nn) ->
+            if nn then return cx.err(span, null_into_nonnull(want))
+
+            TExpr(span, TNullLit(want))
+        CFn(_, _, marks) ->
+            if marks_nonnull(marks) then return cx.err(span, null_into_nonnull(want))
+
+            TExpr(span, TNullLit(want))
         _ -> cx.err(span, s"'null' is a raw pointer, and ${type_show(want)} was expected here")
 end null_literal
+
+// **The refusal of `null` where a pointer that is never null is wanted**, naming the type that holds a
+// pointer which may be absent.
+null_into_nonnull(want: Type) -> string =
+    s"'null' is the address a '${type_show(want)}' never holds, so it is neither stored in one nor " +
+    s"compared with one — a pointer that may be absent is an 'Option[${type_show(want)}]', one word all " +
+    "the same, whose null is 'None'"
 
 // -- names ---------------------------------------------------------------------------------------
 
@@ -1946,7 +1959,7 @@ private builtin(cx: &Analyzer, span: Span, name: string, expected: Option[Type])
     // written -- in a default, the call's. It stands at the call's span, which is what the lowering
     // names where it is not handed one. Module storage has no caller, so there it is null.
     if name == "__CALLER__"
-        if site.func == "" then return TExpr(span, TNullLit(Ptr(byte_type(), false)))
+        if site.func == "" then return TExpr(span, TNullLit(Ptr(byte_type(), false, false)))
 
         return TExpr(at, TCStrLit(caller_sentinel()))
     end if
@@ -2020,7 +2033,7 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
                               s"$box is put in one where it stands")
             _ -> ()
 
-        return address_expr(cx, e.span, operand)
+        return address_expr(cx, e.span, operand, wants_non_null(expected))
     end if
     if op == "*" then return deref_expr(cx, e.span, operand)
 
@@ -2073,7 +2086,11 @@ end unary_expr
 // **A name is asking for THAT thing's address, so it is answered rather than given a copy.**
 // Something computed has no address of its own, so one is made for it: the value is written into a
 // hidden local of this scope and what comes back is that slot's address.
-private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
+//
+// **An address is never null, so it is a `*nonnull T` where the position wants one** (`non_null`),
+// and the `*T` it has always been everywhere else: a `val p = &x` stays a pointer that may later be
+// set to `null`.
+private address_expr(cx: &Analyzer, span: Span, operand: Expr, non_null: bool) -> TExpr
     // A nested function's environment is the frame it was declared in, and an address is a way of
     // carrying it out of that frame -- the same reason the name is not a value either.
     val named = nested_ident(operand)
@@ -2117,7 +2134,7 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
         refuse_ref_call_address(cx, span, place)
         note_counted_address(cx, span, place)
 
-        return TExpr(span, TAddrOf(place, Ptr(place_type(place), false)))
+        return TExpr(span, TAddrOf(place, Ptr(place_type(place), false, non_null)))
 
     // A value nothing occupies has no storage to point at, and a pointer to it could only ever be
     // read through to produce nothing.
@@ -2128,8 +2145,16 @@ private address_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
     // An opaque type's shape is its module's, so there is no slot to lay one down in out here.
     if !value_layout_known(cx, span, ty) then return bad_expr(span)
 
-    TExpr(span, TTempAddr(t, Ptr(ty, false)))
+    TExpr(span, TTempAddr(t, Ptr(ty, false, non_null)))
 end address_expr
+
+// Whether a position wants a pointer that is never null: a `*nonnull T` or a `*const nonnull T`,
+// under whatever name it was written.
+wants_non_null(expected: Option[Type]) -> bool = expected match
+    Some(t) -> nameless(t) match
+        Ptr(_, _, nn) -> nn
+        _ -> false
+    None -> false
 
 private deref_expr(cx: &Analyzer, span: Span, operand: Expr) -> TExpr
     val t = type_expr_bare(cx, operand)
@@ -2590,7 +2615,7 @@ private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Typ
     val ub = underlying(b)
     val addressed = ua match
         Ref(_, _) -> true
-        Ptr(_, _) -> true
+        Ptr(_, _, _) -> true
         _ -> false
 
     if !addressed
@@ -2618,8 +2643,8 @@ private same_handle_kind(a: Type, b: Type) -> bool = a match
     Ref(_, sa) -> b match
         Ref(_, sb) -> sa == sb
         _ -> false
-    Ptr(_, _) -> b match
-        Ptr(_, _) -> true
+    Ptr(_, _, _) -> b match
+        Ptr(_, _, _) -> true
         _ -> false
     _ -> false
 
@@ -3179,7 +3204,7 @@ private points_at_conformer(cx: &Analyzer, from: Type, to: Type) -> bool
     if tr.is_none() then return false
 
     (from, to) match
-        (Ptr(inner, _), Ptr(_, _)) -> !is_trait(*inner) && conforms(cx.an, trait_bound_of(tr.unwrap()), *inner)
+        (Ptr(inner, _, _), Ptr(_, _, _)) -> !is_trait(*inner) && conforms(cx.an, trait_bound_of(tr.unwrap()), *inner)
         _ -> false
 end points_at_conformer
 
@@ -3203,16 +3228,24 @@ private meet_views(taken: Type, read: Buf[Option[TExpr]]) -> Type
 
             taken
         // A `*T` and a `*const T` meet at the read-only pointer for the same reason.
-        Ptr(inner, read_only) ->
-            if read_only then return taken
+        // A `*nonnull T` and a `*T` meet at the pointer that may be null, which either side converts
+        // to, and every mix of the two words meets at the pointer that promises the least.
+        Ptr(inner, read_only, non_null) ->
+            var ro = read_only
+            var nn = non_null
 
             for item in read
                 item match
-                    Some(t) -> if type_eq(texpr_type(t), Ptr(*inner, true)) then
-                                   return Ptr(*inner, true)
+                    Some(t) -> texpr_type(t) match
+                        Ptr(i, iro, inn) ->
+                            if type_eq(*i, *inner)
+                                ro = ro || iro
+                                nn = nn && inn
+                            end if
+                        _ -> ()
                     None -> ()
 
-            taken
+            if ro == read_only && nn == non_null then taken else Ptr(*inner, ro, nn)
         _ -> taken
 end meet_views
 
@@ -3284,7 +3317,7 @@ end collection_expected
 
 private inner_of(t: Type) -> Type = t match
     Ref(inner, _) -> inner_of(*inner)
-    Ptr(inner, _) -> inner_of(*inner)
+    Ptr(inner, _, _) -> inner_of(*inner)
     Weak(inner) -> inner_of(*inner)
     Volatile(inner) -> inner_of(*inner)
     other -> other

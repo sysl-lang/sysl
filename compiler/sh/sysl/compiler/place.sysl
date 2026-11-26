@@ -181,7 +181,7 @@ writable_place(t: TExpr) -> bool = *t.kind match
     TIndex(recv, _, _) -> texpr_type(recv) match
         Slice(_, _) -> true
         Str -> false
-        Ptr(_, _) -> true
+        Ptr(_, _, _) -> true
         _ -> writable_place(recv)
     _ -> false
 
@@ -391,19 +391,19 @@ const_pointer_of(cx: &Analyzer, t: TExpr) -> Option[Type] = *t.kind match
         val rt = texpr_type(recv)
 
         repr(rt) match
-            Ptr(_, ro) -> if ro then Some(rt) else None
+            Ptr(_, ro, _) -> if ro then Some(rt) else None
             _ -> if owns_its_elements(rt) then const_pointer_of(cx, recv) else None
     TField(recv, _, _) ->
         val rt = texpr_type(recv)
 
         repr(rt) match
-            Ptr(_, ro) -> if ro then Some(rt) else None
+            Ptr(_, ro, _) -> if ro then Some(rt) else None
             _ -> if holds_an_address(rt) then None else const_pointer_of(cx, recv)
     TLoad(name, _) -> ref_place(cx, name) match
         Some(p) -> const_pointer_of(cx, p)
         None -> None
     TDeref(p, _) -> repr(texpr_type(p)) match
-        Ptr(_, ro) -> if ro then Some(texpr_type(p)) else None
+        Ptr(_, ro, _) -> if ro then Some(texpr_type(p)) else None
         _ -> ref_call_place(cx, t) match
             Some(v) -> const_pointer_of(cx, v)
             None -> None
@@ -411,7 +411,7 @@ const_pointer_of(cx: &Analyzer, t: TExpr) -> Option[Type] = *t.kind match
 
 // What a pointer type points at.
 private pointee_of(t: Type) -> Type = repr(t) match
-    Ptr(inner, _) -> *inner
+    Ptr(inner, _, _) -> *inner
     _ -> Unknown
 
 // Whether a value of this type is an address of storage kept elsewhere -- a counted box, a weak
@@ -419,7 +419,7 @@ private pointee_of(t: Type) -> Type = repr(t) match
 private holds_an_address(t: Type) -> bool = repr(t) match
     Ref(_, _) -> true
     Weak(_) -> true
-    Ptr(_, _) -> true
+    Ptr(_, _, _) -> true
     _ -> false
 
 // The `&sync` box an array lives inside, where a view of it would be a view into that box: a
@@ -725,7 +725,7 @@ private encloses_hazard(cx: &Analyzer, place: TExpr, key: string) -> bool
         if owning_step(ty) || (through_call && holds_storage(ty)) then below = true
 
         repr(ty) match
-            Ptr(_, _) -> below = false
+            Ptr(_, _, _) -> below = false
             _ -> ()
 
         through_call = placed_by(cx, step).is_some()
@@ -913,7 +913,7 @@ end holders_have
 
 private indirect_type(t: Type) -> bool = repr(t) match
     Ref(_, _) -> true
-    Ptr(_, _) -> true
+    Ptr(_, _, _) -> true
     Slice(_, _) -> true
     Str -> true
     _ -> false
@@ -1042,7 +1042,7 @@ note_counted_address(cx: &Analyzer, span: Span, place: TExpr)
         val step = at.unwrap()
         val ty = texpr_type(step)
         val pointer = repr(ty) match
-            Ptr(_, _) -> true
+            Ptr(_, _, _) -> true
             _ -> false
 
         if pointer

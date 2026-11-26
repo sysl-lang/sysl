@@ -613,6 +613,68 @@ absent
 The same holds for a `*extern` function pointer: a callback C may leave unset is a plain one,
 compared with `null`.
 
+### A pointer C never makes null
+
+**A [`*nonnull T`](/reference/memory/#nonnull-t-a-pointer-that-is-never-null) is a plain `T *` in
+every position, and an `Option[*nonnull T]` is the same one word, `NULL` for `None`.** So a binding
+can say which kind each C pointer is: never null, or maybe null and matched. The header spells both
+`T *`:
+
+```sysl
+extern strchr(s: *nonnull u8, c: i32) -> Option[*nonnull u8]
+
+for c in ['l', 'z']
+    strchr(c"hello", i32(c)) match
+        Some(at) -> print(at[0])
+        None -> print("absent")
+```
+
+```output
+108
+absent
+```
+
+| position | `*nonnull T` | `Option[*nonnull T]` |
+|---|---|---|
+| `extern` parameter | sysl proved it; C trusts it | `None` passes `NULL` |
+| `extern` result | **checked at the call**: a `NULL` traps, naming the `extern` | matched by the caller |
+| `@export` parameter | **checked at entry**: a C caller's `NULL` traps, naming the export | matched by the body |
+| `@export` result | sysl proved it | `None` returns `NULL` |
+
+**The two checks sit where C hands sysl a promise sysl cannot verify** — one compare per call, small
+beside the call — so a wrong binding stops at the boundary rather than reading as a `None` made out of
+a `Some` somewhere later. A call through a `*extern` answering a `*nonnull T` is checked the same way.
+`@unchecked`, on a line of its own above the `extern` or the `@export`, takes the promise on trust and
+drops the check:
+
+```sysl
+@unchecked
+extern "strchr" find(s: *nonnull u8, c: i32) -> *nonnull u8
+
+val at = find(c"hello", i32('e'))
+
+print(at[0], at[1])
+```
+
+```output
+101 108
+```
+
+Where sysl proved the pointer — an argument handed to C, a definition's parameter, an answer taken on
+trust — the emitted LLVM says `nonnull`, and a plain load of one says `!nonnull`, so the optimizer
+gains too. A checked answer or entry says neither, since the check is the point.
+
+**An `Option[*T]` stays refused**: its tag makes it the wrong C type. The refusal offers both
+spellings:
+
+```sysl
+extern strchr(s: *u8, c: i32) -> Option[*u8]
+```
+
+```error
+A pointer C may make null is a plain '*byte', compared with 'null', or an 'Option[*nonnull byte]', matched
+```
+
 **An `Option[&T]` is one word, with `None` as null**, so an `extern` takes or answers one wherever
 it takes or answers a bare `&T` — the very address the bare `&T` hands over, and `NULL` for `None` —
 under the same promise a `&T` handed to C already makes: the counted box is a sysl layout C has no

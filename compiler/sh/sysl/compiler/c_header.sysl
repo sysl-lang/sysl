@@ -66,7 +66,7 @@ private header_aggregate(r: Type, seen: *Buf[Type], named: *Buf[Type])
 
             named.push(r)
         Array(_, elem, _) -> header_walk(*elem, seen, named)
-        Ptr(inner, _) -> header_walk(*inner, seen, named)
+        Ptr(inner, _, _) -> header_walk(*inner, seen, named)
         CFn(params, ret, _) ->
             for param in params
                 header_walk(param, seen, named)
@@ -132,7 +132,7 @@ private hollow_walk(l: TargetLayout, target: Target, t: Type, by_value: bool,
             None
         // No element is no store C could make in bounds, whatever the element's size.
         Array(n, elem, _) -> if n == 0 then None else hollow_walk(l, target, *elem, false, seen)
-        Ptr(inner, _) -> hollow_walk(l, target, *inner, false, seen)
+        Ptr(inner, _, _) -> hollow_walk(l, target, *inner, false, seen)
         CFn(params, ret, _) ->
             for param in params
                 val found = hollow_walk(l, target, param, true, seen)
@@ -157,9 +157,12 @@ private hollow_in_c(l: TargetLayout, target: Target, t: Type) -> bool = hollow_c
 
 // A transparent named subtype or a qualifier taken off the top, and every name inside left where it
 // was written -- a name there is exactly the thing a header is asked to spell.
+//
+// An `Option` of a pointer that is never null is the pointer itself to C, `NULL` its `None`.
 private header_surface(t: Type) -> Type = t match
     Constrained(d) -> if d.derived then t else header_surface(d.base)
     Volatile(inner) -> header_surface(*inner)
+    Enum(d) -> if option_of_nonnull_pointer(t) then nullable_of(d.targs[0]) else t
     _ -> t
 
 // The C name of a named type -- the one the author chose, or the derived one.
@@ -320,7 +323,7 @@ private note_c_type_headers(t: Type, out: *Buf[string])
                         if !already_included(header, out) then out.push(header)
                 None -> if d.cname.is_none() then note_c_type_headers(d.base, out)
         Volatile(inner) -> note_c_type_headers(*inner, out)
-        Ptr(inner, _) -> note_c_type_headers(*inner, out)
+        Ptr(inner, _, _) -> note_c_type_headers(*inner, out)
         Array(_, elem, _) -> note_c_type_headers(*elem, out)
         CFn(params, ret, _) ->
             for p in params
@@ -480,7 +483,7 @@ end names_va_list
 
 private spells_va_list(t: Type) -> bool = repr(t) match
     VaList -> true
-    Ptr(inner, _) -> spells_va_list(*inner)
+    Ptr(inner, _, _) -> spells_va_list(*inner)
     _ -> false
 
 // The no-return annotation, written once per header and only where something needs it.
@@ -731,7 +734,7 @@ private c_declarator(t: Type, name: string, konst: bool) -> string = header_surf
     // A pointer to something whose declarator binds tighter than `*` -- an array or a function
     // pointer -- needs the parentheses that make the `*` apply first. An exported name is a base
     // type, so a pointer to one takes no parentheses whatever it names.
-    Ptr(inner, ro) ->
+    Ptr(inner, ro, _) ->
         val star = if konst then "* const" else "*"
 
         if binds_tighter(*inner) && !typedefd(*inner)
@@ -753,7 +756,7 @@ end qualified
 // pointer to the element, which is the same address the sysl side reads as a pointer to the whole
 // array, so the two agree on what crosses. An exported `type` naming the array is still its name.
 private c_parameter(t: Type, name: string) -> string = parameter_surface(t) match
-    Ptr(inner, ro) ->
+    Ptr(inner, ro, _) ->
         if typedefd(*inner) then c_declare(t, name)
         else header_surface(*inner) match
             Array(length, elem, _) -> c_declare(*elem, s"$name[$length]", ro)

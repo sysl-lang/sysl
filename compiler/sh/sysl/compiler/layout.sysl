@@ -20,19 +20,36 @@ import sysl.container.{Map, map}
 // lost and there is no tag. A raw `*T` may be null, so an `Option` of one keeps its tag and a
 // `Some(null)` stays apart from `None`; a trait object, being two words, keeps the tag too, and so does
 // every other enum.
+//
+// **A `*nonnull T` and a `*nonnull extern(…)` are never null either**, so an `Option` of one is the
+// address alone in the same way -- which is also C's nullable `T *`, `None` being `NULL`.
 null_niche(d: &EnumType) -> bool = option_of(d) match
     Some(inner) -> underlying(inner) match
         Ref(_, _) -> !erased(underlying(inner))
+        Ptr(_, _, nn) -> nn && !erased(underlying(inner))
+        CFn(_, _, marks) -> marks_nonnull(marks)
         _ -> false
     None -> false
 
-// Whether a type is an `Option` of a raw pointer or a `*extern` -- tagged, so not the nullable
-// pointer C declares, which is a plain `*T` compared with `null`.
+// Whether a type is an `Option` of a raw pointer or a `*extern` that may be null -- tagged, so not
+// the nullable pointer C declares, which is a plain `*T` compared with `null`, or an
+// `Option[*nonnull T]`, matched.
 option_of_raw_pointer(t: Type) -> bool = underlying(t) match
     Enum(d) -> option_of(d) match
         Some(inner) -> underlying(inner) match
-            Ptr(_, _) -> true
-            CFn(_, _, _) -> true
+            Ptr(_, _, nn) -> !nn
+            CFn(_, _, marks) -> !marks_nonnull(marks)
+            _ -> false
+        None -> false
+    _ -> false
+
+// Whether a type is an `Option` of a pointer that is never null -- one word, `None` the null address,
+// and so the nullable pointer C declares.
+option_of_nonnull_pointer(t: Type) -> bool = underlying(t) match
+    Enum(d) -> option_of(d) match
+        Some(inner) -> underlying(inner) match
+            Ptr(_, _, nn) -> nn && !erased(underlying(inner))
+            CFn(_, _, marks) -> marks_nonnull(marks)
             _ -> false
         None -> false
     _ -> false
@@ -239,7 +256,7 @@ struct TargetLayout
         Never -> 0
         Unknown -> 0
         VaList -> self.pointer_bytes() * 4
-        Ptr(_, _) -> if erased(underlying(t)) then self.fat() else self.pointer_bytes()
+        Ptr(_, _, _) -> if erased(underlying(t)) then self.fat() else self.pointer_bytes()
         Ref(_, _) -> if erased(underlying(t)) then self.fat() else self.pointer_bytes()
         Weak(inner) -> if is_trait(*inner) then self.fat() else self.pointer_bytes()
         CFn(_, _, _) -> self.pointer_bytes()
@@ -292,7 +309,7 @@ struct TargetLayout
         Never -> 1
         Unknown -> 1
         VaList -> self.pointer_bytes()
-        Ptr(_, _) -> self.pointer_bytes()
+        Ptr(_, _, _) -> self.pointer_bytes()
         Ref(_, _) -> self.pointer_bytes()
         Weak(_) -> self.pointer_bytes()
         CFn(_, _, _) -> self.pointer_bytes()

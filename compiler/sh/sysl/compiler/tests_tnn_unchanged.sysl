@@ -1,0 +1,59 @@
+module sh.sysl.compiler
+@tests
+
+// **A program that writes no `nonnull` is emitted as it was before the word existed.** Every
+// position a `*T` takes keeps its type -- an address nothing asks to be non-null is a `*T`, an
+// `Option[*T]` keeps its tag, `null` goes wherever it went -- and nothing the `*nonnull` machinery
+// adds (the `nonnull` attribute, `!nonnull`, the boundary checks) reaches a module that never names
+// the type. The byte-for-byte comparison against the compiler before the change was made once by
+// hand (the change's report); these hold the properties that comparison rested on.
+//
+// The axes: an extern over `*T` and `Option`-free pointers; an export; a struct of pointers; a
+// generic over `*T`; `&x` read into an unannotated binding; a `*extern` callback; the null literal in
+// each position.
+
+private tnn_plain_program() -> string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        v: int
+        next: *Node
+
+    extern strchr(s: *u8, c: i32) -> *u8
+    extern c_take(p: *int, f: *extern(int) -> int)
+
+    twice(n: int) -> int = n * 2
+
+    first[T](xs: Buf[T]) -> T = xs[0]
+
+    @export("s_read")
+    read(p: *int) -> int = if p == null then -1 else *p
+
+    var x = 4
+    var p = &x
+    var n = Node(1, null)
+    var held: Buf[*int] = buf()
+
+    held.push(p)
+    held.push(null)
+    print(strchr(c"hello", 108) == null, *first(held), n.next == null, read(p), sizeof(Option[*int]))
+    c_take(p, &twice)
+    p = null
+    """
+
+@test("a program with no nonnull in it carries no nonnull attribute, no !nonnull and no null check")
+tnn_no_new_ir()
+    if std_root().is_err() then return
+
+    val b = tnn_build(tnn_plain_program(), host_target())
+
+    assert_eq(b.0, "")
+    tnn_lacks(b.1, "nonnull")
+    tnn_lacks(b.1, "answered_null")
+    tnn_lacks(b.1, "handed_null")
+    tnn_says(b.1, "declare ptr @strchr(ptr, i32)")
+
+@test("an Option of a *T keeps its tag and its old layout")
+tnn_option_ptr_still_tagged()
+    tnn_prints("print(sizeof(Option[*int]), sizeof(Option[*extern(int) -> int]), sizeof(*int))\n", "",
+               "16 16 8\n")

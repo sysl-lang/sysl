@@ -190,7 +190,9 @@ true true
 ```
 
 So an `Option[*T]` is not C's nullable pointer, and an `extern` or `@export` naming one is refused
-([`ffi.md`](/reference/ffi/#a-nullable-pointer-is-a-plain-t)). The guarantee is for a thin reference: a
+([`ffi.md`](/reference/ffi/#a-nullable-pointer-is-a-plain-t)). A raw pointer that is never null,
+[`*nonnull T`](#nonnull-t-a-pointer-that-is-never-null), has the niche a reference has: an
+`Option[*nonnull T]` is one word, and it is C's nullable pointer. The guarantee is for a thin reference: a
 `&Shape` of a trait is two words, the value and its table, and an `Option` of one keeps its tag, as
 does an `Option` of a `weak T` and every other enum.
 
@@ -3452,6 +3454,118 @@ Where the two have to agree — the branches of an `if`, the operands of `==` �
 read-only pointer, and a view taken of a `*const T` is a `[]const T`. What it does not reach is
 storage behind an address it leads to: a `*T` field of the pointee is written exactly as that pointer
 allows. `ptr_cast` reaches between the two, as it reaches between any two pointers.
+
+### `*nonnull T` — a pointer that is never null
+
+**`*nonnull T` is a raw pointer that is never the null address.** It has every operation a `*T` has
+— `*p`, `p.f`, `p[i]`, `p[0..<n]`, `p - q`, `usize(p)` — and is laid out and passed as one. The word
+sits after the `*`, and after a `const`: `*const nonnull T` is a read-only one, access first and then
+what the value promises, in that one order. `nonnull` is a soft word, special only in front of a
+type, so a type a program calls `nonnull` is still pointed at by `*nonnull`.
+
+**It has the null niche**, as a `&T` does: an `Option[*nonnull T]` is the address alone, with `None`
+as null, where an `Option[*T]` keeps its tag:
+
+```sysl
+print(sizeof(*nonnull int), sizeof(Option[*nonnull int]), sizeof(Option[*int]))
+```
+
+```output
+8 8 16
+```
+
+**An address is never null**, so `&x`, `&p[n]`, `r.into_raw()` and a `c"…"` literal are each a
+`*nonnull T` wherever one is wanted. With nothing asking, `&x` is the `*T` it has always been, which
+may later be set to `null`. **A `*T` becomes one only by being asked**: `p.nonnull()` answers an
+`Option[*nonnull T]` — the same bits, so it costs nothing — and `p.nonnull().unwrap()` is the checked
+conversion, which traps on null. A `*nonnull T` goes wherever a `*T`, a `*const T` or a `*const
+nonnull T` is wanted, and where the two have to agree they meet at the pointer that may be null:
+
+```sysl
+first(p: *nonnull int) -> int = *p
+plain(p: *int) -> int = *p
+
+var x = 41
+val p: *nonnull int = &x
+var raw: *int = &x
+
+print(first(p), plain(p) + 1, first(&x))
+
+for i in 0..<2
+    raw.nonnull() match
+        Some(q) -> print("some", *q)
+        None -> print("none")
+
+    raw = null
+```
+
+```output
+41 42 41
+some 41
+none
+```
+
+**`null` is not one**, wherever a `*nonnull T` is wanted — a binding, an argument, a field, a result —
+and comparing one with `null` is the same mistake:
+
+```sysl
+val p: *nonnull int = null
+```
+
+```error
+'null' is the address a '*nonnull int' never holds, so it is neither stored in one nor compared with one — a pointer that may be absent is an 'Option[*nonnull int]', one word all the same, whose null is 'None'
+```
+
+Nor is a `*T`, which may be null:
+
+```sysl
+var x = 1
+val p: *int = &x
+val q: *nonnull int = p
+```
+
+```error
+a '*int' may be null, and a '*nonnull int' never is — so the one does not become the other. Check it with '.nonnull()', which answers an 'Option[*nonnull int]' that is 'None' for null
+```
+
+**It has no zero value**, so a struct holding one has none either and is given its field at
+construction; like every raw pointer it is not `Plain`. The other order of the two words is refused,
+naming this one:
+
+```sysl
+var x = 1
+val p: *nonnull const int = &x
+```
+
+```error
+'const' goes before 'nonnull' — what may be done through the pointer first, then what its value promises: '*const nonnull T'
+```
+
+**The raw tier.** `nonnull_unchecked(p)`, imported from `sysl.raw` as `ptr_cast` is, takes a `*T` as a
+`*nonnull T` with nothing checked: a null handed to it is read as `None` by any `Option` holding it,
+and a read through it faults. `ptr_cast` from a `*nonnull A` to a `*nonnull B` stays non-null, since
+re-typing cannot make an address null, and makes one out of a literal address that is not zero — a
+device's base. Anything else is refused, naming `.nonnull()`:
+
+```sysl
+import sysl.raw.{nonnull_unchecked, ptr_cast}
+
+var x: u32 = 7
+val p: *u32 = &x
+val q = nonnull_unchecked(p)
+val bytes: *nonnull u8 = ptr_cast(q)
+val device: *nonnull u32 = ptr_cast(0x4000_C000)
+
+print(*q, usize(bytes) == usize(q), usize(device))
+```
+
+```output
+7 true 1073790976
+```
+
+**A function pointer takes it too**: `*nonnull extern(int) -> int` is a callback that is never null,
+made by `&f`, with the same niche and the same refusals. At the C boundary `Option[*nonnull T]` is C's
+nullable `T *`, matched rather than compared ([`ffi.md`](/reference/ffi/#a-pointer-c-never-makes-null)).
 
 ### Arithmetic: two directions, one spelling each
 

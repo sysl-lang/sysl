@@ -1,0 +1,117 @@
+module sh.sysl.compiler
+@tests
+
+// **The raw tier meets `*nonnull T`** (`reference/memory.md § A pointer that is never null`):
+// `nonnull_unchecked` from `sysl.raw` takes a `*T` as one with nothing checked; `ptr_cast` keeps a
+// `*nonnull A` non-null at `*nonnull B` and makes one out of a literal address that is not zero, and
+// refuses anything else; a `*nonnull extern` is a callback that is never null, made by `&f`; a
+// `volatile` pointee, `usize(p)` and `p - q` are unchanged.
+//
+// The axes: each form at a `*nonnull` target and at a `*T` one; the form's name shadowed by the
+// program's own; the refusals' exact text; the function pointer in a field, an argument and through
+// a call.
+//
+// Skipped cells: `from_raw` of a `*nonnull T`, which widens to the `*T` it takes and is that form's
+// to test (`tnn_makers` makes the pointer).
+
+@test("nonnull_unchecked takes a *T as a *nonnull T, keeping its const")
+tnn_unchecked_form()
+    tnn_prints(raw"""
+        import sysl.raw.nonnull_unchecked
+
+        var x = 12
+        val p: *int = &x
+        val c: *const int = &x
+        val q = nonnull_unchecked(p)
+        val r: *const nonnull int = nonnull_unchecked(c)
+
+        print(*q, *r, sizeof(Option[*nonnull int]))
+        """, "", "12 12 8\n")
+
+@test("nonnull_unchecked is imported from sysl.raw, and a program's own name wins")
+tnn_unchecked_imported()
+    tnn_refused("var x = 1\nval p: *int = &x\nval q = nonnull_unchecked(p)\n", "sysl.raw")
+    tnn_prints(raw"""
+        nonnull_unchecked(p: *int) -> int = 99
+
+        var x = 1
+        val p: *int = &x
+
+        print(nonnull_unchecked(p))
+        """, "", "99\n")
+
+@test("nonnull_unchecked refuses what is not a raw pointer")
+tnn_unchecked_refusal()
+    tnn_refused("import sysl.raw.nonnull_unchecked\n\nval q = nonnull_unchecked(4)\n",
+                "'nonnull_unchecked' takes a raw pointer or a '*extern', and the value has type int")
+
+@test("ptr_cast keeps a *nonnull A non-null at *nonnull B, and reads a literal address that is not zero")
+tnn_ptr_cast()
+    tnn_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        var x: u32 = 0x01020304
+        val p: *nonnull u32 = &x
+        val b: *nonnull u8 = ptr_cast(p)
+        val dev: *nonnull u32 = ptr_cast(0x4000_C000)
+        val plain: *u8 = ptr_cast(p)
+
+        print(usize(b) == usize(p), usize(dev), usize(plain) == usize(p))
+        """, "", "true 1073790976 true\n")
+
+@test("ptr_cast to a *nonnull T from a value that may be null, or from the literal zero, is refused")
+tnn_ptr_cast_refused()
+    tnn_refused("import sysl.raw.ptr_cast\n\nvar n: usize = 16\nval a: *nonnull int = ptr_cast(n)\n",
+                "'ptr_cast' makes a '*nonnull int' only out of a pointer that is never null or a literal address that is not zero, and this may be null — read it as a '*int' and check it with '.nonnull()'")
+    tnn_refused("import sysl.raw.ptr_cast\n\nval a: *nonnull int = ptr_cast(0)\n", "a literal address that is not zero")
+    tnn_refused("import sysl.raw.ptr_cast\n\nvar x = 1\nval p: *int = &x\nval a: *nonnull u8 = ptr_cast(p)\n",
+                "read it as a '*byte' and check it with '.nonnull()'")
+
+@test("a *nonnull extern is made by &f, widens to a *extern, and is held in a field and called")
+tnn_fn_pointer()
+    tnn_prints(raw"""
+        struct Hooks
+            on: *nonnull extern(int) -> int
+
+        twice(n: int) -> int = n * 2
+
+        apply(f: *extern(int) -> int, n: int) -> int = f(n)
+
+        val f: *nonnull extern(int) -> int = &twice
+        val h = Hooks(&twice)
+
+        print(f(3), h.on(4), apply(f, 5), apply(h.on, 6))
+        """, "", "6 8 10 12\n")
+
+@test("a *extern where a *nonnull extern is wanted is refused, and so is null")
+tnn_fn_pointer_refused()
+    tnn_refused("twice(n: int) -> int = n * 2\n\nval g: *extern(int) -> int = &twice\nval f: *nonnull extern(int) -> int = g\n",
+                "a '*extern(int) -> int' may be null, and a '*nonnull extern(int) -> int' never is")
+
+@test("a *nonnull extern's nonnull() and its Option are one word, matched")
+tnn_fn_pointer_option()
+    tnn_prints(raw"""
+        twice(n: int) -> int = n * 2
+
+        var g: *extern(int) -> int = &twice
+
+        g.nonnull() match
+            Some(f) -> print(f(21))
+            None -> print("none")
+
+        g = null
+        print(g.nonnull().is_none())
+        """, "", "42\ntrue\n")
+
+@test("a volatile pointee, usize(p), p[i] and p[0..<n] read through a *nonnull T as through a *T")
+tnn_unchanged_reads()
+    tnn_prints(raw"""
+        import sysl.raw.ptr_cast
+
+        var a = [5, 6, 7]
+        val p: *nonnull int = &a[0]
+        val v: *nonnull volatile int = ptr_cast(p)
+        val view = p[0..<3]
+
+        print(p[2], *v, view.len, usize(p) != 0)
+        """, "", "7 5 3 true\n")

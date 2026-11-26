@@ -211,7 +211,7 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
         // where a mismatch belongs.
         // A pointer is also asked about where the two differ only in the `const`, which is the one
         // conversion between pointers a position performs (`coerce`).
-        Ptr(inner, _) ->
+        Ptr(inner, _, _) ->
             if is_trait(*inner) then return coerce(cx, analyze_value(cx, e, expected), want)
 
             return coerce(cx, held_by_reference(cx, analyze_value(cx, e, expected), expected), want)
@@ -233,7 +233,7 @@ private converts(want: Type) -> bool
         Ref(_, _) -> true
         Weak(_) -> true
         Slice(e, ro) -> ro || is_volatile_elem(*e)
-        Ptr(_, ro) -> ro
+        Ptr(_, ro, _) -> ro
         _ -> false
 end converts
 
@@ -279,6 +279,27 @@ named_place(e: Expr) -> bool = *e.kind match
 // `None` for any other pair.
 private pointer_retyped(cx: &Analyzer, t: TExpr, got: Type, want: Type) -> Option[TExpr]
     if type_eq(got, want) then return None
+
+    // **`nonnull` is settled first, and the other marks are asked of what is left.** A function
+    // pointer that is never null goes where one that may be is wanted, as a `*nonnull T` does; one
+    // that may be null becomes one that is not only where it is a function's address, which is never
+    // null.
+    val gnn = function_pointer_nonnull(got)
+    val wnn = function_pointer_nonnull(want)
+
+    if gnn.is_some() && wnn.is_some() && gnn.unwrap() != wnn.unwrap()
+        val settled = with_function_nonnull(underlying(got), wnn.unwrap())
+        val retyped = *t.kind match
+            TFuncAddr(name, entry, _) -> TExpr(t.span, TFuncAddr(name, entry, settled))
+            _ ->
+                if wnn.unwrap() then return Some(cx.err(t.span, nullable_into_nonnull(got, want)))
+
+                TExpr(t.span, TCast(t, settled))
+
+        if type_eq(settled, want) then return Some(retyped)
+
+        return Some(pointer_retyped(cx, retyped, settled, want).unwrap_or(retyped))
+    end if
 
     val fits = callable_within(got, want)
 
@@ -341,6 +362,32 @@ marks_refused(got: Type, want: Type, i: usize, kept: bool, lets_out: bool, shown
         s"$what $keeps into storage of its own"
 end marks_refused
 
+// Whether an expression makes the address it yields, which is then never null: an address of a
+// place or of a temporary, a C string literal, or a counted reference given up.
+private makes_an_address(t: TExpr) -> bool = *t.kind match
+    TAddrOf(_, _) -> true
+    TTempAddr(_, _) -> true
+    TCStrLit(_) -> true
+    TIntoRaw(_, _) -> true
+    _ -> false
+
+// Whether a function pointer is one that is never null; `None` for any other type.
+private function_pointer_nonnull(t: Type) -> Option[bool] = underlying(t) match
+    CFn(_, _, marks) -> Some(marks_nonnull(marks))
+    _ -> None
+
+// A function pointer with its `nonnull` mark set as `on` says.
+private with_function_nonnull(t: Type, on: bool) -> Type = t match
+    CFn(ps, r, marks) -> CFn(ps, r, with_nonnull(marks, on))
+    other -> other
+
+// **The refusal of a pointer that may be null where one that never is was wanted**, naming the one
+// spelling that makes the promise checked: `.nonnull()` answers the `Option` the caller matches.
+nullable_into_nonnull(got: Type, want: Type) -> string =
+    s"a '${type_show(got)}' may be null, and a '${type_show(want)}' never is — so the one does not " +
+    s"become the other. Check it with '.nonnull()', which answers an 'Option[${type_show(want)}]' that " +
+    "is 'None' for null"
+
 // What a position does to a value of the wrong-but-convertible type.
 //
 // Nothing else coerces -- any other mismatch is left for the caller to diagnose, where the message
@@ -360,14 +407,35 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
         // **A `*T` is accepted where a `*const T` is wanted, and never the other way round**, as
         // with the two views: a holder may give up the licence to write, and gaining it is what
         // the type exists to prevent. The two are one pointer, so the conversion is a retyping.
-        Ptr(want, read_only) ->
-            if read_only && type_eq(got, Ptr(*want, false)) then return TExpr(t.span, TConstView(t))
+        Ptr(want, read_only, non_null) ->
+            if read_only && type_eq(got, Ptr(*want, false, non_null)) then return TExpr(t.span, TConstView(t))
 
-            if !read_only && type_eq(got, Ptr(*want, true)) then
-                return cx.err(t.span, s"a '*const ${type_show(*want)}' may be read through and not " +
-                              s"written, and a '*${type_show(*want)}' is a licence to write — so the one " +
-                              "does not become the other. Take the parameter as " +
-                              s"'*const ${type_show(*want)}' if it is only read")
+            // **A `*nonnull T` is accepted where a `*T` is wanted, and never the other way round**: a
+            // holder may give up the promise that the address is never null, and gaining it is what
+            // `.nonnull()` is for. The two are one address, so the conversion is a retyping.
+            val got_pointer = got match
+                Ptr(gi, gro, gnn) -> if type_eq(*gi, *want) then Some((gro, gnn)) else None
+                _ -> None
+
+            if got_pointer.is_some()
+                val (gro, gnn) = got_pointer.unwrap()
+
+                if gro && !read_only then
+                    return cx.err(t.span, s"a '${type_show(Ptr(*want, true, gnn))}' may be read through and not " +
+                                  s"written, and a '${type_show(Ptr(*want, false, non_null))}' is a licence to write — so the one " +
+                                  "does not become the other. Take the parameter as " +
+                                  s"'${type_show(Ptr(*want, true, non_null))}' if it is only read")
+
+                // An address the expression itself makes -- `&x`, a `c"…"` literal, `r.into_raw()` --
+                // is never null, wherever it was read.
+                if !gnn && non_null then
+                    if makes_an_address(t) then return TExpr(t.span, TCast(t, expected))
+
+                    return cx.err(t.span, nullable_into_nonnull(got, expected))
+                end if
+
+                if gnn && !non_null then return TExpr(t.span, TCast(t, expected))
+            end if
 
             t
         Ref(inner, sync) ->

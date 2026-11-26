@@ -1045,13 +1045,15 @@ private extern_signature_fault(a: &Analysis, key: string, message: string)
 // Why an `Option` of a raw pointer cannot cross to C, and what to write instead, as the tail of a
 // refusal: its tag sits beside the address, so it is not the nullable pointer C declares.
 nullable_pointer_reason(t: Type) -> string
-    val inner = underlying(t) match
-        Enum(d) if d.targs.len() == 1 -> type_show(d.targs[0])
-        _ -> "*T"
+    val pointer = underlying(t) match
+        Enum(d) if d.targs.len() == 1 -> Some(d.targs[0])
+        _ -> None
+    val inner = pointer.map(type_show).unwrap_or("*T")
+    val never_null = pointer.map(p -> type_show(never_null_of(p))).unwrap_or("*nonnull T")
 
     "which C has no spelling for — an 'Option' of a raw pointer is a tag beside the address, so " +
     s"'Some(null)' stays apart from 'None'. A pointer C may make null is a plain '$inner', compared " +
-    "with 'null'"
+    s"with 'null', or an 'Option[$never_null]', matched"
 end nullable_pointer_reason
 
 // The type a vector's lanes are, as a diagnostic shows it.
@@ -1331,7 +1333,7 @@ private check_answers_names(a: &Analysis, scope: Scope, span: Span, d: ExternDec
 end check_answers_names
 
 private is_pointer_answer(t: Type) -> bool = underlying(t) match
-    Ptr(_, _) -> true
+    Ptr(_, _, _) -> true
     _ -> false
 
 // **A `@test` or a hook returns nothing**: the runner reads its verdict off whether it came back, so
@@ -1818,7 +1820,7 @@ private type_keys(out: *Buf[string], t: Type)
             for item in assocs
                 type_keys(out, item.1)
         Constrained(d) -> push_key(out, d.name)
-        Ptr(inner, _) -> type_keys(out, *inner)
+        Ptr(inner, _, _) -> type_keys(out, *inner)
         Volatile(inner) -> type_keys(out, *inner)
         Ref(inner, _) -> type_keys(out, *inner)
         Weak(inner) -> type_keys(out, *inner)
@@ -1885,7 +1887,7 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
 
             for arg in args
                 names_in(out, arg, skip)
-        PtrType(inner, _) -> names_in(out, inner, skip)
+        PtrType(inner, _, _) -> names_in(out, inner, skip)
         RefType(inner, _) -> names_in(out, inner, skip)
         WeakType(inner) -> names_in(out, inner, skip)
         VolatileType(inner) -> names_in(out, inner, skip)
@@ -1899,7 +1901,7 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
                 names_in(out, param, skip)
 
             names_in(out, ret, skip)
-        CFnType(params, ret, _) ->
+        CFnType(params, ret, _, _) ->
             for param in params
                 names_in(out, param, skip)
 
