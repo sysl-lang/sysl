@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { posix }"
 
 ## Index
 
-[`net_accept`](#net_accept) [`net_bind`](#net_bind) [`net_bind_path`](#net_bind_path) [`net_close`](#net_close) [`net_connect`](#net_connect) [`net_connect_path`](#net_connect_path) [`net_listen`](#net_listen) [`net_local`](#net_local) [`net_option`](#net_option) [`net_recv`](#net_recv) [`net_recv_from`](#net_recv_from) [`net_resolve`](#net_resolve) [`net_send`](#net_send) [`net_send_to`](#net_send_to) [`net_shutdown`](#net_shutdown) [`net_socket`](#net_socket)
+[`net_accept`](#net_accept) [`net_bind`](#net_bind) [`net_bind_path`](#net_bind_path) [`net_close`](#net_close) [`net_connect`](#net_connect) [`net_connect_path`](#net_connect_path) [`net_listen`](#net_listen) [`net_local`](#net_local) [`net_option`](#net_option) [`net_peer_credentials`](#net_peer_credentials) [`net_recv`](#net_recv) [`net_recv_from`](#net_recv_from) [`net_resolve`](#net_resolve) [`net_send`](#net_send) [`net_send_file`](#net_send_file) [`net_send_to`](#net_send_to) [`net_send_vectored`](#net_send_vectored) [`net_shutdown`](#net_shutdown) [`net_socket`](#net_socket)
 
 ## Functions
 
@@ -67,6 +67,12 @@ net_local(fd: int, at: *Endpoint) -> int
 net_option(fd: int, which: int, value: i64) -> int
 ```
 
+### `net_peer_credentials`
+
+```sysl
+net_peer_credentials(fd: int, out: *Credentials) -> int
+```
+
 ### `net_recv`
 
 ```sysl
@@ -91,10 +97,22 @@ net_resolve(host: *u8, host_len: usize, port: int, passive: int, out: *Endpoint,
 net_send(fd: int, from: *u8, len: usize) -> isize
 ```
 
+### `net_send_file`
+
+```sysl
+net_send_file(fd: int, file: int, offset: i64, count: usize) -> isize
+```
+
 ### `net_send_to`
 
 ```sysl
 net_send_to(fd: int, from: *u8, len: usize, to: *Endpoint) -> isize
+```
+
+### `net_send_vectored`
+
+```sysl
+net_send_vectored(fd: int, pieces: *Piece, count: usize) -> isize
 ```
 
 ### `net_shutdown`
