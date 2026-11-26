@@ -43,9 +43,13 @@ end xvr_no_library
 // The LLVM text of a program of several files, lowered the way the driver lowers it.
 xvr_ir(files: []const (string, string)) -> string = xvr_ir_with(xvr_library(), files)
 
+// The same with nothing pruned, as a library half is lowered: every function analyzed is lowered,
+// whether or not anything calls it.
+xvr_ir_unpruned(files: []const (string, string)) -> string = xvr_ir_with(xvr_library(), files, false)
+
 // The same against a library of the caller's choosing, which is how a claim about what a LIBRARY
 // module's declaration becomes is asked of a library small enough to hold the one declaration.
-xvr_ir_with(library: Buf[Program], files: []const (string, string)) -> string
+xvr_ir_with(library: Buf[Program], files: []const (string, string), pruned: bool = true) -> string
     var units: Buf[Program] = buf()
 
     for item in library
@@ -65,9 +69,16 @@ xvr_ir_with(library: Buf[Program], files: []const (string, string)) -> string
     if !errors_of(done.an.diagnostics()).is_empty()
         return analysis_report(errors_of(done.an.diagnostics()))
 
-    val kept = prune(strip_tests(whole), program_own(units))
+    val kept = if pruned then prune(strip_tests(whole), program_own(units)) else strip_tests(whole)
+    val lowered = codegen_with_gaps(kept, host_target(), promotions)
 
-    ir_print_module(codegen_with_gaps(kept, host_target(), promotions).0)
+    // The checks that wait for the lowering's answer, as the driver asks them.
+    check_switch_kept(done.an, lowered.2)
+
+    if !errors_of(done.an.diagnostics()).is_empty()
+        return analysis_report(errors_of(done.an.diagnostics()))
+
+    ir_print_module(lowered.0)
 end xvr_ir_with
 
 // What a program of several files prints, built and linked for real -- the link is the claim.

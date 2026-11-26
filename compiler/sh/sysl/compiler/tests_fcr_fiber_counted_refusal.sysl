@@ -38,8 +38,13 @@ private fcr_head() -> string = raw"""
 
 // The scheduler is a module of its own, so its `pair` is module storage every body may reach rather
 // than the entry file's own.
-private fcr_ir(body: string) -> string = xvr_ir([("main.sysl", "import sched.*\nimport sysl.fiber.{Context, Stack, switch}\n\n" + body),
-                                               ("sched/sched.sysl", fcr_head())])
+//
+// **A parameter's refusal waits for the lowering** (`abandons.sysl`'s `check_switch_kept`), and only a
+// body that is lowered is answered, so nothing is pruned here (`xvr_ir_unpruned`): every function a
+// fixture writes is lowered, as a library half lowers every one of its own, and none needs a caller
+// to be asked. `fcr_shapes_` below asks real builds, whose bodies are reached from `main`.
+private fcr_ir(body: string) -> string = xvr_ir_unpruned([("main.sysl", "import sched.*\nimport sysl.fiber.{Context, Stack, switch}\n\n" + body),
+                                                         ("sched/sched.sysl", fcr_head())])
 
 private fcr_accepted(body: string)
     if xvr_no_library() then return
@@ -698,10 +703,9 @@ fcr_kept_scalar_params_accepted()
             g != null
         """)
 
-// The check asks `owning` before the +0 analysis (`plus0_locals.sysl`), which borrows a parameter that
-// only walks what its caller handed over: `total` holds no count at all, and is refused even so. The
-// exact answer is the emitter's after that analysis.
-// TODO: exact check (the emitter's answer after the +0 analysis) is a 0.14 item; then this is accepted.
+// **Whether the frame keeps a parameter's count is the lowering's answer** (`check_switch_kept`): the
+// +0 analysis (`plus0_locals.sysl`) borrows a parameter that only walks what its caller handed over,
+// so `total` holds no count at all across the call, and is accepted.
 private fcr_walking_param(mark: string) -> string = raw"""
     struct Node
         v: int
@@ -719,13 +723,296 @@ private fcr_walking_param(mark: string) -> string = raw"""
         sum
     """
 
-@test("KNOWN OVER-REFUSAL: a parameter that walks what it was handed, borrowed by the +0 analysis, is refused")
-fcr_kept_walking_param_over_refused()
-    fcr_held_both(fcr_walking_param(""), fcr_kept_held("p"), "sched.wait")
+@test("a parameter that walks what it was handed, borrowed by the +0 analysis, holds nothing across the call")
+fcr_kept_walking_param_accepted()
+    fcr_lent(fcr_walking_param(""))
 
-@test("'@pinned(thread)' accepts the walking parameter the check over-refuses")
+@test("'@pinned(thread)' accepts the walking parameter too")
 fcr_kept_walking_param_pinned_accepted()
     fcr_lent(fcr_walking_param("@pinned(thread)\n"))
+
+// The cells around the walking parameter: what else the frame holds at the call, a fresh value on
+// one path, a second parameter, the body's kind (a member, a generic at two types, a closure), and
+// each thing that keeps every parameter whatever the +0 analysis says (an address taken, a task, a
+// foreign caller).
+private fcr_nodes() -> string = raw"""
+    struct Node
+        v: int
+        next: Option[&Node]
+
+    """
+
+@test("a walking parameter beside a counted local held across the call names the local")
+fcr_walking_param_beside_local_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        total(p: Option[&Node], sum0: int) -> usize
+            val s = s"${sum0}!"
+
+            while p is Some(n)
+                p = n.next
+
+            wait()
+            s.len
+        """, "'s'", "sched.wait")
+
+@test("a walking parameter assigned a value it made on one path keeps its count, and is refused")
+fcr_walking_param_fresh_on_one_path_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        total(p: Option[&Node], fresh: bool) -> int
+            if fresh then p = Some(Node(0, None))
+
+            while p is Some(n)
+                p = n.next
+
+            wait()
+            0
+        """, fcr_kept_held("p"), "sched.wait")
+
+@test("a walking parameter beside a kept one: the kept one is named")
+fcr_walking_then_kept_names_the_kept()
+    fcr_held_both(fcr_nodes() + raw"""
+        total(p: Option[&Node], s: string) -> usize
+            s = s + "x"
+
+            while p is Some(n)
+                p = n.next
+
+            wait()
+            s.len
+        """, fcr_kept_held("s"), "sched.wait")
+
+@test("two kept parameters: the first is named")
+fcr_two_kept_names_the_first()
+    fcr_held_both(raw"""
+        both(a: string, b: string) -> usize
+            a = a + "x"
+            b = b + "y"
+            wait()
+            a.len + b.len
+        """, fcr_kept_held("a"), "sched.wait")
+
+@test("two walking parameters hold nothing across the call")
+fcr_two_walking_accepted()
+    fcr_lent(fcr_nodes() + raw"""
+        total(p: Option[&Node], q: Option[&Node]) -> int
+            var sum = 0
+
+            while p is Some(n)
+                sum += n.v
+                p = n.next
+
+            while q is Some(n)
+                sum += n.v
+                q = n.next
+
+            wait()
+            sum
+        """)
+
+@test("a member's walking parameter holds nothing across the call")
+fcr_walking_param_member_accepted()
+    fcr_lent(fcr_nodes() + raw"""
+        struct Walker
+            scale: int
+
+        impl Walker
+            total(self, p: Option[&Node]) -> int
+                var sum = 0
+
+                while p is Some(n)
+                    sum += n.v * self.scale
+                    p = n.next
+
+                wait()
+                sum
+
+        // The caller holds the temporaries across the call, so it says it stays on its thread.
+        @pinned(thread)
+        use_it() -> int = Walker(2).total(Some(Node(1, None)))
+        """)
+
+@test("a generic's walking parameter holds nothing at either instantiation, and a kept one is refused at both")
+fcr_walking_param_generic()
+    val items = raw"""
+        struct Item[T]
+            v: T
+            next: Option[&Item[T]]
+
+        """
+
+    fcr_lent(items + raw"""
+        count[T](p: Option[&Item[T]]) -> int
+            var n = 0
+
+            while p is Some(i)
+                n += 1
+                p = i.next
+
+            wait()
+            n
+
+        @pinned(thread)
+        both() -> int = count(Some(Item(1, None))) + count(Some(Item("a", None)))
+        """)
+    fcr_held_both(items + raw"""
+        count[T](p: Option[&Item[T]], v: T) -> int
+            p = Some(Item(v, None))
+            wait()
+            if p is Some(_) then 1 else 0
+
+        @pinned(thread)
+        both() -> int = count(None, 1) + count(None, "a")
+        """, fcr_kept_held("p"), "sched.wait")
+
+@test("a walking parameter of a function whose address is taken keeps its count, and is refused")
+fcr_walking_param_address_taken_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        last(p: &Node) -> int
+            var sum = p.v
+
+            while p.next is Some(n)
+                sum += n.v
+                p = n
+
+            wait()
+            sum
+
+        taken() -> bool
+            val g = &last
+            g != null
+        """, fcr_kept_held("p"), "sched.wait")
+
+    // The same walk with no address taken is borrowed, and accepted.
+    fcr_lent(fcr_nodes() + raw"""
+        last(p: &Node) -> int
+            var sum = p.v
+
+            while p.next is Some(n)
+                sum += n.v
+                p = n
+
+            wait()
+            sum
+        """)
+
+// A switch is a kill for the +0 analysis (borrow-inference.md §3): other code runs in the frame's time
+// and may let go of what the walk is backed by, so a walking parameter read after the call keeps its
+// count, and the frame holds it across the call.
+@test("a walking parameter read after the call keeps its count, and is refused")
+fcr_walking_param_read_after_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        last(p: &Node) -> int
+            var sum = 0
+
+            while p.next is Some(n)
+                sum += n.v
+                p = n
+
+            wait()
+            sum + p.v
+        """, fcr_kept_held("p"), "sched.wait")
+
+// Only a binding that is read through is a candidate for the +0 analysis (borrow-inference.md §8); one
+// only passed along keeps its count, and so does the parameter it is assigned to.
+@test("a walk whose binding is only passed along keeps the parameter's count, and is refused")
+fcr_walking_binding_passed_along_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        last(p: &Node) -> int
+            var sum = p.v
+
+            while p.next is Some(n)
+                p = n
+
+            wait()
+            sum
+        """, fcr_kept_held("p"), "sched.wait")
+
+@test("an async function's walking parameter is kept for the life of the task, and refused")
+fcr_walking_param_async_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        async total(p: Option[&Node]) -> int
+            while p is Some(n)
+                p = n.next
+
+            wait()
+            0
+        """, fcr_kept_held("p"), "sched.wait")
+
+@test("a '@section' function's walking parameter is the frame's own count, refused without waiting for the lowering")
+fcr_walking_param_section_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        @section("__TEXT,__fcr")
+        total(p: Option[&Node]) -> int
+            while p is Some(n)
+                p = n.next
+
+            wait()
+            0
+        """, fcr_kept_held("p"), "sched.wait")
+
+// A parameter's refusal waits for the lowering, and a program with another error is never lowered; a
+// foreign caller's parameter, a local and a temporary are refused before it, beside any other error.
+@test("a kept parameter's refusal is said only once the rest of the program has no error")
+fcr_param_refusal_waits_for_other_errors()
+    if xvr_no_library() then return
+
+    val said = fcr_ir(raw"""
+        grow(s: string)
+            s = s + "x"
+            wait()
+            print(s)
+
+        wrong() -> int = "no"
+        """)
+
+    assert(said.contains("error: "), said)
+    assert(!said.contains("sysl.fiber.switch"), said)
+
+@test("a foreign caller's parameter and a local are refused beside another error")
+fcr_immediate_refusals_beside_other_errors()
+    if xvr_no_library() then return
+
+    val said = fcr_ir(raw"""
+        @section("__TEXT,__fcr")
+        placed(s: string)
+            wait()
+            print(s)
+
+        local_held(n: int) -> usize
+            val t = s"${n}!"
+            wait()
+            t.len
+
+        wrong() -> int = "no"
+        """)
+
+    assert(said.contains("holds the parameter 's' (kept with a count of its own"), said)
+    assert(said.contains("and this frame holds 't' across the call"), said)
+
+@test("a closure's walking parameter is kept, as every closure body keeps its convention, and refused")
+fcr_walking_param_closure_refused()
+    fcr_held_both(fcr_nodes() + raw"""
+        make() -> &Fn(Option[&Node]) -> int
+            (p: Option[&Node]) ->
+                while p is Some(n)
+                    p = n.next
+
+                wait()
+                0
+        """, fcr_kept_held("p"), "sched.wait")
+
+// A walk written as a jump back to the entry is not one the +0 analysis borrows: the lowered body
+// keeps `p`'s count, so the refusal is the lowering's answer, as the loop's acceptance above is.
+@test("a parameter that jumps back to its own entry with what it was handed is kept by the lowering, and refused")
+fcr_walking_param_self_jump()
+    fcr_held_both(fcr_nodes() + raw"""
+        total(p: Option[&Node], sum: int) -> int
+            wait()
+
+            p match
+                Some(n) -> total(n.next, sum + n.v)
+                None -> sum
+        """, fcr_kept_held("p"), "sched.wait")
 
 @test("'@pinned(thread)' accepts a kept parameter held across the switch")
 fcr_kept_pinned_accepted()
@@ -1044,7 +1331,7 @@ fcr_local_parameter_moves_refused()
             val s = b[0..<1]
             wait()
             b = c
-            s.len
+            s.len + b.len
         """, fcr_kept_held("b"), "sched.wait")
     fcr_held_both(fcr_send() + raw"""
         look(p: *[]const u8) -> usize = (*p).len
