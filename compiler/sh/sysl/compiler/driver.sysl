@@ -806,13 +806,22 @@ emit_llvm_text(path: string, named_target: Option[string],
     // (`seal_linkage.sysl`); the text `emit-llvm` prints keeps every linkage as written.
     take_local_notes()
 
+    // **`--explain-checks` records this lowering and no other** (`explain_checks.sysl`): the
+    // artifact above and the `@stack` text were lowered before it is armed.
+    arm_check_ledger(explaining_checks())
+
     val lowered = codegen_with_gaps(kept with { precompiled = joined_names(linked.precompiled,
                                                                            roots.precompiled) },
                                     t, promotions, linking && imports_bodies(level), None, watched,
                                     if linking then program.own else buf(), compact)
 
+    disarm_check_ledger()
     phase_done("codegen")
     explain_local_notes(program, done.an)
+
+    // **And one whose lowered body keeps a parameter's count across a call that can reach the fiber
+    // switch is refused**, now that the lowering has said which it keeps (`check_switch_kept`).
+    check_switch_kept(done.an, lowered.2)
 
     // **And one that put a type aligned beyond the pair's promise on the heap answers the aligned
     // hook**, where nothing writes it a default (`check_aligned_heap`).
@@ -831,6 +840,13 @@ emit_llvm_text(path: string, named_target: Option[string],
     val report = errors_of(done.an.diagnostics())
 
     say_warnings(report, done.an)
+
+    // **And `--explain-checks` says which of the program's checks survive the optimizer**, at the
+    // level this build optimizes at, of the text it builds.
+    if explaining_checks() && report.is_empty()
+        for line in explain_checks_report(text, t, level, own_files(program))
+            say_note(line)
+    end if
 
     Ok(Emitted(text, report, lowered.1, link_required(program.units),
                roots.archives, entries_of(kept, image_entry_named(root, t)), stack_assumptions(kept.funcs)))
@@ -1076,6 +1092,10 @@ target_for(path: string, named_target: Option[string]) -> Result[Target, Refusal
     // `malloc` and `free` underneath, which only a POSIX host is sure to have.
     if alloc_counting_asked() && malloc_symbol() == "malloc" && os_posix(t.os)
         use_named_allocator(counted_allocator(), Some("SYSL_COUNT_ALLOCS"))
+
+    // **And whether every share is counted** (`retain_count.sysl`), on the same host, for the same
+    // reason: the report is a `dprintf` from an `atexit`.
+    use_retain_counting(retain_counting_asked() && os_posix(t.os))
 
     // **And whether a failed bounds check names where it was written**, settled here for the same
     // reason: the standard module's artifact is built the same way as the program, and keyed by it.
@@ -2075,6 +2095,7 @@ private lower_for_c(path: string, t: Target, level: Option[string] = None) -> Re
 
     val lowered = codegen_with_gaps(kept, t, promotions)
 
+    check_switch_kept(done.an, lowered.2)
     check_aligned_heap(done.an, kept)
     if level.is_some() then check_stack_bounds(done.an, kept, t, level.unwrap(), promotions, None)
 
@@ -2359,6 +2380,9 @@ run_cache_key_for(command: string, path: string, named_target: Option[string], l
     // for it has no entry to replay.
     if explaining_drops() then return None
 
+    // Nor the report of the checks that survive, whose lowering lays a record down for each.
+    if explaining_checks() then return None
+
     // Nor was the report of every frame, which is read off the compile.
     if stack_usage_flag().is_some() then return None
 
@@ -2371,7 +2395,7 @@ end run_cache_key_for
 // narrowed test build looks for its own entry and then for the whole tree's (`test_project`).
 run_cache_keys_for(command: string, other: string, path: string, named_target: Option[string],
                    level: string, cc: Option[string]) -> (Option[string], Option[string])
-    if explaining_drops() then return (None, None)
+    if explaining_drops() || explaining_checks() then return (None, None)
 
     val t = target_for(path, named_target) match
         Ok(found) -> found
@@ -2561,6 +2585,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
     phase_done("codegen")
     explain_local_notes(program, ready.an)
 
+    check_switch_kept(ready.an, lowered.2)
     check_aligned_heap(ready.an, ready.kept)
 
     val report = errors_of(ready.an.diagnostics())
@@ -2576,7 +2601,7 @@ private test_build_from(program: Compilation, standalone: bool, level: string,
 end test_build_from
 
 // What lowering a test build reads of its analysis: the pruned program, what the escape analysis
-// promoted, and the analysis itself for the one check that follows the lowering and for the report.
+// promoted, and the analysis itself for the checks that follow the lowering and for the report.
 struct TestsAnalyzed
     an: &Analysis
     kept: TProgram

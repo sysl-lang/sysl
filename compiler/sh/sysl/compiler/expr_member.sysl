@@ -242,6 +242,12 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
                           "two units of its declared type in a '@packed' struct — a volatile access is " +
                           "exactly one unit, and no one unit holds it")
 
+        // And a volatile value is reached by one access on its type's boundary, which `@packed` -- here
+        // or in a struct this field holds -- may have moved it off (`volatile_offset.sysl`).
+        val misplaced = misplaced_field(cx, d, usize(idx))
+
+        if misplaced.is_some() then return cx.err(span, misplaced.unwrap())
+
         // Whatever qualifier the field was declared with stays in the struct's field list and comes
         // off here: reading a register yields an ordinary value.
         return TExpr(span, TField(tr, idx, unqualified(d.fields[usize(idx)].1)))
@@ -253,6 +259,10 @@ private struct_field(cx: &Analyzer, span: Span, tr: TExpr, d: &StructType, name:
     if !through.is_empty()
         if !layout_known(cx.an, cx.scope, span, d.base, qualified_name(d.base)) then
             return bad_expr(span)
+
+        val misplaced = misplaced_field(cx, d, usize(through[0]))
+
+        if misplaced.is_some() then return cx.err(span, misplaced.unwrap())
 
         return through_anonymous(cx, span, tr, d, name, through)
     end if
@@ -308,7 +318,7 @@ end struct_field
 const_selector(subst: Buf[Binding], name: string) -> Option[int]
     bound_type(subst, name) match
         Some(ConstArg(v, ty, _, _)) -> underlying(*ty) match
-            Integer(_, _, _) -> v.to_long().and_then(n -> if n >= -2147483648 && n <= 2147483647 then
+            Integer(_, _, _) -> v.to_long().and_then(n -> if n >= int::Min && n <= int::Max then
                     Some(int(n))
                 else
                     None)

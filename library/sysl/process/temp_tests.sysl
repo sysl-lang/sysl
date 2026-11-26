@@ -1,0 +1,236 @@
+module sysl.process
+@requires(posix)
+@tests
+
+import sysl.fs.{entries, exists, make_dir, make_temp_dir, remove_dir_all, set_permissions, write_text}
+import sysl.testing.compiler
+
+// `sysl.fs.temp_root`, `temp_dir` and `temp_file` where the ROOT is the subject: a program that asks
+// for them is started with the `TMPDIR`, the umask, or the company of its choosing, which no test can
+// give its own process without changing it for every test running beside it. Each test builds the
+// program into a directory of its own and points `TMPDIR` inside that, so nothing it makes is anybody
+// else's to see.
+
+private val tmr_source = raw"""
+    import sysl.fs.{IoError, metadata, temp_dir, temp_file, temp_root}
+    import sysl.threads.{Mutex, Thread, spawn}
+
+    struct Work
+        failed: Mutex[int]
+        rounds: int
+        dirs: bool
+
+    made(w: *Work) -> unit
+        for _ in 0..<w.rounds
+            val ok = if w.dirs then temp_dir("m-").is_ok() else temp_file("m-").is_ok()
+
+            if !ok then w.failed.with((n) -> *n += 1)
+
+    named(e: IoError) -> string =
+        e match
+            NotFound -> "NotFound"
+            PermissionDenied -> "PermissionDenied"
+            NotADirectory -> "NotADirectory"
+            InvalidUtf8(_) -> "InvalidUtf8"
+            _ -> "other"
+
+    shown(r: Result[string, IoError]) -> string =
+        r match
+            Ok(p) -> s"ok $p ${metadata(p).unwrap().permissions()}"
+            Err(e) -> s"err ${named(e)}"
+
+    file_path(prefix: string) -> Result[string, IoError] =
+        temp_file(prefix) match
+            Ok((_, p)) -> Ok(p)
+            Err(e) -> Err(e)
+
+    main(args: []string)
+        args[1] match
+            "root" -> print(temp_root())
+            "dir" -> print(shown(temp_dir(args[2])))
+            "file" -> print(shown(file_path(args[2])))
+            _ ->
+                val w: &Work = Work(Mutex.new(0), 50, args[1] == "dirs")
+                var threads: [4]Option[Thread] = [None; 4]
+
+                for i in 0..<4
+                    threads[i] = spawn(&made, &*w)
+
+                for i in 0..<4
+                    threads[i] match
+                        Some(t) -> _ = t.join()
+                        None -> print("a thread did not start")
+
+                print(w.failed.with((n) -> *n))
+    """
+
+/** A fresh directory holding the program as `prog` and an empty `t` to point `TMPDIR` at. */
+private tmr_program() -> string
+    val root = make_temp_dir("sysl-tmr-").unwrap()
+
+    make_dir(s"$root/t").unwrap()
+    write_text(s"$root/main.sysl", tmr_source).unwrap()
+
+    val built = capture(compiler(), ["build", "-o", s"$root/prog", s"$root/main.sysl"],
+                        stderr = true).unwrap()
+
+    assert_eq(built.status, Status.Exited(0), built.err.unwrap_or(""))
+    root
+end tmr_program
+
+/** What the program printed asked `what` with `TMPDIR` set to `tmp`. */
+private tmr_ask(root: string, tmp: string, what: []const string) -> string
+    val o = capture(s"$root/prog", what, env = [Var("TMPDIR", tmp)]).unwrap()
+
+    assert_eq(o.status, Status.Exited(0))
+    o.text
+end tmr_ask
+
+/** The same through a shell, for a `TMPDIR` or a umask an argument list cannot carry. `$1` is the
+ * program's directory.
+ */
+private tmr_sh(root: string, script: string) -> string
+    val o = capture("/bin/sh", ["-c", script, "sh", root]).unwrap()
+
+    assert_eq(o.status, Status.Exited(0))
+    o.text
+end tmr_sh
+
+/** Where the root is when `TMPDIR` says nothing: the per-user directory on macOS, `/tmp` elsewhere. */
+private tmr_fallback() -> string
+    if os() != MacOS then return "/tmp"
+
+    val o = capture("getconf", ["DARWIN_USER_TEMP_DIR"]).unwrap()
+
+    o.text.trim_end_matches("/\n")
+end tmr_fallback
+
+@test("tmr: TMPDIR is the root, and the directory and the file are made inside it, 0700 and 0600")
+tmr_tmpdir_honoured()
+    val root = tmr_program()
+    val t = s"$root/t"
+
+    assert_eq(tmr_ask(root, t, ["root"]), s"$t\n")
+
+    val dir = tmr_ask(root, t, ["dir", "d-"])
+    val file = tmr_ask(root, t, ["file", "f-"])
+
+    assert(dir.starts_with(s"ok $t/d-") && dir.ends_with(" 448\n"), dir)
+    assert(file.starts_with(s"ok $t/f-") && file.ends_with(" 384\n"), file)
+    assert_eq(entries(t).unwrap().len(), 2)
+    remove_dir_all(root).unwrap()
+
+@test("tmr: trailing slashes on TMPDIR are dropped, so a made path has one slash before its name")
+tmr_trailing_slashes()
+    val root = tmr_program()
+    val t = s"$root/t"
+
+    assert_eq(tmr_ask(root, s"$t//", ["root"]), s"$t\n")
+    assert(tmr_ask(root, s"$t/", ["dir", "d-"]).starts_with(s"ok $t/d-"))
+    assert(tmr_ask(root, s"$t///", ["file", "f-"]).starts_with(s"ok $t/f-"))
+    assert_eq(tmr_ask(root, "/", ["root"]), "/\n")
+    assert_eq(tmr_ask(root, "//", ["root"]), "/\n")
+    remove_dir_all(root).unwrap()
+
+@test("tmr: an empty TMPDIR and an absent one both fall back to the platform's directory")
+tmr_fallback_when_unset()
+    val root = tmr_program()
+    val want = s"${tmr_fallback()}\n"
+
+    assert_eq(tmr_ask(root, "", ["root"]), want)
+
+    val o = capture(s"$root/prog", ["root"], inherit_env = false).unwrap()
+
+    assert_eq(o.text, want)
+
+    // And the fallback is where a directory is made, not only what is answered.
+    val made = capture(s"$root/prog", ["dir", "sysl-tmr-fallback-"], inherit_env = false).unwrap().text
+
+    assert(made.starts_with(s"ok ${tmr_fallback()}/sysl-tmr-fallback-"), made)
+    assert(made.ends_with(" 448\n"), made)
+    remove_dir_all(made[3..<made.len - 5]).unwrap()
+    remove_dir_all(root).unwrap()
+
+@test("tmr: a root that is not there is answered as it is, and nothing can be made in it")
+tmr_root_missing()
+    val root = tmr_program()
+    val gone = s"$root/gone"
+
+    assert_eq(tmr_ask(root, gone, ["root"]), s"$gone\n")
+    assert_eq(tmr_ask(root, gone, ["dir", "d-"]), "err NotFound\n")
+    assert_eq(tmr_ask(root, gone, ["file", "f-"]), "err NotFound\n")
+    assert(!exists(gone))
+    remove_dir_all(root).unwrap()
+
+@test("tmr: a root this process may not write in is PermissionDenied, and nothing is made")
+tmr_root_unwritable()
+    val root = tmr_program()
+    val t = s"$root/t"
+
+    set_permissions(t, 0o500).unwrap()
+    assert_eq(tmr_ask(root, t, ["dir", "d-"]), "err PermissionDenied\n")
+    assert_eq(tmr_ask(root, t, ["file", "f-"]), "err PermissionDenied\n")
+    set_permissions(t, 0o700).unwrap()
+    assert_eq(entries(t).unwrap().len(), 0)
+    remove_dir_all(root).unwrap()
+
+@test("tmr: a root that is a file is NotADirectory")
+tmr_root_is_a_file()
+    val root = tmr_program()
+    val f = s"$root/plain"
+
+    write_text(f, "x").unwrap()
+    assert_eq(tmr_ask(root, f, ["dir", "d-"]), "err NotADirectory\n")
+    assert_eq(tmr_ask(root, f, ["file", "f-"]), "err NotADirectory\n")
+    remove_dir_all(root).unwrap()
+
+// **APFS refuses a name that is not UTF-8** (`EILSEQ` at the `mkdir`), so on macOS such a root
+// cannot exist and the two calls find nothing there; a Linux file system takes any bytes, and there
+// the directory and the file ARE made, cannot be answered as a `string`, and are taken back.
+@test("tmr: a root whose name is not UTF-8 leaves nothing behind, and temp_root answers /tmp for it")
+tmr_root_not_utf8()
+    val root = tmr_program()
+    val odd = "d=\"$1/$(printf '\\377')\"; mkdir \"$d\" 2>/dev/null; "
+    val ask = "TMPDIR=\"$d\" \"$1/prog\" dir d-; TMPDIR=\"$d\" \"$1/prog\" file f-; " +
+              "TMPDIR=\"$d\" \"$1/prog\" root; ls -A \"$d\" 2>/dev/null | wc -l | tr -d ' '"
+    val why = if os() == MacOS then "NotFound" else "InvalidUtf8"
+
+    assert_eq(tmr_sh(root, odd + ask), s"err $why\nerr $why\n/tmp\n0\n")
+    remove_dir_all(root).unwrap()
+
+@test("tmr: the umask narrows the two modes and never widens them")
+tmr_umask()
+    val root = tmr_program()
+    val run = "TMPDIR=\"$1/t\" \"$1/prog\" dir d- | cut -d' ' -f3; TMPDIR=\"$1/t\" \"$1/prog\" file f- | cut -d' ' -f3"
+
+    assert_eq(tmr_sh(root, s"umask 0; $run"), "448\n384\n")
+    assert_eq(tmr_sh(root, s"umask 077; $run"), "448\n384\n")
+    assert_eq(tmr_sh(root, s"umask 0277; $run"), "320\n256\n")
+    remove_dir_all(root).unwrap()
+
+/** Four copies of the program at once, each making fifty of `what` on each of four threads, in one
+ * root: every one of the eight hundred is made, and each is its own entry.
+ */
+private tmr_parallel(what: string)
+    val root = tmr_program()
+    val t = s"$root/t"
+    var running: [4]Option[&Child] = [None; 4]
+
+    for i in 0..<4
+        running[i] = Some(start(s"$root/prog", [what], env = [Var("TMPDIR", t)]).unwrap())
+
+    for i in 0..<4
+        val o = running[i].unwrap().wait().unwrap()
+
+        assert_eq(o.status, Status.Exited(0))
+        assert_eq(o.text, "0\n")
+
+    assert_eq(entries(t).unwrap().len(), 800)
+    remove_dir_all(root).unwrap()
+end tmr_parallel
+
+@test("tmr: four processes of four threads making files at once make eight hundred files")
+tmr_parallel_files() = tmr_parallel("files")
+
+@test("tmr: four processes of four threads making directories at once make eight hundred directories")
+tmr_parallel_dirs() = tmr_parallel("dirs")
