@@ -80,7 +80,7 @@ private stack_box_limit() -> usize = 1024
 stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
     var out = no_stack_boxes()
     val tables: Option[TraitTables] = if p.entry_point then Some(tables_by_trait(p.vtables)) else None
-    val open: &SbOpen = SbOpen(map(), map(), map(), buf(), buf(), set(), 0, false)
+    val open: &SbOpen = SbOpen(map(), map(), map(), set(), buf(), buf(), set(), 0, false)
     val cx: &BoxCx = BoxCx(map(), p.funcs, map(), open, map(), set(), map(), set(), tables, map())
 
     for i in 0..<p.funcs.len()
@@ -1111,6 +1111,12 @@ private struct SbOpen
     // Each open question's `name|k`, the key `answering` is read by (`frame_counts.sysl`), whatever
     // environment record it was asked with.
     plain: Map[string, string]
+
+    // The `name|k` of every question asked with an environment record whose body is being walked now.
+    // The same parameter asked again under another record is asked with none, which reads every
+    // closure as the walk did before records: a recursion that builds a new record at every turn
+    // would otherwise ask a new question at every turn.
+    walking: Set[string]
     stack: Buf[string]
     lows: Buf[usize]
     read: Set[string]
@@ -1143,6 +1149,10 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize, env: Option[Se
             return open.values.get(key).unwrap_or((false, false))
         None -> ()
 
+    val plain = s"$name|$k"
+
+    if env.is_some() && open.walking.has(plain) then return summary(cx, name, k, given, None)
+
     val at = cx.index.get(name)
 
     if at.is_none() then return (true, true)
@@ -1157,14 +1167,17 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize, env: Option[Se
 
     open.next += 1
     open.order.put(key, mine)
-    open.plain.put(key, s"$name|$k")
+    open.plain.put(key, plain)
     open.stack.push(key)
     open.lows.push(mine)
 
     loop
         open.changed = false
+        if env.is_some() then open.walking.add(plain)
 
         val w = follow_param(cx, f, k, env)
+
+        if env.is_some() then open.walking.remove(plain)
         val was = open.values.get(key).unwrap_or((false, false))
         val now = (was.0 || w.escaped, was.1 || w.answers)
 

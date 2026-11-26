@@ -610,6 +610,36 @@ frs_parameters_apart()
     assert_eq(got.bytes, one.bytes)
 end frs_parameters_apart
 
+// A recursion building a closure over its box at every turn asks its own parameter again under a new
+// record of the environments it built (`closure_mode`'s field-sensitive environments). That question
+// is asked with no record, which reads every closure slot as carrying the box: the box stays on the
+// heap, and the question is settled rather than asked anew at every turn.
+private const frs_closure_each_turn: string = raw"""
+    struct Acc
+        n: int
+
+    apply(f: &Fn() -> int) -> int = f()
+
+    walk(a: &Acc, k: int) -> int
+        if k == 0 then return a.n
+
+        val f: &Fn() -> int = () -> a.n
+
+        apply(f) + walk(a, k - 1)
+
+    main()
+        val a: &Acc = Acc(2)
+
+        print(walk(a, 3))
+    """
+
+@test("a recursion building a new closure record at every turn is settled, conservatively")
+frs_closure_records()
+    if !enm_ready() then return
+
+    frs_check("frs_closure_each_turn", frs_closure_each_turn, "", "8\n", false)
+end frs_closure_records
+
 // Entered at `f1` with the store in `f0`, the escape is found by `f0`'s walk after every other
 // function of the cycle read `f0`'s first value, so it reaches `f1` only in a second round.
 @test("a forty-function cycle is settled: framed where nothing keeps, heap wherever one stores")
