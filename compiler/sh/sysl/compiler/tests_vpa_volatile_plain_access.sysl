@@ -621,7 +621,10 @@ end vpa_ir_other_processor
 // v8-M Mainline hard, softfp and soft), at -O0, -O1, -O2 and -Os, and full LTO. A volatile wider than a
 // word (`u64`, `f64`, `u128`) is one such access per 32-bit word, lowest address first (where LLVM's was
 // an `ldrd`/`strd`, written back in a loop); the order is pinned in the IR and in the machine code. A
-// width that is not whole words (`u48`) is refused there (`tests_volatile.sysl`, `vo_arm_*`).
+// width that is not whole words (`u48`) is refused there (`tests_volatile.sysl`, `vo_arm_*`). Beside the
+// pointer walks, the fixture reaches a volatile through a pointer subscript (`p[i]`, a separate place
+// from `*q`), in a constant-trip loop -O2 unrolls into neighbouring words, and as two adjacent words
+// written then read (`p[0]`, `p[1]`), the shapes an `ldrd`/`strd` or `ldm`/`stm` merge would take.
 private val vpa_thumb_fixture: string = raw"""
     @packed
     struct Reg
@@ -822,6 +825,42 @@ private val vpa_thumb_fixture: string = raw"""
     @export("reg")
     reg(r: *Reg)
         r.mode = 5
+
+    @export("index_ld")
+    index_ld(p: *volatile u32, n: int) -> u32
+        var acc: u32 = 0
+
+        for i in 0..<n
+            acc = acc ^ p[i]
+
+        acc
+    end index_ld
+
+    @export("index_st")
+    index_st(p: *volatile u16, n: int, v: u16)
+        for i in 0..<n
+            p[i] = v
+
+    @export("unrolled_copy")
+    unrolled_copy(src: *volatile u32, dst: *volatile u32)
+        for i in 0..<8
+            dst[i] = src[i]
+
+    @export("unrolled_st")
+    unrolled_st(p: *volatile u8, v: u8)
+        var q = p
+
+        for i in 0..<8
+            *q = v
+            q = &q[1]
+    end unrolled_st
+
+    @export("adjacent")
+    adjacent(p: *volatile u32, x: u32) -> u32
+        p[0] = x
+        p[1] = x
+        p[0] ^ p[1]
+    end adjacent
     """ + vpa_aggregate_fixture
 
 // The aggregate cells, and an instruction each body must hold, on either processor.
@@ -864,6 +903,11 @@ private vpa_thumb_expected() -> Buf[(string, string)]
     out.push(("bank", "str"))
     out.push(("ticks", "str"))
     out.push(("reg", "strb"))
+    out.push(("index_ld", "ldr"))
+    out.push(("index_st", "strh"))
+    out.push(("unrolled_copy", "str"))
+    out.push(("unrolled_st", "strb"))
+    out.push(("adjacent", "ldr"))
     out
 end vpa_thumb_expected
 
