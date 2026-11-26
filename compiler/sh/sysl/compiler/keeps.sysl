@@ -2417,7 +2417,28 @@ struct Track
     // tracked is asked the same of its own body (`endless_keeps_of`).
     endless: bool
 
+    // **The locals whose copy of what is tracked every way to the piece being asked has overwritten**
+    // (`keeps_flow.sysl`'s `copies_gone`), set by the walk of the body's ways (`walk_track`) and empty
+    // anywhere else. Such a local holds nothing tracked there, whatever it held before.
+    gone: Buf[string]
+
+    // The locals a whole store into may overwrite a copy (`copy_locals`): each bound by one
+    // declaration and nothing else, so a name means one local wherever the body says it.
+    copies: Buf[string]
+
+    // Set while a piece is asked which locals it binds anew (`rebinds`), into `noted` rather than
+    // into `held` and `ptrs`.
+    noting: bool
+    noted: Buf[string]
+
+    // Each closure literal the walk built, by node, with the copies overwritten where it was built
+    // (`note_made`): what it captured is asked as of then, wherever it is handed over.
+    made: Buf[(usize, Buf[string])]
+
     holds(self, name: string) -> bool = holds_string(self.held, name)
+
+    // Whether a local holds what is tracked at the piece being asked.
+    holds_here(self, name: string) -> bool = self.holds(name) && !holds_string(self.gone, name)
 end Track
 
 // A walk of what is read through the parameter at `i` as a read question asks it: its steps, and the
@@ -2435,7 +2456,8 @@ private track_as(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, ste
 private track_along(cx: &KeepsCx, f: TFunc, i: usize, raw: bool, through: bool, steps: int, path: string) -> &Track
     val org = origins_of(cx, f)
     val t: &Track = Track(cx, func_home(cx.an, f.name), buf(), buf(), false, not_kept(), org, raw, through,
-                          steps, buf(), buf(), false, round_handles(cx, org, f), f, false, path, "", buf(), false)
+                          steps, buf(), buf(), false, round_handles(cx, org, f), f, false, path, "", buf(), false,
+                          buf(), buf(), false, buf(), buf())
 
     if i < f.params.len()
         t.held.push(f.params[i].0)
@@ -2598,7 +2620,15 @@ private walk_track(t: &Track, i: usize, endless: bool = false) -> KeptWhy
 
     w.endless = endless
     t.endless = endless
+
+    // **A copy overwritten on every way to a piece is not handed over by it** -- `var b = a`, then
+    // `b = &spare`, then `f1(&b)` -- so each piece is asked with the copies its way has overwritten.
+    t.copies = copy_locals(t)
+
+    if !t.copies.is_empty() then w.sees = st -> t.gone = copies_gone(st.cleared)
+
     flow_body(w, f.body)
+    t.gone = buf()
 
     val pending = if t.steps > 0 || t.deep then read_back_locs(t, w.out_pending) else w.out_pending
     var first: Option[KeptAt] = None
@@ -2681,6 +2711,8 @@ private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
 
     stmt_moves(t.cx, evs, s)
     t.hs.at = stmt_handle(t.hs, s)
+    rebinds(t, v -> walk_stmt(s, v), evs)
+    note_made(t, v -> walk_stmt(s, v))
 
     s match
         TWriteStmt(w) -> clear_store(t, evs, w.place, w.value)
@@ -2688,7 +2720,9 @@ private track_stmt_events(t: &Track, s: TStmt) -> Buf[FlowEv]
             for item in writes
                 clear_store(t, evs, item.place, item.value)
         TExprStmt(e) -> top_clears(t, evs, e)
-        TVarDecl(_, _, init, _) -> top_clears(t, evs, init)
+        TVarDecl(n, _, init, _) ->
+            top_clears(t, evs, init)
+            copy_overwrite(t, evs, n, init)
         _ -> ()
 
     walk_stmt(s, TWalk(false, e -> kept_at(t, evs, e), w -> stored(t, evs, w.place, w.value), x -> ()))
@@ -2701,6 +2735,8 @@ private track_expr_events(t: &Track, e: TExpr) -> Buf[FlowEv]
 
     piece_moves(t.cx, evs, e)
     t.hs.at = expr_handle(t.hs, e)
+    rebinds(t, v -> walk_texpr(e, v), evs)
+    note_made(t, v -> walk_texpr(e, v))
     top_clears(t, evs, e)
     walk_texpr(e, TWalk(false, x -> kept_at(t, evs, x), w -> stored(t, evs, w.place, w.value), s -> ()))
     t.hs.at = ""
@@ -2775,6 +2811,10 @@ end top_clears
 // A store of something not tracked overwrites what its place held.
 private clear_store(t: &Track, evs: &EvBuf, place: TExpr, v: TExpr)
     if carries(t, v) then return
+
+    whole_local(t.refs, place) match
+        Some(n) -> copy_overwrite(t, evs, n, v)
+        None -> ()
 
     val loc = place_loc(t.org, place)
 
@@ -3117,15 +3157,66 @@ private captures_kept(t: &Track, evs: &EvBuf, st: &StructType, args: Buf[TExpr])
 end captures_kept
 
 // The same at a call handed the closure, after whatever the call overwrites (`closures_handed`).
+//
+// **The literal was built where it is written, not at the call**, so what it captured is asked with no
+// copy held overwritten: one overwritten between the two was captured before it was.
 private handed_closures_kept(t: &Track, evs: &EvBuf, args: Buf[TExpr])
+    val gone = t.gone
+
     for a in args
         closure_literal_of(a, t.decls, 0) match
             Some(lit) ->
+                t.gone = gone_where_made(t, lit)
+
                 *lit.kind match
                     TStructNew(st, captured) -> captures_kept(t, evs, st, captured)
                     _ -> ()
             None -> ()
+
+    t.gone = gone
 end handed_closures_kept
+
+// The copies overwritten on every way to where a closure literal was built, each time the walk built it
+// (`note_made`) -- none, where the walk has not been there yet.
+private gone_where_made(t: &Track, lit: TExpr) -> Buf[string]
+    val id = node_id(lit)
+
+    for item in t.made
+        if item.0 == id then return item.1
+
+    buf()
+end gone_where_made
+
+// **Where a piece builds a closure literal, which copies were overwritten there**: met again -- a loop's
+// next round, a later turn -- only what was overwritten every time stays so.
+private note_made(t: &Track, walk: &Fn(&TWalk) -> unit)
+    if t.copies.is_empty() then return
+
+    walk(expr_walk(false, e -> *e.kind match
+        TStructNew(st, _) -> if is_closure_literal(Struct(st)) then made_with(t, node_id(e))
+        _ -> ()))
+end note_made
+
+private made_with(t: &Track, id: usize)
+    for k in 0..<t.made.len()
+        if t.made[k].0 != id then continue
+
+        var both: Buf[string] = buf()
+
+        for n in t.made[k].1
+            if holds_string(t.gone, n) then both.push(n)
+
+        t.made[k] = (id, both)
+        return
+    end for
+
+    var now: Buf[string] = buf()
+
+    for n in t.gone
+        now.push(n)
+
+    t.made.push((id, now))
+end made_with
 
 // The steps from a closure's environment to what a capture holds: the field itself for one held by
 // value, the variable its field points at for one held by reference.
@@ -3237,6 +3328,8 @@ private gather_steps(t: &Track, e: TExpr, out: *Buf[int], depth: int)
 
     *e.kind match
         TLoad(n, _) ->
+            if holds_string(t.gone, n) then return
+
             for item in t.ptrs
                 if item.0 == n then push_step(out, item.1)
         TAddrOf(place, _) ->
@@ -3597,6 +3690,125 @@ private track_locals(t: &Track, body: TBlock)
                                      s -> bind_stmt(t, s)))
 end track_locals
 
+// **The locals whose copy a whole store may overwrite**: each one the body holds what is tracked in,
+// declared by exactly one `var` or `val` and bound by nothing else -- no pattern, no loop variable, no
+// `ref` -- so that whatever binds the name anew is a declaration or a store the walk sees as one.
+private copy_locals(t: &Track) -> Buf[string]
+    val others: &Binders = Binders(buf(), buf())
+
+    walk_block_stmts(t.func.body, TWalk(false, e -> other_binders(t, e, others), w -> (), s -> s match
+        TRefDecl(n, _, place) ->
+            others.names.push(n)
+            held_address(t, place, others)
+        _ -> ()))
+
+    var out: Buf[string] = buf()
+
+    for n in t.held
+        if holds_string(others.names, n) || holds_string(out, n) then continue
+
+        var decls = 0
+
+        for item in t.decls
+            if item.0 == n then decls += 1
+
+        if decls == 1 then out.push(n)
+    end for
+
+    out
+end copy_locals
+
+// The names bound some other way than one declaration, and the addresses of locals handed straight to
+// a callee that does not keep them (`lent`, by node).
+private struct Binders
+    names: Buf[string]
+    lent: Buf[usize]
+
+// **A local whose address is held anywhere is no copy a store can be seen to overwrite**: a store
+// through that address -- by a nested function through its environment, by a callee through a
+// pointer stashed in another local -- puts what is tracked back where no piece names the local. Only
+// an address handed straight to a callee with a body here, which does not keep that parameter, lives
+// no longer than the call; what the callee stores through it is a store the gathering sees.
+private other_binders(t: &Track, e: TExpr, out: &Binders)
+    *e.kind match
+        TMatch(_, arms, _) ->
+            for arm in arms
+                for p in arm.patterns
+                    pattern_names(p, &out.names)
+        TIf(cond, _, _, _) -> cond_binders(cond, &out.names)
+        TWhile(cond, _, _, _) -> cond_binders(cond, &out.names)
+        TFor(name, _, _, _, _, _, _, _) -> out.names.push(name)
+        TForEach(name, _, _, _, _, _) -> out.names.push(name)
+        TIterate(cursor, _, _, _, pat, _, _, _) ->
+            out.names.push(cursor)
+            pattern_names(pat, &out.names)
+        TCall(name, args, _, _) ->
+            if t.cx.find(name).is_none() then return
+
+            for j in 0..<args.len()
+                if !keeps_of(t.cx, name, j).kept then out.lent.push(node_id(args[j]))
+        TAddrOf(place, _) -> if !lent_here(out, e) then held_address(t, place, out)
+        TSlice(base, _, _, _, _) -> held_address(t, base, out)
+        TConstView(v) -> held_address(t, v, out)
+        TViewAs(v, _) -> held_address(t, v, out)
+        _ -> ()
+end other_binders
+
+private lent_here(out: &Binders, e: TExpr) -> bool
+    val id = node_id(e)
+
+    for x in out.lent
+        if x == id then return true
+
+    false
+end lent_here
+
+private held_address(t: &Track, place: TExpr, out: &Binders)
+    local_root(t.refs, place) match
+        Some(n) -> out.names.push(n)
+        None -> ()
+end held_address
+
+private cond_binders(cond: Buf[TCondTerm], out: *Buf[string])
+    for term in cond
+        term match
+            TCondIs(_, patterns, _) ->
+                for p in patterns
+                    pattern_names(p, out)
+            _ -> ()
+end cond_binders
+
+// **The copies a piece binds anew**, among those its way has overwritten: everything the gathering of
+// the body's copies (`track_locals`) would bind there, asked of the piece alone.
+private rebinds(t: &Track, walk: &Fn(&TWalk) -> unit, evs: &EvBuf)
+    if t.gone.is_empty() then return
+
+    t.noting = true
+    t.noted = buf()
+    walk(TWalk(false, e -> bind_expr(t, e), w -> bind_store(t, w.place, w.value), s -> bind_stmt(t, s)))
+    t.noting = false
+
+    for n in t.noted
+        if holds_string(t.gone, n) then evs.items.push(copy_back_ev(n, span_zero()))
+end rebinds
+
+// **A whole store into a copy of something not tracked overwrites the copy** -- not a field of it,
+// which leaves the rest, and not through a pointer to it, which may point elsewhere by then.
+private copy_overwrite(t: &Track, evs: &EvBuf, n: string, v: TExpr)
+    if !holds_string(t.copies, n) || carries(t, v) || !ptr_steps(t, v).is_empty() then return
+
+    evs.items.push(copy_gone_ev(n, v.span))
+end copy_overwrite
+
+// The local a place is the whole of, a `ref` followed to what it names.
+private whole_local(refs: Buf[(string, TExpr)], place: TExpr) -> Option[string] = *place.kind match
+    TLoad(n, _) ->
+        for item in refs
+            if item.0 == n then return whole_local(refs, item.1)
+
+        Some(n)
+    _ -> None
+
 private bind_stmt(t: &Track, s: TStmt)
     s match
         TVarDecl(n, _, init, _) -> bind(t, n, init)
@@ -3786,6 +3998,12 @@ end bind
 // have been read at, since a local given a pointer read one step in and then one read two steps in
 // holds either afterwards.
 private bind_steps(t: &Track, name: string, steps: Buf[int])
+    if t.noting
+        if !steps.is_empty() then note_bound(t, name)
+
+        return
+    end if
+
     for s in steps
         if !has_step(t, name, s)
             t.ptrs.push((name, s))
@@ -3807,7 +4025,14 @@ private bound_step(t: &Track, name: string) -> bool
     false
 end bound_step
 
+private note_bound(t: &Track, name: string) = if !holds_string(t.noted, name) then t.noted.push(name)
+
 private bind_name(t: &Track, name: string)
+    if t.noting
+        note_bound(t, name)
+        return
+    end if
+
     if t.holds(name) then return
 
     t.held.push(name)
@@ -3871,7 +4096,7 @@ end local_root
 // no pointer inside is never made of the argument, whatever it was computed from. A raw walk is the
 // one exception: it follows an address through the integers it is computed with.
 private carries(t: &Track, e: TExpr) -> bool = *e.kind match
-    TLoad(n, ty) -> t.holds(n) && (t.raw || may_hold_pointer(t.cx, ty))
+    TLoad(n, ty) -> t.holds_here(n) && (t.raw || may_hold_pointer(t.cx, ty))
 
     // An address INTO the pointee is the same pointer moved along; the address of a local that holds
     // it is a pointer to it, one step further away.
@@ -3988,7 +4213,7 @@ private holds_it(t: &Track, e: TExpr) -> bool = t.raw || may_hold_pointer(t.cx, 
 // In a walk of the value itself, a field or element in place of a local holding it may be the copy:
 // `h.p = a` then `&h.p`.
 private holds_local(t: &Track, place: TExpr) -> bool = *place.kind match
-    TLoad(n, _) -> t.holds(n)
+    TLoad(n, _) -> t.holds_here(n)
     TField(_, _, _) -> value_walk(t) && part_held(t, place)
     TIndex(_, _, _) -> value_walk(t) && part_held(t, place)
     _ -> false
@@ -3996,7 +4221,7 @@ private holds_local(t: &Track, place: TExpr) -> bool = *place.kind match
 private value_walk(t: &Track) -> bool = !t.through && t.steps == 0
 
 private part_held(t: &Track, place: TExpr) -> bool = local_root(t.refs, place) match
-    Some(n) -> t.holds(n) && carries(t, place)
+    Some(n) -> t.holds_here(n) && carries(t, place)
     None -> false
 
 private boxed(ty: Type) -> bool = ty match
