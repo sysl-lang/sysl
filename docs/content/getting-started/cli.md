@@ -1386,9 +1386,9 @@ with the JSON-RPC parse error (`-32700`); a request the server does not answer, 
 server ends at `exit`, with status 0 after `shutdown` and 1 without; input that ends or cannot be
 framed ends it with status 1.
 
-**Visual Studio Code**: the [sysl extension](https://github.com/sysl-lang/vscode-extension) starts
+**Visual Studio Code**: the [sysl extension](https://github.com/sysl-lang/sysl/tree/dev/editors/vscode) starts
 `sysl lsp --stdio` and colours sysl with the grammar the documentation uses. Install the `.vsix`
-from its [releases](https://github.com/sysl-lang/vscode-extension/releases) (**Extensions: Install
+from its [releases](https://github.com/sysl-lang/sysl/releases) (**Extensions: Install
 from VSIX…**). Its settings are `sysl.server.path` (the compiler, `sysl` on the `PATH` by default)
 and `sysl.lib` (passed as `SYSL_LIB`; an installed sysl needs none). The grammar itself ships in
 the release at `share/sysl/editors/sysl.tmLanguage.json`, for any editor that reads TextMate
