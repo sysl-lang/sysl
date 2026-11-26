@@ -361,9 +361,9 @@ cross(n: int) -> Result[int, string]
 ```
 
 **In a closure, the enclosing function is the closure**, so a `?` returns the failure from the
-closure. Its result has to be known before the body is read, and the context supplies it: a typed
-`val`, the parameter the closure is passed to, or a generic one like `and_then`'s `T -> Option[U]`,
-where the body settles `U`:
+closure. Where the context says what the closure returns — a typed `val`, the parameter the closure
+is passed to, or a generic one like `and_then`'s `T -> Option[U]`, where the body settles `U` — the
+`?` returns into that:
 
 ```sysl
 half(n: int) -> Option[int]
@@ -380,19 +380,61 @@ print(Some(12).and_then(n -> Some(half(n)? + 1)).unwrap())
 7
 ```
 
-Where nothing says what the closure returns, the `?` has nowhere to send the failure. You write the
-type on what holds the closure:
+**Where nothing says what the closure returns, its body does, and its `?`s say the error.** The
+closure's result is what its body yields, as for any closure, and each `?` is held to it. A `Result`
+the body leaves without an error type — `Ok(parse(s)? + 1)` says the success and nothing else —
+takes the one its `?`s propagate, at its last line, at each branch of an `if` or a `match` that ends
+it, and at a value it returns early:
 
 ```sysl
 half(n: int) -> Option[int]
     if n % 2 == 0 then Some(n / 2) else None
 
+parse(s: string) -> Result[int, string]
+    if s == "1" then Ok(1) else Err("bad")
+
 val quarter = (n: int) -> half(half(n)?)
+val inc = (s: string) ->
+    if s == "" then return Ok(0)
+
+    Ok(parse(s)? + 1)
+
+print(quarter(8).unwrap(), quarter(6).is_none())
+print(inc("1").unwrap(), inc("x").unwrap_err(), inc("").unwrap())
+```
+
+```output
+2 true
+2 bad 0
+```
+
+A body yielding something a `?` cannot carry is told so in the words a declared result gets —
+`(n: int) -> half(n)? + 1` yields an `int`, and its `?` "may only be used in a function returning
+Option, not int". **`?`s propagating two different errors name neither**, since nothing says which
+the closure returns. Where the body names it — its last line a call returning `Result[int, Fault]`,
+say — each `?` converts into it [through `From`](#a-converts-through-from); where nothing does, you
+write the type where the closure is stored or passed:
+
+```sysl
+enum Io
+    NotFound
+
+parse(s: string) -> Result[int, string]
+    if s == "1" then Ok(1) else Err("bad")
+
+open(ok: bool) -> Result[int, Io] = if ok then Ok(7) else Err(Io.NotFound)
+
+val both = (s: string, ok: bool) -> Ok(parse(s)? + open(ok)?)
+
+print(both("1", true).is_ok())
 ```
 
 ```error
-'?' needs this closure's result type, and nothing here fixes it — write the type where the closure is stored or passed, as in 'val f: &Fn(…) -> Option[…] = …'
+'?' propagates a Io error where an earlier '?' in this closure propagates string, and nothing here says which the closure returns — write the type where the closure is stored or passed, as in 'val f: &Fn(…) -> Result[…] = …', and each '?' converts into it
 ```
+
+A function whose result is read off its body is not a closure: a `?` in one needs the result
+written after the parameters.
 
 **An early return by `?` runs the block's deferred statements**, as any `return` does, and is a
 failure: an [`errdefer`](/reference/statements/#errdefer) written above it runs too, undoing the
