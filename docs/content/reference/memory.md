@@ -1620,6 +1620,67 @@ name.sysl:8:5: 's.bytes' is the bytes of a string that may be held in the string
 `sysl test` takes the flag as a build does, and `sysl test <library> --std --explain-escapes` is how
 the standard library's own promotions are listed.
 
+**A box [the frame does not lay](#a-box-nothing-keeps-is-laid-in-the-frame) is reported too**, after
+the arrays and closures: one line per `&T` construction and per factory call whose box is on the
+heap, at the construction or the call, naming the **first way out** the analysis met. Where the box
+is handed to a callee that lets it out, the line says how that callee does, in parentheses, as far
+down as the calls go. A box laid in its frame says nothing, and nor does a factory's own answer,
+which each of its calls reports where that call put it.
+
+```sysl
+struct Counter
+    n: int
+
+var kept: Option[&Counter] = None
+
+counter(n: int) -> &Counter = Counter(n)
+
+keep(c: &Counter)
+    kept = Some(c)
+
+count(n: int, c: &Counter) -> int
+    if n == 0
+        keep(c)
+        return c.n
+
+    count(n - 1, c)
+
+main()
+    val a: &Counter = Counter(1)
+
+    kept = Some(a)
+    keep(counter(2))
+    print(count(3, Counter(3)))
+
+    val quiet: &Counter = Counter(4)
+
+    print(quiet.n, kept.unwrap().n)
+    kept = None
+```
+
+```output
+3
+4 3
+```
+
+```
+$ sysl run --explain-escapes counters.sysl
+counters.sysl:19:23: a 'Counter' is boxed on the heap, because it is stored in 'kept' on line 21
+counters.sysl:22:10: what 'counter' answers is boxed on the heap, because it is handed to 'keep' on line 22, which keeps its parameter 'c' (it is stored in 'kept' on line 9)
+counters.sysl:23:20: a 'Counter' is boxed on the heap, because it is handed to 'count' on line 23, which keeps its parameter 'c' (it is handed to 'keep' on line 13, which keeps its parameter 'c' (it is stored in 'kept' on line 9))
+```
+
+A recursion is reported by what its body does at the bottom: `count` hands its parameter on to
+itself and lets it out only through `keep`, which is the reason given.
+
+The other reasons a line gives are the rest of the ways out [listed above](#a-box-nothing-keeps-is-laid-in-the-frame):
+stored in a place that is not the frame's own (*"is stored in 'h.c'"*), returned other than as a
+factory's answer, captured by a closure, built into another box or into a value with a destructor,
+weakened, carried out of a loop by `break`, kept in a local that outlives the loop turn that built
+it, handed to a call with no body in sight, a payload over the kilobyte a frame lays, a destructor
+that may let its payload out, a body that is `async`, and a factory whose parameter is lent by
+address, which therefore has no frame entry.
+
 The idiom worth reaching for first, even with an allocator, is **return a count and let the caller
 slice its own buffer** — what `snprintf` does, and what most kernel code wants.
 
