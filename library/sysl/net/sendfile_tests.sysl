@@ -280,8 +280,15 @@ nsf_non_blocking_back_pressure()
 
     var full = a.send_file(f, u64(first), total - first)
     var sent = first
+    var calls = 0
+    var zeros = 0
 
     while full.is_ok() && sent < total
+        calls += 1
+        assert(calls < 100000, f"a full socket never answered would_block: $sent sent, $zeros calls sent none")
+
+        if full.unwrap() == 0 then zeros += 1
+
         sent += full.unwrap()
         full = a.send_file(f, u64(sent), total - sent)
 
@@ -294,6 +301,8 @@ nsf_non_blocking_back_pressure()
     var into: []u8 = [0; 65536]
     var turns = 0
 
+    c.read_timeout(20_000).unwrap()
+
     while got.len() < total
         turns += 1
         assert(turns < 200000, "the transfer did not finish")
@@ -303,7 +312,17 @@ nsf_non_blocking_back_pressure()
                 Ok(n) -> sent += n
                 Err(e) -> assert(would_block(e), "send_file failed")
 
-        val k = c.recv(into).unwrap()
+        // A full socket can be one whose bytes have all arrived and are not yet acknowledged: with
+        // nothing in flight a blocking `recv` here would wait for bytes only this thread can send.
+        if got.len() == sent
+            sleep(millis(1))
+            continue
+
+        val k = c.recv(into) match
+            Ok(k) -> k
+            Err(e) ->
+                assert(false, f"the reader stalled at ${got.len()} with $sent sent: $e")
+                0
 
         for b in into[0..<k]
             got.push(b)
