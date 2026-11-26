@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`get_xattr`](#get_xattr) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_get_xattr`](#link_get_xattr) [`link_list_xattrs`](#link_list_xattrs) [`link_metadata`](#link_metadata) [`link_remove_xattr`](#link_remove_xattr) [`link_set_xattr`](#link_set_xattr) [`list_xattrs`](#list_xattrs) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`remove_xattr`](#remove_xattr) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`set_xattr`](#set_xattr) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`LockKind`](#lockkind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`get_xattr`](#get_xattr) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_get_xattr`](#link_get_xattr) [`link_list_xattrs`](#link_list_xattrs) [`link_metadata`](#link_metadata) [`link_remove_xattr`](#link_remove_xattr) [`link_set_xattr`](#link_set_xattr) [`list_xattrs`](#list_xattrs) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`remove_xattr`](#remove_xattr) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`set_xattr`](#set_xattr) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`temp_dir`](#temp_dir) [`temp_file`](#temp_file) [`temp_root`](#temp_root) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Constants
 
@@ -450,16 +450,7 @@ file) reports `AlreadyExists`. Neither is silently accepted.
 make_temp_dir(prefix: string) -> Result[string, IoError]
 ```
 
-A directory that did not exist a moment ago and that nobody else can take, made inside whatever
-`TMPDIR` names -- or `/tmp` where it names nothing.
-
-**It is created, not merely named**, which is the whole point: inventing a path and then making it
-leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
-somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
-not what makes the name unique.
-
-**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
-a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+`temp_dir` under the name it had first; the two are one call.
 
 ### `map_file`
 
@@ -858,6 +849,70 @@ unpacked. It is also stored **as written**: a relative target is resolved agains
 the link is in, every time it is followed, rather than against wherever the program was when it
 made the link.
 
+### `temp_dir`
+
+```sysl
+temp_dir(prefix: string = "") -> Result[string, IoError]
+```
+
+A directory that did not exist a moment ago and that nobody else can take, made with mode `0700`
+inside `temp_root()`. Its name is `prefix` followed by six characters chosen to make it unique.
+
+**It is created, not merely named**, which is the whole point: inventing a path and then making it
+leaves a gap between the two in which somebody else on a shared `/tmp` can take the name, and that
+somebody is not necessarily friendly. The prefix is for a human reading a directory listing and is
+not what makes the name unique.
+
+**Removing it is the caller's**, and `remove_dir_all` is the call: nothing here runs at the end of
+a scope that the scope did not say, so `defer remove_dir_all(d)` is the idiom.
+
+A root that is not there answers `NotFound`, and one this process may not write in
+`PermissionDenied`. **A prefix holding a `/` or a NUL is refused** with `Other(22)`, `EINVAL`,
+before anything is made: it would name something other than one entry of the root.
+
+### `temp_file`
+
+```sysl
+temp_file(prefix: string = "") -> Result[(File, string), IoError]
+```
+
+A regular file that did not exist a moment ago and that nobody else can take, made inside
+`temp_root()` and answered open for reading and writing, with its path. Its name is `prefix`
+followed by six characters chosen to make it unique.
+
+**It is created and opened in one step** -- `O_CREAT | O_EXCL`, as `mkstemp` does -- **with mode
+`0600`**, so there is no moment at which the name is somebody else's file or is readable by
+anyone but this user. Naming a file and then `create`-ing it would be the race `temp_dir`
+describes, with the added hazard that `create` follows a symbolic link somebody planted at the
+name. The process umask can narrow the mode further and never widens it.
+
+The `File` closes when the last copy of it goes, like any other. **The file itself stays**:
+removing it is the caller's, and `defer remove_file(p)` is the idiom -- written after the binding,
+so it runs after the `File` is closed or dropped.
+
+A root that is not there answers `NotFound`, and one this process may not write in
+`PermissionDenied`. A prefix holding a `/` or a NUL is refused as `temp_dir` refuses it.
+
+### `temp_root`
+
+```sysl
+temp_root() -> string
+```
+
+The directory temporary files go in, which `temp_dir` and `temp_file` make things inside.
+
+**The rule, in order:** `TMPDIR` where it is set and not empty; otherwise, on macOS, the per-user
+directory `confstr(_CS_DARWIN_USER_TEMP_DIR)` names (`/var/folders/…/T`), which is where Apple's
+own `NSTemporaryDirectory` points and which only this user can write in; otherwise `/tmp`.
+Trailing slashes are dropped, so `s"${temp_root()}/name"` is the path the system will report back;
+`/` itself stays `/`.
+
+It is read afresh at every call rather than once, so a program that sets `TMPDIR` for itself is
+answered with what it set. It is not checked: a `TMPDIR` naming nothing is answered as it is, and
+the failure is `temp_dir`'s or `temp_file`'s, where there is something to fail. A target whose
+hooks cannot answer, and a root whose name is not UTF-8 and so cannot be a `string`, are answered
+`/tmp`; `temp_dir` and `temp_file` report the second as `InvalidUtf8` and leave nothing behind.
+
 ### `truncate`
 
 ```sysl
@@ -1039,9 +1094,6 @@ easy. While any copy lives the descriptor stays open.
 | `map_mut` | `map_mut(*self, len: usize = …) -> Result[&MappedMut, IoError]` | The file's bytes mapped readable and writable and shared, so a write through `bytes()` reaches the file. |
 | `sync_data` | `sync_data(*self) -> Result[unit, IoError]` | Hands what is buffered over and asks the device to keep the file's contents, returning once it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which skips an unchanged modification time). |
 | `full_sync` | `full_sync(*self) -> Result[unit, IoError]` | The strongest durability the platform offers: what is buffered is handed over and the device is made to empty its own write cache. |
-| `lock` | `lock(self, kind: LockKind) -> Result[unit, IoError]` | Takes an advisory lock on the whole file, waiting until no other open file holds one that conflicts: a `Shared` lock waits out an `Exclusive` one, and an `Exclusive` lock waits out both. |
-| `try_lock` | `try_lock(self, kind: LockKind) -> Result[unit, IoError]` | `lock` without the wait: the lock is taken now, or the answer is an `IoError` whose `would_block()` says another open file holds one that conflicts, and nothing new is held. |
-| `unlock` | `unlock(self) -> Result[unit, IoError]` | Gives up the lock this file holds, of either kind, **handing over what is buffered first**, as `close` does: bytes written under the lock are in the file before anybody waiting for it gets in. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -1112,7 +1164,6 @@ Why a filesystem operation did not happen.
 | `message` | `message(self) -> string` | A sentence, in the terms the operation was asked in rather than in C's. |
 | `refused_link` | `refused_link(self) -> bool` | Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one or any above it, whether the link points inside the directory or out of it -- or `open_with` asked `nofollow` refused it because its last component is one. |
 | `escaped` | `escaped(self) -> bool` | Whether a `Dir` refused this path because it leads out of the directory: an absolute path, a `..` component, or the kernel finding a way out. |
-| `would_block` | `would_block(self) -> bool` | Whether the call would have had to wait -- what `File.try_lock` answers when another open file holds a lock that conflicts. |
 
 ### `Kind`
 
@@ -1143,17 +1194,6 @@ make an ordinary use of the older name ambiguous, one program away.
 |---|---|---|
 | `is_dir` | `is_dir(self) -> bool` | So that `k == Directory` reads as itself. |
 | `name` | `name(self) -> string` | The word for what this is. |
-
-### `LockKind`
-
-```sysl
-enum LockKind
-    Shared
-    Exclusive
-```
-
-Which lock `File.lock` and `File.try_lock` take: one any number of open files may hold together
-(`Shared`, for readers), or one no other open file may hold beside it (`Exclusive`, for a writer).
 
 ### `Mapped`
 
