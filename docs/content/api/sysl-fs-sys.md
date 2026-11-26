@@ -9,7 +9,7 @@ requires: "requires { os }"
 
 ## Index
 
-[`access_execute`](#access_execute) [`access_exists`](#access_exists) [`access_read`](#access_read) [`access_write`](#access_write) [`open_append`](#open_append) [`open_create`](#open_create) [`open_dsync`](#open_dsync) [`open_exclusive`](#open_exclusive) [`open_nofollow`](#open_nofollow) [`open_read`](#open_read) [`open_sync`](#open_sync) [`open_truncate`](#open_truncate) [`open_uncached`](#open_uncached) [`open_write`](#open_write) [`seek_current`](#seek_current) [`seek_end`](#seek_end) [`seek_start`](#seek_start) [`Stat`](#stat)
+[`access_execute`](#access_execute) [`access_exists`](#access_exists) [`access_read`](#access_read) [`access_write`](#access_write) [`lock_exclusive`](#lock_exclusive) [`lock_release`](#lock_release) [`lock_shared`](#lock_shared) [`open_append`](#open_append) [`open_create`](#open_create) [`open_dsync`](#open_dsync) [`open_exclusive`](#open_exclusive) [`open_nofollow`](#open_nofollow) [`open_read`](#open_read) [`open_sync`](#open_sync) [`open_truncate`](#open_truncate) [`open_uncached`](#open_uncached) [`open_write`](#open_write) [`seek_current`](#seek_current) [`seek_end`](#seek_end) [`seek_start`](#seek_start) [`Stat`](#stat)
 
 ## Constants
 
@@ -39,6 +39,29 @@ const access_read: int = 4
 ```sysl
 const access_write: int = 2
 ```
+
+### `lock_exclusive`
+
+```sysl
+const lock_exclusive: int = 2
+```
+
+### `lock_release`
+
+```sysl
+const lock_release: int = 8
+```
+
+### `lock_shared`
+
+```sysl
+const lock_shared: int = 1
+```
+
+The bits of `sysl_fs_lock`'s and `sysl_fs_lock_now`'s `how`: a lock others may share, one nobody
+else may hold, or giving up whichever this descriptor holds. They are this interface's own numbers,
+and happen to be `flock`'s `LOCK_SH`, `LOCK_EX` and `LOCK_UN` on Linux, Android and every BSD,
+so a supplier over `flock` passes them through.
 
 ### `open_append`
 
