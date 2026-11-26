@@ -984,6 +984,68 @@ at — one to the same type or to a struct holding it, and bytes from bytes, as 
 of an out-parameter of another type, so a handle a library allocated is not made of the `*i32` it
 reported an error code through.
 
+**An object behind a trait holds an address only where some type the program makes one of does.** A
+program's build sees every type erased to each trait, so a `&Shape` whose every implementation holds
+only numbers and counted references is as plain as they are, wherever it sits — the answer itself, a
+field, an `Option`, a `weak Shape` — and a closure handed a local's address may answer one:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    s: int
+
+impl Shape for Sq
+    area(self) -> int = self.s
+
+through(f: &Fn(*int) -> &Shape) -> &Shape
+    var x = 3
+    f(&x)
+
+main()
+    print(through((p) -> Sq(*p)).area())
+```
+
+```output
+3
+```
+
+One implementation that can hold the address — a `*int` field, a closure, an object of a trait that
+can — makes every object of the trait able to; a generic trait is asked at its own arguments. A closure
+behind a `&Fn` may hold anything, and so may every object in a build that does not see every table —
+`build-lib`, and `build-c`, whose C half can be handed an object made where the build cannot look:
+
+```sysl
+trait Shape
+    area(self) -> int
+
+struct Sq
+    s: int
+
+impl Shape for Sq
+    area(self) -> int = self.s
+
+struct Pt
+    p: *int
+
+impl Shape for Pt
+    area(self) -> int = *self.p
+
+through(f: &Fn(*int) -> &Shape) -> &Shape
+    var x = 3
+    f(&x)
+
+main()
+    var y = 1
+    val a: &Shape = Pt(&y)
+    print(through((p) -> Sq(*p)).area() + a.area())
+```
+
+```error
+'f' is returned, but it holds the address of a local of 'through'
+```
+
 #### An address as an integer leaves the analysis
 
 **An address as an integer is a number**: `usize(&marker)` stored, handed on or handed back keeps

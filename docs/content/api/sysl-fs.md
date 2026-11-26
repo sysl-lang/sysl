@@ -21,35 +21,42 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`LockKind`](#lockkind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_metadata`](#link_metadata) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`rename`](#rename) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+
+## Constants
+
+### `unchanged`
+
+```sysl
+const unchanged: u32 = 4294967295
+```
+
+What `set_owner` and `set_link_owner` take for an owner or a group to leave as it is: `4294967295`,
+which is `(uid_t)-1` and `(gid_t)-1`, the value `chown(2)` itself reads as "no change". No account
+has that id.
 
 ## Functions
 
 ### `append`
 
 ```sysl
-append(path: string, mode: u32 = file_mode) -> Result[File, IoError]
+append(path: string) -> Result[File, IoError]
 ```
 
 ### `append_bytes`
 
 ```sysl
-append_bytes(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
+append_bytes(path: string, bytes: []const u8) -> Result[unit, IoError]
 ```
 
 Writes the bytes at the end of the file, making it if it is not there. Each call lands after
 whatever the file already held, including anything another program appended in between.
 
-`mode` is the permission bits of a file this call makes, as `write_bytes` takes them; a file that
-is already there keeps its own.
-
 ### `append_text`
 
 ```sysl
-append_text(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]
+append_text(path: string, text: string) -> Result[unit, IoError]
 ```
-
-`append_bytes` for text, with the same `mode`.
 
 ### `cache_dir`
 
@@ -418,12 +425,12 @@ The three ways a program opens a file, named for what it means rather than for t
 becomes. `open` reads an existing file; `create` makes one, or empties one that was there;
 `append` writes at the end of whatever is there, making the file if it is not.
 
-**`create`, `append` and `create_update` take the permission bits a NEW file is born with**,
-`0o666` by default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A
-secret file asks `0o600` here and is owner-only from the moment it exists, with no window between
-creating and `set_permissions`. The mode applies only when the file is created: one that already
-exists keeps the mode it has. Bits above the twelve permission bits are dropped, as in
-`set_permissions`. A target with no permission bits ignores the mode.
+**`create` and `create_update` take the permission bits a NEW file is born with**, `0o666` by
+default, which the process umask narrows exactly as `open(2)` with `O_CREAT` does. A secret file
+asks `0o600` here and is owner-only from the moment it exists, with no window between creating
+and `set_permissions`. The mode applies only when the file is created: one that already exists
+keeps the mode it has. Bits above the twelve permission bits are dropped, as in `set_permissions`.
+A target with no permission bits ignores the mode.
 
 ### `open_dir`
 
@@ -640,8 +647,8 @@ set_link_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError]
 
 The owner and group of `path` **itself** set to `owner` and `group`, as `lchown(2)`: a symbolic link
 is given the ids and what it names keeps its own, which is the writing half of `link_metadata`'s
-reading. Anything at `path` that is not a link is changed exactly as `set_owner` changes it, with
-`set_owner`'s privilege rule: giving it away is `NotPermitted` to a program not acting as user 0. A
+reading. `unchanged` for `owner` or `group` leaves that id as it is. Anything at `path` that is not a
+link is changed exactly as `set_owner` changes it, with `set_owner`'s privilege rule: giving it away is `NotPermitted` to a program not acting as user 0. A
 path that is not there is `NotFound`; a target whose filesystem has no owners reports `unsupported()`.
 
 ### `set_modified`
@@ -665,8 +672,8 @@ set_owner(path: string, owner: u32, group: u32) -> Result[unit, IoError]
 ```
 
 The owner and group of what `path` names set to exactly `owner` and `group` -- the two numbers
-`Meta.owner` and `Meta.group` read back, and `sysl.process.user()` and `group()` answer. Both are
-set; a program changing only one passes the other as `metadata` read it.
+`Meta.owner` and `Meta.group` read back, and `sysl.process.user()` and `group()` answer. A program
+changing only one passes `unchanged` for the other.
 
 **Giving a file away is privileged**: a program not acting as user 0 is refused with `NotPermitted`,
 `chown(2)`'s own rule. A symbolic link is followed, as `set_permissions` follows one. A target
@@ -753,21 +760,15 @@ writable(path: string) -> bool
 ### `write_bytes`
 
 ```sysl
-write_bytes(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
+write_bytes(path: string, bytes: []const u8) -> Result[unit, IoError]
 ```
 
 Writes the bytes, replacing whatever was there and making the file if it was not.
 
-**`mode` is the permission bits a file this call makes is born with**, exactly as `create` takes
-them: `0o666` by default, narrowed by the process umask, bits above the twelve dropped, ignored on
-a target with no permission bits. A file that is already there keeps its own mode -- its contents
-are replaced, not the file. A failure answers what the open or the write said, the OS's reason
-included, whichever mode was asked for.
-
 ### `write_bytes_atomic`
 
 ```sysl
-write_bytes_atomic(path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]
+write_bytes_atomic(path: string, bytes: []const u8) -> Result[unit, IoError]
 ```
 
 Writes the bytes to `path` by way of a pending name, so a reader of `path` sees the whole of the
@@ -777,27 +778,19 @@ On any failure -- the write, the close or the rename -- the pending file is remo
 error is the answer, so `path` is exactly what it was before the call. A directory that is not
 there answers `NotFound` and leaves nothing anywhere.
 
-**`mode` is the permission bits the new file is born with**, as `write_bytes` takes them (`0o666`
-by default, narrowed by the umask). The pending file is created with them, so the file is never
-readable more widely than asked, not even under its pending name. **Unlike `write_bytes`, a file
-already at `path` does not keep its mode**: it is replaced by a new file, which has the mode asked
-for here.
-
 ### `write_text`
 
 ```sysl
-write_text(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]
+write_text(path: string, text: string) -> Result[unit, IoError]
 ```
-
-`write_bytes` for text, with the same `mode`.
 
 ### `write_text_atomic`
 
 ```sysl
-write_text_atomic(path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]
+write_text_atomic(path: string, text: string) -> Result[unit, IoError]
 ```
 
-`write_bytes_atomic` for text, with the same `mode`.
+`write_bytes_atomic` for text.
 
 ## Types
 
@@ -837,14 +830,14 @@ own, and stays open after the directory is gone.
 |---|---|---|
 | `fd` | `fd(self) -> int` | The descriptor, lent for a call this module does not make; the directory still closes it. |
 | `open` | `open(self, path: string) -> Result[File, IoError]` | The five ways a file is opened, as `sysl.fs.open`, `create`, `append`, `open_update` and `create_update` open one, with `path` beneath this directory. |
-| `create` | `create(self, path: string, mode: u32 = file_mode) -> Result[File, IoError]` |  |
-| `append` | `append(self, path: string, mode: u32 = file_mode) -> Result[File, IoError]` |  |
+| `create` | `create(self, path: string) -> Result[File, IoError]` |  |
+| `append` | `append(self, path: string) -> Result[File, IoError]` |  |
 | `open_update` | `open_update(self, path: string) -> Result[File, IoError]` |  |
-| `create_update` | `create_update(self, path: string, mode: u32 = file_mode) -> Result[File, IoError]` |  |
+| `create_update` | `create_update(self, path: string) -> Result[File, IoError]` |  |
 | `read_bytes` | `read_bytes(self, path: string) -> Result[[]u8, IoError]` | The whole-file functions, as `sysl.fs.read_bytes`, `read_text`, `write_bytes` and `write_text` do them and with the same errors (the OS's reason for a failed write included), with `path` beneath this directory and refused exactly as `open` and `create` refuse it. |
 | `read_text` | `read_text(self, path: string) -> Result[string, IoError]` |  |
-| `write_bytes` | `write_bytes(self, path: string, bytes: []const u8, mode: u32 = file_mode) -> Result[unit, IoError]` |  |
-| `write_text` | `write_text(self, path: string, text: string, mode: u32 = file_mode) -> Result[unit, IoError]` |  |
+| `write_bytes` | `write_bytes(self, path: string, bytes: []const u8) -> Result[unit, IoError]` |  |
+| `write_text` | `write_text(self, path: string, text: string) -> Result[unit, IoError]` |  |
 | `link_metadata` | `link_metadata(self, path: string) -> Result[Meta, IoError]` | What is at `path`, described as `sysl.fs.link_metadata` describes it: a link as the last component is reported as a link (`is_link()`), never followed. |
 | `exists` | `exists(self, path: string) -> bool` | Whether anything is at `path`, a link included. |
 | `remove_file` | `remove_file(self, path: string) -> Result[unit, IoError]` | Removes the file at `path`. |
@@ -901,9 +894,6 @@ easy. While any copy lives the descriptor stays open.
 | `map_mut` | `map_mut(*self, len: usize = …) -> Result[&MappedMut, IoError]` | The file's bytes mapped readable and writable and shared, so a write through `bytes()` reaches the file. |
 | `sync_data` | `sync_data(*self) -> Result[unit, IoError]` | Hands what is buffered over and asks the device to keep the file's contents, returning once it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which skips an unchanged modification time). |
 | `full_sync` | `full_sync(*self) -> Result[unit, IoError]` | The strongest durability the platform offers: what is buffered is handed over and the device is made to empty its own write cache. |
-| `lock` | `lock(self, kind: LockKind) -> Result[unit, IoError]` | Takes an advisory lock on the whole file, waiting until no other open file holds one that conflicts: a `Shared` lock waits out an `Exclusive` one, and an `Exclusive` lock waits out both. |
-| `try_lock` | `try_lock(self, kind: LockKind) -> Result[unit, IoError]` | `lock` without the wait: the lock is taken now, or the answer is an `IoError` whose `would_block()` says another open file holds one that conflicts, and nothing new is held. |
-| `unlock` | `unlock(self) -> Result[unit, IoError]` | Gives up the lock this file holds, of either kind, **handing over what is buffered first**, as `close` does: bytes written under the lock are in the file before anybody waiting for it gets in. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -973,7 +963,6 @@ Why a filesystem operation did not happen.
 | `message` | `message(self) -> string` | A sentence, in the terms the operation was asked in rather than in C's. |
 | `refused_link` | `refused_link(self) -> bool` | Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one or any above it, whether the link points inside the directory or out of it. |
 | `escaped` | `escaped(self) -> bool` | Whether a `Dir` refused this path because it leads out of the directory: an absolute path, a `..` component, or the kernel finding a way out. |
-| `would_block` | `would_block(self) -> bool` | Whether the call would have had to wait -- what `File.try_lock` answers when another open file holds a lock that conflicts. |
 
 ### `Kind`
 
@@ -1004,17 +993,6 @@ make an ordinary use of the older name ambiguous, one program away.
 |---|---|---|
 | `is_dir` | `is_dir(self) -> bool` | So that `k == Directory` reads as itself. |
 | `name` | `name(self) -> string` | The word for what this is. |
-
-### `LockKind`
-
-```sysl
-enum LockKind
-    Shared
-    Exclusive
-```
-
-Which lock `File.lock` and `File.try_lock` take: one any number of open files may hold together
-(`Shared`, for readers), or one no other open file may hold beside it (`Exclusive`, for a writer).
 
 ### `Mapped`
 
