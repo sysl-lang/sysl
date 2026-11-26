@@ -321,10 +321,15 @@ of, a counted temporary of the expression around the call, and a parameter the f
 a direct call hands over with a count of its own
 ([A parameter the function keeps arrives with its count](/reference/memory/#a-parameter-the-function-keeps-arrives-with-its-count)) —
 held from entry to the end of the body, as a local declared there would be. So is a parameter the
-function takes a count of its own for at entry: one the body assigns, every parameter of a function
-whose address is taken, of one that calls itself last (and so jumps back to its own entry), of an
-`async` function, and of one something outside sysl may call (`@export`, `@section`, a foreign
-convention). A parameter the function only reads is its caller's to hold, and holds nothing here. A scalar, a `*T` and a `&sync T` are not
+function takes a count of its own for at entry: one the body assigns a value it made, every parameter
+of a function whose address is taken, of one that calls itself last (and so jumps back to its own
+entry), of an `async` function, and of one something outside sysl may call (`@export`, `@section`, a
+foreign convention). A parameter the function only reads is its caller's to hold, and holds nothing
+here — and so is one the body only ever assigns what it was handed, walking a list or a tree its
+caller holds, which the compiler reads without a count of its own. **Whether a parameter holds a
+count is what the compiled body does**: the question is asked of each function the build compiles,
+after it is compiled, and a function nothing calls is not asked. So a refusal at a call a parameter
+may be held across is said only once the rest of the program has no error. A scalar, a `*T` and a `&sync T` are not
 — the last has an atomic count. Nor is a local holding a view that owns no count: a literal's bytes,
 a view of a `*T`, of an array laid in the frame or in module storage, or of another such local, so
 long as nothing writes it a counted value, takes its address or binds a `ref` to it. Nor is a local
@@ -385,15 +390,18 @@ wait()
 keep(s: string, out: &Holder)
     out.name = s
     wait()
+
+val h: &Holder = Holder("")
+
+keep("x" + "y", h)
 ```
 
 ```error
 'wait' can reach 'sysl.fiber.switch', which may resume this fiber on another thread, and this frame holds the parameter 's' (handed over with a count of its own, which this frame then gives back or keeps) across the call
 ```
 
-A parameter the body assigns takes its count at entry, so it is held across the call wherever the
-assignment stands. This holds even of one that only walks storage its caller handed over, which the
-compiler may in the end read without a count; `@pinned(thread)` is the way out there:
+A parameter the body assigns a value it made takes its count at entry, so it is held across the call
+wherever the assignment stands:
 
 ```sysl
 import sysl.fiber.{Context, switch}
@@ -408,10 +416,75 @@ grow(s: string)
     s = s + "x"
     wait()
     print(s)
+
+grow("a")
 ```
 
 ```error
 'wait' can reach 'sysl.fiber.switch', which may resume this fiber on another thread, and this frame holds the parameter 's' (kept with a count of its own, taken at entry and given back at the exit) across the call
+```
+
+One the body only ever assigns what it was handed, and does not read after the call, holds nothing:
+`total` walks a list its caller holds, so its `p` takes no count, and the fiber parked in it holds
+none either. (Read after the call, it would take one: while the fiber is parked other code runs, and
+may let go of the list's tail —
+[A local that walks storage takes no count](/reference/memory/#a-local-that-walks-storage-takes-no-count)
+says when a walk is read without one.)
+
+```sysl
+import sysl.fiber.{Context, Stack, switch}
+
+struct Node
+    v: int
+    next: Option[&Node]
+
+var home = Context.new()
+var away = Context.new()
+
+wait()
+    switch(&away, &home)
+
+total(p: Option[&Node]) -> int
+    var sum = 0
+
+    while p is Some(n)
+        sum += n.v
+        p = n.next
+
+    wait()
+    sum
+
+@pinned(thread)
+twice()
+    val list: Option[&Node] = Some(Node(1, Some(Node(2, None))))
+
+    print(total(list))
+    print(total(list))
+
+run(p: *int)
+    twice()
+
+    loop
+        wait()
+
+var unused = 0
+
+main()
+    val stack = Stack.reserve(64 * 1024).unwrap()
+
+    away = Context.start(stack, &run, &unused)
+
+    for _ in 0..<3
+        switch(&home, &away)
+        print("main again")
+```
+
+```output
+main again
+3
+main again
+3
+main again
 ```
 
 **A body whose fiber is only ever resumed on the thread it began on says so with
