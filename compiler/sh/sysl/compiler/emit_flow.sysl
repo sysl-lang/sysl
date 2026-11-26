@@ -111,7 +111,10 @@ private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)]
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
+
+    val mark = nowrap_mark(e)
+
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true, true)
     e.moves.last_uses = lasts.1
     e.moves.dying = dying_for(b.result.unwrap(), lasts.3)
 
@@ -119,6 +122,7 @@ private gen_block_into(e: *Emit, b: TBlock, dest: Val, inherit: Buf[(Val, Type)]
 
     e.moves.calm = calm_tail(e, b.stmts, b.result.unwrap(), e.moves.ready)
     gen_into(e, dest, b.result.unwrap())
+    nowrap_release(e, mark)
     e.moves.calm = was_calm
     e.moves.dying = set()
     e.moves.last_uses = was
@@ -883,7 +887,10 @@ gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
+
+    val mark = nowrap_mark(e)
+
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true, true)
     e.moves.last_uses = lasts.1
 
     b.result match
@@ -893,6 +900,7 @@ gen_block_void(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf())
             e.moves.dying = set()
         None -> ()
 
+    nowrap_release(e, mark)
     e.moves.last_uses = was
 
     pop_owned(e)
@@ -909,7 +917,10 @@ gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
     push_temps(e)
     push_owned(e)
     inherit_slots(e, inherit)
-    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true)
+
+    val mark = nowrap_mark(e)
+
+    gen_stmts_with(e, b.stmts, lasts.0, lasts.2, b.result, true, true)
     e.moves.last_uses = lasts.1
 
     val v = b.result match
@@ -922,6 +933,8 @@ gen_block_value(e: *Emit, b: TBlock, inherit: Buf[(Val, Type)] = buf()) -> Val
             retain_moving(e, r, texpr_type(r), got)
             got
         None -> VNothing
+
+    nowrap_release(e, mark)
 
     e.moves.last_uses = was
 
@@ -942,8 +955,12 @@ gen_stmts(e: *Emit, xs: Buf[TStmt]) = gen_stmts_with(e, xs, buf())
 //
 // `quiet_end` says the scope ends with nothing but releases, which is what lets a statement that
 // nothing observable follows hand a destructor-running local over (`calm_keeps.sysl`).
+//
+// With `hold`, the guards the list proved are kept for its value, which the caller lowers next and
+// then gives them back with `nowrap_release` from a mark it took before the call -- the value is the
+// rest of the list as surely as a statement after the guard would be.
 gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set[string]] = buf(),
-               tail: Option[TExpr] = None, quiet_end: bool = false)
+               tail: Option[TExpr] = None, quiet_end: bool = false, hold: bool = false)
     val mark = nowrap_mark(e)
     val was = e.moves.last_uses
     val was_calm = e.moves.calm
@@ -983,7 +1000,9 @@ gen_stmts_with(e: *Emit, xs: Buf[TStmt], lasts: Buf[Set[string]], dying: Buf[Set
 
     e.moves.last_uses = was
     e.moves.calm = was_calm
-    nowrap_release(e, mark)
+
+    if hold && tail.is_some() then nowrap_before_tail(e, tail.unwrap())
+    else nowrap_release(e, mark)
 end gen_stmts_with
 
 // A block's value emitted under the calm nothing after it disturbs, and the enclosing calm put back.
