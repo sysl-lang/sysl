@@ -21,7 +21,7 @@ handling away from every program with no operating system to ask. Deciding what 
 
 ## Index
 
-[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`get_xattr`](#get_xattr) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_get_xattr`](#link_get_xattr) [`link_list_xattrs`](#link_list_xattrs) [`link_metadata`](#link_metadata) [`link_remove_xattr`](#link_remove_xattr) [`link_set_xattr`](#link_set_xattr) [`list_xattrs`](#list_xattrs) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`remove_xattr`](#remove_xattr) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`set_xattr`](#set_xattr) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`temp_dir`](#temp_dir) [`temp_file`](#temp_file) [`temp_root`](#temp_root) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`LockKind`](#lockkind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
+[`unchanged`](#unchanged) [`append`](#append) [`append_bytes`](#append_bytes) [`append_text`](#append_text) [`cache_dir`](#cache_dir) [`canonicalize`](#canonicalize) [`config_dir`](#config_dir) [`copy_dir_all`](#copy_dir_all) [`copy_file`](#copy_file) [`create`](#create) [`create_update`](#create_update) [`current_dir`](#current_dir) [`data_dir`](#data_dir) [`entries`](#entries) [`entry_bytes`](#entry_bytes) [`executable`](#executable) [`exists`](#exists) [`from_errno`](#from_errno) [`get_xattr`](#get_xattr) [`hard_link`](#hard_link) [`home_dir`](#home_dir) [`is_dir`](#is_dir) [`is_file`](#is_file) [`is_link`](#is_link) [`link_get_xattr`](#link_get_xattr) [`link_list_xattrs`](#link_list_xattrs) [`link_metadata`](#link_metadata) [`link_remove_xattr`](#link_remove_xattr) [`link_set_times`](#link_set_times) [`link_set_xattr`](#link_set_xattr) [`list_xattrs`](#list_xattrs) [`make_dir`](#make_dir) [`make_dir_all`](#make_dir_all) [`make_temp_dir`](#make_temp_dir) [`map_file`](#map_file) [`metadata`](#metadata) [`open`](#open) [`open_dir`](#open_dir) [`open_options`](#open_options) [`open_uncached`](#open_uncached) [`open_update`](#open_update) [`open_with`](#open_with) [`page_size`](#page_size) [`pending_name`](#pending_name) [`publish_dir`](#publish_dir) [`publish_file`](#publish_file) [`read_bytes`](#read_bytes) [`read_link`](#read_link) [`read_text`](#read_text) [`readable`](#readable) [`remove_dir`](#remove_dir) [`remove_dir_all`](#remove_dir_all) [`remove_file`](#remove_file) [`remove_xattr`](#remove_xattr) [`rename`](#rename) [`rename_no_replace`](#rename_no_replace) [`set_current_dir`](#set_current_dir) [`set_link_owner`](#set_link_owner) [`set_modified`](#set_modified) [`set_owner`](#set_owner) [`set_permissions`](#set_permissions) [`set_times`](#set_times) [`set_xattr`](#set_xattr) [`size_of`](#size_of) [`space`](#space) [`symlink`](#symlink) [`temp_dir`](#temp_dir) [`temp_file`](#temp_file) [`temp_root`](#temp_root) [`truncate`](#truncate) [`walk`](#walk) [`writable`](#writable) [`write_bytes`](#write_bytes) [`write_bytes_atomic`](#write_bytes_atomic) [`write_text`](#write_text) [`write_text_atomic`](#write_text_atomic) [`Advice`](#advice) [`Dir`](#dir) [`Entry`](#entry) [`File`](#file) [`FileState`](#filestate) [`IoError`](#ioerror) [`Kind`](#kind) [`Mapped`](#mapped) [`MappedMut`](#mappedmut) [`Matching`](#matching) [`Meta`](#meta) [`OpenOptions`](#openoptions) [`Space`](#space-1) [`Walk`](#walk-1) [Display for IoError](#display-for-ioerror) [Display for Kind](#display-for-kind) [Drop for Dir](#drop-for-dir) [Drop for FileState](#drop-for-filestate) [Drop for Mapped](#drop-for-mapped) [Drop for MappedMut](#drop-for-mappedmut) [Eq for IoError](#eq-for-ioerror) [Eq for Kind](#eq-for-kind) [Fallible for File](#fallible-for-file) [Iterate for Matching](#iterate-for-matching) [Iterate for Walk](#iterate-for-walk) [Positioned for File](#positioned-for-file) [ReadAt for File](#readat-for-file) [Reader for File](#reader-for-file) [WriteAt for File](#writeat-for-file) [Writer for File](#writer-for-file)
 
 ## Constants
 
@@ -388,6 +388,16 @@ link_remove_xattr(path: string, name: string) -> Result[unit, IoError]
 ```
 
 `remove_xattr` on a symbolic link itself.
+
+### `link_set_times`
+
+```sysl
+link_set_times(path: string, accessed: Option[Instant], modified: Option[Instant]) -> Result[unit, IoError]
+```
+
+The same, on the path **itself**: a symbolic link's own times are set, and what it points at is
+left untouched -- `link_metadata` reads them back. A path that is not a link is set as `set_times`
+sets it, and a link that points nowhere is still a link whose times can be set.
 
 ### `link_set_xattr`
 
@@ -797,6 +807,26 @@ The permission bits set to exactly what is given. It is not a mask to add: `0o64
 ends up `0o644` whatever it was, which is `chmod(2)`'s own meaning and the one a program that read
 `permissions()` first is expecting.
 
+### `set_times`
+
+```sysl
+set_times(path: string, accessed: Option[Instant], modified: Option[Instant]) -> Result[unit, IoError]
+```
+
+The access time and the modification time of what `path` names set, following a symbolic link --
+each to the `Instant` given, and left exactly as it was where `None` is given, which is what lets a
+program copying a file's times carry one and not the other. `set_times(p, Some(t), Some(t))` is
+`set_modified(p, t)`.
+
+Neither can be set to "now" by the kernel's own clock here, because an `Instant` is a time and not
+an instruction: `Some(sysl.time.now())` sets it by this program's. The third time, `changed`, is
+not anyone's to set: it moves to now on every call that changes anything.
+
+A path that is not there reports `NotFound` -- also where both are `None`, which changes nothing
+and still asks that the path be there, so the answer is the same on every platform. Times are kept
+to the resolution of the filesystem; an `Instant` is microseconds, which APFS, ext4, btrfs and xfs
+all keep exactly. A target whose filesystem cannot be told a time reports `unsupported()`.
+
 ### `set_xattr`
 
 ```sysl
@@ -1094,9 +1124,6 @@ easy. While any copy lives the descriptor stays open.
 | `map_mut` | `map_mut(*self, len: usize = …) -> Result[&MappedMut, IoError]` | The file's bytes mapped readable and writable and shared, so a write through `bytes()` reaches the file. |
 | `sync_data` | `sync_data(*self) -> Result[unit, IoError]` | Hands what is buffered over and asks the device to keep the file's contents, returning once it has -- `sync` without the metadata a reader does not need (`fdatasync` on Linux, which skips an unchanged modification time). |
 | `full_sync` | `full_sync(*self) -> Result[unit, IoError]` | The strongest durability the platform offers: what is buffered is handed over and the device is made to empty its own write cache. |
-| `lock` | `lock(self, kind: LockKind) -> Result[unit, IoError]` | Takes an advisory lock on the whole file, waiting until no other open file holds one that conflicts: a `Shared` lock waits out an `Exclusive` one, and an `Exclusive` lock waits out both. |
-| `try_lock` | `try_lock(self, kind: LockKind) -> Result[unit, IoError]` | `lock` without the wait: the lock is taken now, or the answer is an `IoError` whose `would_block()` says another open file holds one that conflicts, and nothing new is held. |
-| `unlock` | `unlock(self) -> Result[unit, IoError]` | Gives up the lock this file holds, of either kind, **handing over what is buffered first**, as `close` does: bytes written under the lock are in the file before anybody waiting for it gets in. |
 | `flush` | `flush(*self) -> Result[unit, IoError]` | Hands over what is buffered. |
 | `close` | `close(*self) -> Result[unit, IoError]` | Releases the descriptor, handing over what is still buffered. |
 | `tell` | `tell(*self) -> Result[long, IoError]` | Where the next read or write will happen, in bytes from the start. |
@@ -1167,7 +1194,6 @@ Why a filesystem operation did not happen.
 | `message` | `message(self) -> string` | A sentence, in the terms the operation was asked in rather than in C's. |
 | `refused_link` | `refused_link(self) -> bool` | Whether a `Dir` refused this path because a component of it is a symbolic link -- the last one or any above it, whether the link points inside the directory or out of it -- or `open_with` asked `nofollow` refused it because its last component is one. |
 | `escaped` | `escaped(self) -> bool` | Whether a `Dir` refused this path because it leads out of the directory: an absolute path, a `..` component, or the kernel finding a way out. |
-| `would_block` | `would_block(self) -> bool` | Whether the call would have had to wait -- what `File.try_lock` answers when another open file holds a lock that conflicts. |
 
 ### `Kind`
 
@@ -1198,17 +1224,6 @@ make an ordinary use of the older name ambiguous, one program away.
 |---|---|---|
 | `is_dir` | `is_dir(self) -> bool` | So that `k == Directory` reads as itself. |
 | `name` | `name(self) -> string` | The word for what this is. |
-
-### `LockKind`
-
-```sysl
-enum LockKind
-    Shared
-    Exclusive
-```
-
-Which lock `File.lock` and `File.try_lock` take: one any number of open files may hold together
-(`Shared`, for readers), or one no other open file may hold beside it (`Exclusive`, for a writer).
 
 ### `Mapped`
 
@@ -1290,6 +1305,7 @@ struct Meta
     modified: Instant
     accessed: Instant
     changed: Instant
+    created: Option[Instant]
 ```
 
 Everything one `stat` answers, in one value.

@@ -1,0 +1,454 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// Handing a destructor-running local to an owned parameter (`calm_keeps.sysl`): a `&Trait` or a
+// `&Fn` pushed at its last use costs what a `&Node` does, and no destructor runs anywhere else than
+// it did. Every cell is a real program whose destructors print; the order is the assertion, and the
+// count beside it is what the hand-over saves. The expected outputs are the ones the compiler before
+// the hand-over printed.
+//
+// The axes: where the local is used (its last use, not its last, in a loop), what the callee does
+// with it (keeps it in a buffer that outlives the scope, keeps it and lets the buffer go, keeps it and
+// clears it itself), what follows the call (nothing, a `return`, a call that clears, a print), the
+// path out (the end, an early `return`, a `?` before or through the call), the callee (direct,
+// generic, the library's `Buf.push`), the value (a trait object, a closure whose capture has a
+// destructor, a fresh closure), and a branch that is or is not the scope's last statement. Skipped:
+// codegen units and `-O2`, which decide nothing here (the choice is made on the typed tree, once per
+// program), and a separately built `.syslib` callee, which a program cannot see into and so retains
+// for, as before.
+
+private struct OahRun
+    ok: bool
+    out: string
+    err: string
+
+private oah_ready() -> bool
+    if std_root().is_err() || !clang_available()
+        print("skipped: the library or the toolchain is not on this machine")
+        return false
+    end if
+
+    true
+end oah_ready
+
+private oah_prelude() -> string = """
+    import sysl.buf.{Buf, buf}
+
+    trait Shape
+        area(self) -> int
+
+    struct Noisy
+        id: int
+
+    impl Drop for Noisy
+        drop(self)
+            print(s"dropped ${self.id}")
+
+    impl Shape for Noisy
+        area(self) -> int = self.id
+
+    var quiet_drops = 0
+
+    // A destructor that takes no share of its own, for the cells that compare counts.
+    struct Quiet
+        id: int
+
+    impl Drop for Quiet
+        drop(self)
+            quiet_drops += 1
+
+    impl Shape for Quiet
+        area(self) -> int = self.id
+
+    """
+
+// The prelude and `body` built with the shares counted, and run.
+private oah_run(body: string) -> OahRun
+    val root = make_temp_dir("sysl-oah").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", oah_prelude() + body).unwrap()
+    force_retain_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(s"$root/built"))
+
+    force_retain_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return OahRun(false, failure_text(why), "")
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> OahRun(false, "could not be started", "")
+        Ok(o) -> OahRun(o.status.ok(), o.text, o.err.unwrap_or(""))
+end oah_run
+
+private oah_counts(run: OahRun) -> RetainCounts
+    assert(run.ok, run.out)
+
+    retain_count_reported(run.err) match
+        Some(c) -> c
+        None -> panic(s"no count was reported: '${run.err}'")
+end oah_counts
+
+@test("a trait object pushed at its last use is handed over, and dies with the buffer as before")
+oah_last_use_is_handed_over()
+    if !oah_ready() then return
+
+    val three = oah_run(oah_puts("&Shape", "Noisy", 3))
+
+    assert_eq(three.out, "3\ndropped 1\ndropped 2\ndropped 3\n")
+
+    // The same pushes of a `&Node`, whose release runs no code, beside a `&Shape` whose destructor
+    // takes no share of its own: each `put` costs both nothing, so the differences agree.
+    val node = oah_counts(oah_run(oah_puts("&Node", "Node", 3))).retains -
+        oah_counts(oah_run(oah_puts("&Node", "Node", 1))).retains
+    val quiet = oah_counts(oah_run(oah_puts("&Shape", "Quiet", 3))).retains -
+        oah_counts(oah_run(oah_puts("&Shape", "Quiet", 1))).retains
+
+    assert_eq(quiet, node)
+end oah_last_use_is_handed_over
+
+// A program whose `put` makes a `make` as `ty` and pushes it at its last use, `k` times.
+private oah_puts(ty: string, make: string, k: int) -> string = s"""
+    struct Node
+        v: int
+
+    put(xs: Buf[$ty], id: int)
+        val a: $ty = $make(id)
+
+        xs.push(a)
+
+    main()
+        val xs: Buf[$ty] = buf()
+
+        for i in 0..<$k
+            put(xs, i + 1)
+
+        print(xs.len())
+    """
+
+@test("an object made in the push's own argument is erased and handed over, as a '&Node' made there is")
+oah_a_fresh_object_is_handed_over()
+    if !oah_ready() then return
+
+    val shape_one = oah_run(oah_fresh("xs.push(Noisy(i))", 1))
+    val shape_three = oah_run(oah_fresh("xs.push(Noisy(i))", 3))
+
+    assert_eq(shape_one.out, "1\ndropped 0\n")
+    assert_eq(shape_three.out, "3\ndropped 0\ndropped 1\ndropped 2\n")
+
+    // Each round's object is the statement's temporary, handed down every layer of the push.
+    val node = oah_counts(oah_run(oah_fresh("ns.push(Node(i))", 3))).retains -
+        oah_counts(oah_run(oah_fresh("ns.push(Node(i))", 1))).retains
+    val quiet = oah_counts(oah_run(oah_fresh("xs.push(Quiet(i))", 3))).retains -
+        oah_counts(oah_run(oah_fresh("xs.push(Quiet(i))", 1))).retains
+    val closures = oah_counts(oah_run(oah_fresh("fs.push(() -> i + 1)", 3))).retains -
+        oah_counts(oah_run(oah_fresh("fs.push(() -> i + 1)", 1))).retains
+
+    assert_eq(quiet, node)
+    assert_eq(closures, node)
+end oah_a_fresh_object_is_handed_over
+
+// A program pushing `k` objects made by `push`, one a round, into one of three buffers.
+private oah_fresh(push: string, k: int) -> string = s"""
+    struct Node
+        v: int
+
+    main()
+        val xs: Buf[&Shape] = buf()
+        val fs: Buf[&Fn() -> int] = buf()
+        val ns: Buf[&Node] = buf()
+
+        for i in 0..<$k
+            $push
+
+        print(xs.len() + fs.len() + ns.len())
+    """
+
+@test("a buffer cleared after the push keeps the retain: the destructor runs where the scope ends")
+oah_a_clear_after_keeps_the_order()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        put_and_clear()
+            var xs: Buf[&Shape] = buf()
+            val a: &Shape = Noisy(2)
+
+            xs.push(a)
+            xs.clear()
+            print("cleared")
+
+        main()
+            put_and_clear()
+            print("returned")
+        """)
+
+    assert_eq(run.out, "cleared\ndropped 2\nreturned\n")
+end oah_a_clear_after_keeps_the_order
+
+@test("a callee that keeps and then clears is not a calm keeper: its print comes before the drop")
+oah_a_callee_that_clears_is_not_calm()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        keep_then_clear(xs: Buf[&Shape], s: &Shape)
+            xs.push(s)
+            xs.clear()
+            print("cleared in callee")
+
+        put(xs: Buf[&Shape])
+            val a: &Shape = Noisy(3)
+
+            keep_then_clear(xs, a)
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            put(xs)
+            print("returned")
+        """)
+
+    assert_eq(run.out, "cleared in callee\ndropped 3\nreturned\n")
+end oah_a_callee_that_clears_is_not_calm
+
+@test("a push that is not the last use retains, and the local outlives the clear")
+oah_not_the_last_use_retains()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        put(xs: Buf[&Shape])
+            val a: &Shape = Noisy(4)
+
+            xs.push(a)
+            xs.clear()
+            print(s"area ${a.area()}")
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            put(xs)
+            print("returned")
+        """)
+
+    assert_eq(run.out, "area 4\ndropped 4\nreturned\n")
+end oah_not_the_last_use_retains
+
+@test("in a loop: a local of the body is handed over each round, one from outside is retained")
+oah_in_a_loop()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        put(xs: Buf[&Shape])
+            for i in 0..<2
+                val a: &Shape = Noisy(50 + i)
+
+                xs.push(a)
+
+            val b: &Shape = Noisy(5)
+
+            for i in 0..<2
+                xs.push(b)
+
+            xs.clear()
+            print("loop cleared")
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            put(xs)
+            print("returned")
+        """)
+
+    assert_eq(run.out, "dropped 50\ndropped 51\nloop cleared\ndropped 5\nreturned\n")
+end oah_in_a_loop
+
+@test("through a generic keeper: handed over where it is last, retained where a clear follows")
+oah_through_a_generic()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        keep[T](xs: Buf[T], x: T)
+            xs.push(x)
+
+        kept_last(xs: Buf[&Shape])
+            val a: &Shape = Noisy(6)
+
+            keep(xs, a)
+
+        kept_then_cleared()
+            var ys: Buf[&Shape] = buf()
+            val a: &Shape = Noisy(60)
+
+            keep(ys, a)
+            ys.clear()
+            print("generic cleared")
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            kept_last(xs)
+            print(s"held ${xs.len()}")
+            kept_then_cleared()
+            print("returned")
+        """)
+
+    assert_eq(run.out, "held 1\ngeneric cleared\ndropped 60\nreturned\ndropped 6\n")
+end oah_through_a_generic
+
+@test("a closure whose capture has a destructor: handed over at its last use, kept past a clear")
+oah_a_closure_capture()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        make(id: int) -> &Fn() -> int
+            val n: &Shape = Noisy(id)
+
+            () -> n.area()
+
+        put(fs: Buf[&Fn() -> int])
+            val f = make(7)
+
+            fs.push(f)
+
+        put_and_clear()
+            var fs: Buf[&Fn() -> int] = buf()
+            val f = make(70)
+
+            fs.push(f)
+            fs.clear()
+            print("closures cleared")
+
+        main()
+            val fs: Buf[&Fn() -> int] = buf()
+
+            put(fs)
+            print(s"called ${fs[0]()}")
+            put_and_clear()
+            print("returned")
+        """)
+
+    assert_eq(run.out, "called 7\nclosures cleared\ndropped 70\nreturned\ndropped 7\n")
+end oah_a_closure_capture
+
+@test("a return after the push is calm; one before it lets the local go there")
+oah_an_early_return()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        put(xs: Buf[&Shape], id: int) -> int
+            val a: &Shape = Noisy(id)
+
+            xs.push(a)
+            return id + 1
+
+        put_unless(xs: Buf[&Shape], skip: bool) -> int
+            val a: &Shape = Noisy(81)
+
+            if skip then return 0
+
+            xs.push(a)
+            return 1
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            print(s"put ${put(xs, 8)}")
+            print(s"skipped ${put_unless(xs, true)}")
+            print(s"kept ${put_unless(xs, false)}")
+            xs.clear()
+            print("returned")
+        """)
+
+    assert_eq(run.out, "put 9\ndropped 81\nskipped 0\nkept 1\ndropped 8\ndropped 81\nreturned\n")
+end oah_an_early_return
+
+@test("a '?' before the push, or through a keeper that may fail, keeps every destructor where it was")
+oah_a_failing_try()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        fails(c: bool) -> Result[unit, string] = if c then Err("no") else Ok(())
+
+        put(xs: Buf[&Shape], c: bool, id: int) -> Result[unit, string]
+            val a: &Shape = Noisy(id)
+
+            fails(c)?
+            xs.push(a)
+            Ok(())
+
+        keep(xs: Buf[&Shape], s: &Shape, c: bool) -> Result[unit, string]
+            fails(c)?
+            xs.push(s)
+            Ok(())
+
+        put_through(xs: Buf[&Shape], c: bool, id: int) -> Result[unit, string]
+            val a: &Shape = Noisy(id)
+
+            keep(xs, a, c)?
+            print(s"kept $id")
+            Ok(())
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            put(xs, true, 9).unwrap_or(())
+            print("after failed put")
+            put(xs, false, 90).unwrap_or(())
+            put_through(xs, true, 91).unwrap_or(())
+            print("after failed keep")
+            put_through(xs, false, 92).unwrap_or(())
+            xs.clear()
+            print("returned")
+        """)
+
+    assert_eq(run.out, "dropped 9\nafter failed put\ndropped 91\nafter failed keep\nkept 92\ndropped 90\n" +
+                       "dropped 92\nreturned\n")
+end oah_a_failing_try
+
+@test("a branch that is its scope's last statement takes the local in; one followed by a print does not")
+oah_a_branch()
+    if !oah_ready() then return
+
+    val run = oah_run("""
+        maybe_last(xs: Buf[&Shape], c: bool, id: int)
+            val a: &Shape = Noisy(id)
+
+            if c
+                xs.push(a)
+            else
+                print("not kept")
+
+        maybe_then_print(xs: Buf[&Shape], c: bool, id: int)
+            val a: &Shape = Noisy(id)
+
+            if c
+                xs.push(a)
+            else
+                print("not kept")
+
+            print("after the branch")
+
+        main()
+            val xs: Buf[&Shape] = buf()
+
+            maybe_last(xs, true, 10)
+            maybe_last(xs, false, 11)
+            print("between")
+            maybe_then_print(xs, true, 12)
+            maybe_then_print(xs, false, 13)
+            print(s"held ${xs.len()}")
+        """)
+
+    assert_eq(run.out, "not kept\ndropped 11\nbetween\nafter the branch\nnot kept\nafter the branch\n" +
+                       "dropped 13\nheld 2\ndropped 10\ndropped 12\n")
+end oah_a_branch

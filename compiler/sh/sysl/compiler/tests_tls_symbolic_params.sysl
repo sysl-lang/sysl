@@ -1,0 +1,341 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.math.bigint.from_int
+import sysl.process.capture
+
+// Symbolic value parameters in the definition walk (`docs/design/type-level-consts.md § 5.2`, rows
+// R1-R3, P7 and P8 of § 10, decision 10): inside its own declaration a value parameter is a symbol,
+// two value arguments are one where their forms are, a body that yields another form is refused there
+// -- saying the two differ by a constant (D1), are two parameters (D2), or part at an atom the form
+// does not see into (D3) -- and the first arm of `if const N == c` is read there with `N` as `c`.
+//
+// The axes: where the two forms meet (a function's result, a local's declared type, a closure's
+// declared result, the value of a refined arm), what parts them (a constant, a second parameter, an
+// atom: `/` and `%` by a constant, `/` by a parameter, a `const` call), the refinement (`N == c`,
+// `c == N`, a `bool` parameter, two nested, into a closure, inside the arm and at the arm's value), the
+// conditions that refine nothing (`N > c`, the `else`, an `elif const N == c`), whether anything calls
+// the generic, and the build (a program, `build-lib`).
+//
+// Cells skipped: a signature that computes (`-> Buf[N + M]`, `xs: [N + 1]int`) -- refused by the
+// `length_arithmetic` check until TL3 lifts it, so P7 is written in a body; a refinement against a
+// constant the parameter's type cannot hold (`N: u8` and `N == 300` -- the instance's typing refuses the
+// comparison before any refinement); a `char` or enum parameter's refinement (the same substitution, a
+// different fold, pinned for `bool`); `min`/`max` as the atom (no type position may call them yet); a
+// nested generic function inside a refined arm (it is hoisted and read as its own declaration).
+
+private tls_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end tls_skip
+
+// What the program PRINTS, or what the build had to say about it.
+private tls_ran(main: string) -> string
+    val root = make_temp_dir("sysl-tls").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tls_ran
+
+// The program is refused with this message, at this line of `main.sysl`.
+private tls_refused(said: string, message: string, line: int)
+    assert(said.index_of(s"error: $message\n").is_some(), s"expected 'error: $message', got: $said")
+    assert(said.index_of(s"/main.sysl:$line:").is_some(), s"expected it at main.sysl:$line, got: $said")
+
+// The program is refused with a message ending in this text, at this line of `main.sysl`.
+private tls_ends(said: string, tail: string, line: int)
+    assert(said.index_of(s"$tail\n").is_some(), s"expected a refusal ending '$tail', got: $said")
+    assert(said.index_of(s"/main.sysl:$line:").is_some(), s"expected it at main.sysl:$line, got: $said")
+
+private tls_buf() -> string = "struct Buf[const N: usize]\n    used: usize\n\n    room(self) -> usize = N - self.used\n"
+
+private tls_flag() -> string = "struct Flag[const B: bool]\n    v: int\n"
+
+// -- R1-R3: refused at a declaration nothing calls ---------------------------------------------------
+
+@test("R1: a result one more than the parameter differs by a constant")
+tls_r1_offset()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + "wrong[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N + 1](b.used)\nprint(1)\n"),
+                "function 'wrong' should return Buf[N], but its body yields Buf[N + 1] — the two differ by 1 for " +
+                "every N", 5)
+
+@test("R2: two value parameters are two types")
+tls_r2_two_params()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + "cast[const N: usize, const M: usize](b: Buf[N]) -> Buf[M] = b\nprint(1)\n"),
+                "function 'cast' should return Buf[M], but its body yields Buf[N] — 'N' and 'M' are different " +
+                "value parameters", 5)
+
+@test("R3: a division by a constant that is not exact stands in the way, and is named")
+tls_r3_atom()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + "half[const N: usize](b: Buf[N]) -> Buf[N] = Buf[N / 2 * 2](b.used)\nprint(1)\n"),
+                "function 'half' should return Buf[N], but its body yields Buf[N / 2 * 2] — '/' by 2 is compared " +
+                "as written, and 'N / 2 * 2' is not 'N' for every N", 5)
+
+@test("D3 at a local: a remainder and a const call")
+tls_d3_atoms()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        rem[const N: usize]() -> usize
+            val a: Buf[N] = Buf[N - N % 3](1)
+            a.used
+        print(1)
+        """), "cannot initialize 'a': declared Buf[N] but the value is Buf[N - N % 3] — '%' by 3 is compared " +
+        "as written, and 'N - N % 3' is not 'N' for every N", 6)
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        const double(n: usize) -> usize = n * 2
+        twice[const N: usize]() -> usize
+            val a: Buf[2 * N] = Buf[double(N)](1)
+            a.used
+        print(1)
+        """), "cannot initialize 'a': declared Buf[2 * N] but the value is Buf[double(N)] — 'double' is " +
+        "compared as written, and 'double(N)' is not '2 * N' for every N", 7)
+
+// The stand-in zero cannot fold a division by a parameter (it would divide by zero), and the argument
+// used to come out as a bare stand-in with no form, which agrees with anything by value.
+@test("a division by a parameter keeps its form though the stand-in zero cannot fold it")
+tls_division_by_a_parameter()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        per[const N: usize, const M: usize]() -> usize
+            val a: Buf[N] = Buf[N / M * M](1)
+            a.used
+        print(1)
+        """), "cannot initialize 'a': declared Buf[N] but the value is Buf[M * (N / M)] — '/' by 'M' is " +
+        "compared as written, and 'M * (N / M)' is not 'N' for every N and M", 6)
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        rem[const N: usize, const M: usize]() -> usize
+            val a: Buf[0] = Buf[N % M](1)
+            a.used
+        print(1)
+        """), "cannot initialize 'a': declared Buf[0] but the value is Buf[N % M] — 'N % M' stands for every " +
+        "value an instantiation chooses, not only 0", 6)
+
+    // The same form on both sides agrees, and an instance with M not zero computes it.
+    assert_eq(tls_ran(tls_buf() + raw"""
+        per[const N: usize, const M: usize]() -> usize
+            val a: Buf[N / M] = Buf[N / M](1)
+            a.room()
+        print(per[7, 2]())
+        """), "2\n")
+
+@test("a coefficient follows the division it multiplies, and a leading minus keeps its parentheses")
+tls_division_text()
+    var two: Buf[Buf[Mono]] = buf()
+
+    two.push(term_param(0, "N"))
+    two.push(term_const(from_int(2)))
+
+    val q = term_atom("/", "", "", two)
+
+    assert_eq(term_text(term_mul(term_const(from_int(2)), q)), "N / 2 * 2")
+    assert_eq(term_text(term_mul(term_const(from_int(-2)), q)), "-2 * (N / 2)")
+    assert_eq(term_text(term_add(term_param(1, "M"), term_mul(term_const(from_int(-2)), q))), "M - N / 2 * 2")
+
+// -- P7: two spellings of one form ------------------------------------------------------------------
+
+@test("P7: N + M is M + N at a local, a closure's result and a field, and each instance computes it")
+tls_p7_commuted()
+    if tls_skip() then return
+
+    assert_eq(tls_ran(tls_buf() + raw"""
+        struct Pair[const N: usize, const M: usize]
+            inner: Buf[N + M]
+        swap[const N: usize, const M: usize]() -> usize
+            val a: Buf[M + N] = Buf[N + M](1)
+            val f: &Fn() -> Buf[M + N] = () -> Buf[N + M](2)
+            val p = Pair[N, M](Buf[M + N](3))
+            a.room() + f().room() + p.inner.room()
+        print(swap[2, 3]())
+        """), "9\n")
+
+// -- P8 and decision 10: `if const N == c` ----------------------------------------------------------
+
+@test("P8: an arm under N == 0 yields what [N]int and Buf[N] are at 0, and each instance runs")
+tls_p8_refined()
+    if tls_skip() then return
+
+    assert_eq(tls_ran(tls_buf() + raw"""
+        zeros[const N: usize]() -> [N]int = if const N == 0 then [] else [0; N]
+        mk[const N: usize]() -> Buf[N] = if const N == 0 then Buf[0](0) else Buf[N](1)
+        back[const N: usize]() -> Buf[N] = if const 3 == N then Buf[3](3) else Buf[N](1)
+        print(zeros[0]().len, zeros[3]().len, mk[0]().used, mk[2]().room(), back[3]().used, back[1]().used)
+        """), "0 3 0 1 3 1\n")
+
+@test("a refined arm whose value still differs over another parameter is refused, nothing calling it")
+tls_refined_value_differs()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        bad[const N: usize, const M: usize]() -> Buf[M]
+            if const N == 0 then Buf[N + M + 1](0) else Buf[M](1)
+        print(1)
+        """), "the first arm of this 'if const' yields Buf[M + 1], but Buf[M] is expected — the arm is taken " +
+        "only where N is 0, and there the two differ by 1 for every M", 6)
+
+@test("a refined arm whose value is the wrong constant is refused, written either way about")
+tls_refined_constant()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        bad[const N: usize]() -> Buf[N] = if const N == 1 then Buf[2](0) else Buf[N](1)
+        print(1)
+        """), "the first arm of this 'if const' yields Buf[2], but Buf[N] is expected — the arm is taken only " +
+        "where N is 1, and there they are Buf[1] and Buf[2]", 5)
+
+    tls_ends(tls_ran(tls_buf() + raw"""
+        bad[const N: usize]() -> Buf[N] = if const 1 == N then Buf[2](0) else Buf[N](1)
+        print(1)
+        """), "where N is 1, and there they are Buf[1] and Buf[2]", 5)
+
+@test("inside a refined arm a local is compared with the parameter as its value")
+tls_refined_local()
+    if tls_skip() then return
+
+    assert_eq(tls_ran(tls_buf() + raw"""
+        f[const N: usize, const M: usize]() -> usize
+            if const N == 0
+                val x: Buf[M] = Buf[N + M](4)
+                x.used
+            else
+                0
+        print(f[0, 2](), f[1, 2]())
+        """), "4 0\n")
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        f[const N: usize, const M: usize]() -> usize
+            if const N == 1
+                val x: Buf[M] = Buf[N + M](4)
+                x.used
+            else
+                0
+        print(1)
+        """), "cannot initialize 'x': declared Buf[M] but the value is Buf[M + 1] — the arm is taken only " +
+        "where N is 1, and there the two differ by 1 for every M", 7)
+
+@test("two refinements nest, and a closure inside the arm reads with them")
+tls_refined_nested()
+    if tls_skip() then return
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        f[const N: usize, const M: usize, const K: usize]() -> usize
+            if const N == 0
+                if const M == 2
+                    val x: Buf[K + 3] = Buf[N + M + K](4)
+                    x.used
+                else
+                    0
+            else
+                0
+        print(1)
+        """), "cannot initialize 'x': declared Buf[K + 3] but the value is Buf[K + 2] — the arm is taken only " +
+        "where N is 0 and M is 2, and there the two differ by 1 for every K", 8)
+
+    tls_refused(tls_ran(tls_buf() + raw"""
+        f[const N: usize, const M: usize]() -> usize
+            if const N == 1
+                val g: &Fn() -> Buf[M] = () -> Buf[N + M](4)
+                g().used
+            else
+                0
+        print(1)
+        """), "this closure should yield Buf[M], but its body yields Buf[M + 1] — the arm is taken only where " +
+        "N is 1, and there the two differ by 1 for every M", 7)
+
+@test("a bool parameter refines as an integer does")
+tls_refined_bool()
+    if tls_skip() then return
+
+    assert_eq(tls_ran(tls_flag() + raw"""
+        pick[const B: bool]() -> Flag[B] = if const B == true then Flag[true](1) else Flag[B](0)
+        print(pick[true]().v, pick[false]().v)
+        """), "1 0\n")
+
+    tls_refused(tls_ran(tls_flag() + raw"""
+        pick[const B: bool]() -> Flag[B] = if const B == true then Flag[false](1) else Flag[B](0)
+        print(1)
+        """), "the first arm of this 'if const' yields Flag[false], but Flag[B] is expected — the arm is taken " +
+        "only where B is true, and there they are Flag[true] and Flag[false]", 3)
+
+@test("no other condition and no other arm is read at the definition")
+tls_unrefined_arms()
+    if tls_skip() then return
+
+    // `N > 0` is not a substitution, the `else` of `N == 0` is not one either, and an `elif const`
+    // is the `else`'s: each is the instantiations' to read.
+    assert_eq(tls_ran(tls_buf() + raw"""
+        a[const N: usize]() -> Buf[N] = if const N > 0 then Buf[7](0) else Buf[N](1)
+        b[const N: usize]() -> Buf[N] = if const N == 0 then Buf[0](0) else Buf[7](0)
+        c[const N: usize]() -> Buf[N]
+            if const N > 5
+                Buf[N](1)
+            elif const N == 0
+                Buf[3](0)
+            else
+                Buf[N](2)
+        print(a[0]().used, b[0]().used, c[9]().used, c[2]().used)
+        """), "1 0 1 2\n")
+
+@test("an instance taking a refined arm still reads it with every argument bound")
+tls_refined_instance()
+    if tls_skip() then return
+
+    // The arm agrees at the definition (`N` is 0 there), and the instance at 0 reads it again.
+    val said = tls_ran(tls_buf() + raw"""
+        f[const N: usize]() -> usize = if const N == 0 then Buf[N](5).missing() else 1
+        print(f[0]())
+        """)
+
+    assert(said.index_of("missing").is_some(), said)
+
+@test("build-lib refuses a refined arm that is wrong, called by nothing")
+tls_build_lib_refuses()
+    if !lbr_ready() then return
+
+    val root = lbr_tree(lbr_one("demo/demo.sysl", "module demo\n\n" + tls_buf() + "\n" +
+                                "bad[const N: usize]() -> Buf[N] = if const N == 1 then Buf[2](0) else Buf[N](1)\n"))
+    val got = lbr_cli(["sysl", "build-lib", root])
+
+    lbr_drop([root])
+    assert(got.0 != 0, got.1)
+    assert(got.1.index_of("the first arm of this 'if const' yields demo.Buf[2], but demo.Buf[N] is expected — the " +
+                          "arm is taken only where N is 1, and there they are demo.Buf[1] and demo.Buf[2]").is_some(),
+           got.1)

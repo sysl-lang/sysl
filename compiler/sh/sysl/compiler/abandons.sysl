@@ -167,7 +167,37 @@ struct Abandoning
     // The locals of the body being walked that hold a view of a parameter's own storage, which the
     // emitter declares with no count (`param_views.sysl`) -- the same answer, asked of the same function.
     views: Set[string]
+
+    // Whether the walk is asking where the body's parameters would be held, whose counts only the
+    // lowering settles: each call that would be refused is then collected (its place and the callee)
+    // rather than said, for `check_switch_kept`.
+    collecting: bool
+    collected: Buf[(Span, string)]
+
+    // The places (`said`'s keys) where the body's parameters would be held, collected first: a refusal
+    // the walk with nothing held makes at one is kept as well rather than said (`SwitchHold.key` empty),
+    // and said only where no parameter turns out held there -- a parameter held from entry is the first
+    // thing held, and is the one named.
+    param_places: Set[string]
+    holding_func: string
 end Abandoning
+
+// A refusal `check_switch_holds` keeps until the lowering has answered: the frame of `func` holds its
+// parameter `key` across the call at `at` only if a body of it keeps a count of its own for it after
+// the +0 analysis (`emit_func.sysl`'s `gen_function`).
+struct SwitchHold
+    func: string
+    key: string
+    scope: Scope
+    at: Span
+    message: string
+
+// What a lowering answers the fiber-switch check (`codegen_with_gaps`): the functions it defined a
+// body of, and the parameters (`<function>|<position>`) one of those bodies keeps a count of its own
+// for from entry.
+struct SwitchKept
+    lowered: Set[string]
+    kept: Set[string]
 
 // Holds every body to what an abandoning call needs of it.
 check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: Buf[TVtable])
@@ -197,7 +227,7 @@ check_abandons(a: &Analysis, funcs: Buf[TFunc], externs: Buf[TExtern], vtables: 
         reached.push(item)
 
     val cx: &Abandoning = Abandoning(seeds, mays, may_abandon(funcs, reached), vtables, empty_scope(),
-                                     false, set(), false, set(), set(), set())
+                                     false, set(), false, set(), set(), set(), false, buf(), set(), "")
     val moved = func_promotions(a, funcs, vtables)
 
     for f in funcs
@@ -246,15 +276,19 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Bu
     reached.push(key)
 
     val cx: &Abandoning = Abandoning(seeds, set(), may_switch(funcs, reached), vtables, empty_scope(),
-                                     false, set(), true, set(), set(), set())
+                                     false, set(), true, set(), set(), set(), false, buf(), set(), "")
     val moved = func_promotions(a, funcs, vtables)
 
-    // The parameters a frame keeps a count of its own for, asked of the same bodies with the same
-    // questions the emitter asks (`gen_function`): the ones a direct call hands over with a count
-    // (`owned_params.sysl`), and the ones `owning` keeps -- a parameter the body assigns, every one of
-    // a function whose address is taken, of a body that jumps back to its own entry, and of a task.
-    // The +0 analysis may later borrow a rewritten parameter after all (`plus0_locals.sysl`); this
-    // asks before it, so such a parameter is refused though it holds nothing across the switch.
+    // **Whether a frame holds a parameter's count is the lowering's answer, not this walk's.** A
+    // parameter a direct call hands over with a count (`owned_params.sysl`), or one `owning` keeps --
+    // one the body assigns, every one of a function whose address is taken, of a body that jumps back
+    // to its own entry, of a task -- takes a count at entry; and the +0 analysis then borrows a
+    // rewritten one after all where every value it holds is backed (`plus0_locals.sysl`), which only
+    // the lowering knows. So the walk is asked twice: once with nothing held on entry, which is said
+    // now, and once with the parameters held, which is collected (`Analysis.switch_holds`) and said by
+    // `check_switch_kept` for a parameter a lowered body of the function does keep. The one exception is
+    // a function something outside sysl may call, whose every counted parameter arrives with the
+    // frame's own count, and which the +0 analysis never borrows: that is said now.
     var e = emitter_for(a.tables.target, destructors_of(a))
     val owned = owned_params(&e, funcs)
     val p = TProgram(buf(), buf(), vtables, reached_externs(a), vals, funcs, buf(), None, buf(), true, false,
@@ -271,17 +305,112 @@ check_switch_holds(a: &Analysis, funcs: Buf[TFunc], vals: Buf[TVal], vtables: Bu
         cx.promoted = promoted_arrays(moved, f)
         cx.views = param_view_locals(f)
 
-        val owns = entry_owning(f, addressed, inert)
-        var kept: Set[string] = set()
+        if foreign_callable(f)
+            val owns = entry_owning(f, addressed, inert)
+            var kept: Set[string] = set()
 
-        for j in 0..<f.params.len()
-            val k = owned_key(f.name, j)
+            for j in 0..<f.params.len()
+                val k = owned_key(f.name, j)
 
-            if keeps_param(&e, f, j, owns, owned.has(k)) then kept.add(k)
+                if keeps_param(&e, f, j, owns, owned.has(k)) then kept.add(k)
 
-        scan_block(a, cx, f.body, held_on_entry(a, cx, f, owned, kept))
+            scan_block(a, cx, f.body, held_on_entry(a, cx, f, owned, kept))
+            continue
+        end if
+
+        collect_param_holds(a, cx, f, owned)
+        cx.lent = set()
+        cx.holding_func = f.name
+        scan_block(a, cx, f.body, held_on_entry(a, cx, f, owned, set()))
+        cx.param_places = set()
     end for
 end check_switch_holds
+
+private foreign_callable(f: TFunc) -> bool = f.exported.is_some() || f.conv.is_some() || f.section.is_some()
+
+// The calls across which `f`'s counted parameters would be held, were the lowering to keep a count
+// for them: one walk with a parameter held from entry, filed once per counted parameter in order --
+// so where two are kept, the first is named, as the walk with both held would have named it. Its
+// places are `cx.param_places`, for the walk with nothing held that follows.
+private collect_param_holds(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string])
+    var counted: Buf[usize] = buf()
+
+    for j in 0..<f.params.len()
+        if holds_count(cx, f.params[j].1) then counted.push(j)
+
+    if counted.is_empty() then return
+
+    var before: Set[string] = set()
+
+    for place in cx.said
+        before.add(place)
+
+    cx.lent = set()
+    cx.collecting = true
+    cx.collected = buf()
+    scan_block(a, cx, f.body, "a parameter")
+    cx.collecting = false
+    cx.said = before
+
+    for call in cx.collected
+        cx.param_places.add(place_key(cx, call.0))
+
+    for j in counted
+        val k = owned_key(f.name, j)
+        val held = param_held(f.params[j].0, owned.has(k))
+
+        for call in cx.collected
+            a.switch_holds.push(SwitchHold(f.name, k, cx.scope, call.0, switch_refusal(cx, call.1, held)))
+end collect_param_holds
+
+private place_key(cx: &Abandoning, at: Span) -> string = s"${cx.scope.src.name}:${at.start}:${at.end}"
+
+// What a refusal says a frame holds when it holds its parameter `name` with a count of its own.
+private param_held(name: string, handed: bool) -> string =
+    if handed then s"the parameter '${shown_local(name)}' (handed over with a count of its own, which this frame then gives back or keeps)"
+    else s"the parameter '${shown_local(name)}' (kept with a count of its own, taken at entry and given back at the exit)"
+
+// The refusals `check_switch_holds` kept, said now that the lowering has answered (`answer`): each one
+// about a parameter that a lowered body of its function keeps a count of its own for, and then, at a
+// place none of those was said, the one about what else is held there (a `key`-less hold), which is
+// refused whatever the lowering said. A function this lowering did not define a body of -- a library
+// half's, whose own build deferred any such body to this one (`library_half_refusals`), or one no root
+// reaches -- holds no parameter here. Where two parameters would be held across one call, the first
+// kept is named.
+check_switch_kept(a: &Analysis, answer: SwitchKept)
+    var said: Set[string] = set()
+
+    for h in a.switch_holds
+        if !param_held_after(h, answer) || !said.add(hold_place(h)) then continue
+
+        a.fault(h.scope, h.at, h.message)
+
+    for h in a.switch_holds
+        if h.key != "" || !said.add(hold_place(h)) then continue
+
+        a.fault(h.scope, h.at, h.message)
+end check_switch_kept
+
+private param_held_after(h: SwitchHold, answer: SwitchKept) -> bool =
+    h.key != "" && answer.lowered.has(h.func) && answer.kept.has(h.key)
+
+private hold_place(h: SwitchHold) -> string = s"${h.scope.src.name}:${h.at.start}:${h.at.end}"
+
+// The functions of a library half `check_switch_kept` would refuse a body of, each with its first
+// refusal, as the gaps `library_deferring_gaps` defers: such a body is compiled from source by the
+// program instead, whose own lowering answers it -- so a precompiled body never holds a count of its
+// own across a call that can reach the switch, and a program says the same whether it links the half
+// or not.
+library_half_refusals(holds: Buf[SwitchHold], answer: SwitchKept) -> Buf[(string, string)]
+    var out: Buf[(string, string)] = buf()
+    var seen: Set[string] = set()
+
+    for h in holds
+        if h.key != "" && !param_held_after(h, answer) then continue
+        if seen.add(h.func) then out.push((h.func, h.message))
+
+    out
+end library_half_refusals
 
 // The arrays `f` declares that the lowering moves to a counted buffer, asked of the escape walk the
 // lowering's own decision comes from. Both walks hold such an array from its declaration to the end
@@ -347,7 +476,9 @@ private called_refs(out: &Refs, e: TExpr) = *e.kind match
 // a fiber may move, only a count matters -- and a parameter the frame keeps a count of its own for
 // (`kept`, as `<function>|<position>`) holds it from entry, as a local declared there does, to the end
 // of the body: one a direct call hands over with a count (`owned`, `owned_params.sysl`), or one
-// `owning` keeps (`borrowing.sysl`), which takes its count at entry.
+// `owning` keeps (`borrowing.sysl`), which takes its count at entry. Only a function something outside
+// sysl may call is handed `kept`; every other one's parameters are asked after the lowering
+// (`collect_param_holds`).
 private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string], kept: Set[string]) -> string
     if !cx.fiber
         for j in 0..<f.params.len()
@@ -362,8 +493,7 @@ private held_on_entry(a: &Analysis, cx: &Abandoning, f: TFunc, owned: Set[string
 
             if !kept.has(k) || !holds_count(cx, p.1) then continue
 
-            return if owned.has(k) then s"the parameter '${shown_local(p.0)}' (handed over with a count of its own, which this frame then gives back or keeps)"
-                   else s"the parameter '${shown_local(p.0)}' (kept with a count of its own, taken at entry and given back at the exit)"
+            return param_held(p.0, owned.has(k))
     end if
 
     if f.exported.is_none() && f.conv.is_none() && f.section.is_none() then return ""
@@ -772,9 +902,20 @@ private check_node(a: &Analysis, cx: &Abandoning, e: TExpr, held: string)
             _ -> ()
 
         for name in own_refs(e).calls
-            if cx.reach.has(name)
+            if !cx.reach.has(name) then continue
+
+            val place = place_key(cx, e.span)
+
+            if cx.collecting
+                if cx.said.add(place) then cx.collected.push((e.span, name))
+            else if cx.param_places.has(place)
+                if cx.said.add(place) then
+                    a.switch_holds.push(SwitchHold(cx.holding_func, "", cx.scope, e.span, switch_refusal(cx, name, held)))
+            else
                 say(a, cx, e.span, switch_refusal(cx, name, held))
-                return
+            end if
+
+            return
         return
     end if
 
@@ -800,7 +941,7 @@ end check_node
 
 // A refusal said once per place, an instantiation of a generic body being the same lines again.
 private say(a: &Analysis, cx: &Abandoning, at: Span, message: string)
-    if !cx.said.add(s"${cx.scope.src.name}:${at.start}:${at.end}") then return
+    if !cx.said.add(place_key(cx, at)) then return
 
     a.fault(cx.scope, at, message)
 
