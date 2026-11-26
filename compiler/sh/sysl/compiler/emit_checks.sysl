@@ -57,6 +57,8 @@ private checks_before_lowering(a: &Analysis, p: TProgram, own: Buf[string],
     check_done("quad_externs")
     check_nested_empty_externs(a, emitted)
     check_done("nested_empty_externs")
+    check_aligned_void_externs(a, emitted)
+    check_done("aligned_void_externs")
     check_fn_pointer_signatures(a, emitted)
     check_done("fn_pointer_signatures")
     check_general_regs(a, emitted, own, pruned)
@@ -309,6 +311,7 @@ check_exports_emitted(a: &Analysis, p: TProgram, own: Buf[string])
     export_duplicates(a, exported)
     export_names(a, exported, storage_by_symbol(p.vals))
     export_header_hollow(a, exported, storage_by_symbol(p.vals))
+    export_header_aligned_void(a, exported, storage_by_symbol(p.vals))
     export_storage(a, p, archive_ways_in(p, own, exported))
     archive_placed_storage(a, p)
     stored_export_duplicates(a, p, exported)
@@ -1284,6 +1287,9 @@ private export_signature(a: &Analysis, f: TFunc)
         else if nested_empty_here(a, p.1).is_some()
             a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
                     nested_empty_reason(a, p.1, nested_empty_here(a, p.1).unwrap()))
+        else if aligned_void_by_value(a, p.1).is_some()
+            a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
+                    aligned_void_call_reason(a, p.1, aligned_void_by_value(a, p.1).unwrap()))
 
     // A `va_list` result was refused where the signature was read, for every function.
     if no_value(f.ret_ty) || mentions_unknown(f.ret_ty) then return
@@ -1303,6 +1309,9 @@ private export_signature(a: &Analysis, f: TFunc)
     else if nested_empty_here(a, f.ret_ty).is_some()
         a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
                 nested_empty_reason(a, f.ret_ty, nested_empty_here(a, f.ret_ty).unwrap()))
+    else if aligned_void_by_value(a, f.ret_ty).is_some()
+        a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
+                aligned_void_call_reason(a, f.ret_ty, aligned_void_by_value(a, f.ret_ty).unwrap()))
 end export_signature
 
 // An `extern` whose signature holds an `f128`, on a machine where C has no binary128 type -- the
@@ -1441,6 +1450,119 @@ private hollow_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
     s"sysl placed after it. Give the empty struct a field, or keep $empty out of what the header declares"
 end hollow_reason
 
+// An `extern` that hands over or answers, by value, a struct holding no data that sysl gives room and
+// the target's C another size (`c_header.sysl`'s `aligned_void`): on every target, since clang's and
+// gcc's C give one no bytes and Microsoft's four at `@align(2)`. Asked of the externs the program
+// reached, as `check_quad_externs` is.
+check_aligned_void_externs(a: &Analysis, p: TProgram)
+    for x in p.externs
+        val home = a.tables.extern_scopes.get(x.name)
+        val decl = a.tables.externs.get(x.name)
+
+        if home.is_none() || decl.is_none() then continue
+
+        val at = home.unwrap()
+        val d = decl.unwrap()
+
+        for i in 0..<x.params.len()
+            val ty = x.params[i]
+            val found = aligned_void_by_value(a, ty)
+
+            if found.is_none() then continue
+
+            val name = if i < d.params.len() then d.params[i].name else s"parameter ${i + 1}"
+
+            a.fault(at.scope, at.span, s"'$name' of the 'extern' '${d.name}' is " +
+                    aligned_void_call_reason(a, ty, found.unwrap()))
+
+        val answered = aligned_void_by_value(a, x.ret_ty)
+
+        if answered.is_some()
+            a.fault(at.scope, at.span, s"the 'extern' '${d.name}' returns " +
+                    aligned_void_call_reason(a, x.ret_ty, answered.unwrap()))
+end check_aligned_void_externs
+
+// The struct holding no data whose size differs across a call that hands `t` over by value.
+private aligned_void_by_value(a: &Analysis, t: Type) -> Option[(string, Type)] =
+    if mentions_unknown(t) then None else aligned_void(a.tables.layout, a.tables.target, t, false)
+
+// **A struct holding no data that the header would declare with a size C does not share**, behind an
+// exported function's pointer, in a function pointer's signature, or as exported storage: the header
+// is the declaration a C project lays the type out by. A parameter or result whose by-value layout
+// already disagrees was refused by `export_signature`, and is not refused twice. Asked of what the
+// header holds, as `export_header_hollow` is.
+private export_header_aligned_void(a: &Analysis, exported: Buf[TFunc], storage: Buf[TVal])
+    val l = a.tables.layout
+    val target = a.tables.target
+
+    for f in exports_by_symbol(exported)
+        val scope = func_home(a, f.name)
+
+        for p in f.params
+            if mentions_unknown(p.1) || aligned_void(l, target, p.1, false).is_some() then continue
+
+            val found = aligned_void(l, target, p.1, true)
+
+            if found.is_some()
+                a.fault(scope, f.span, s"'${p.0}' of the exported '${qualified_name(f.name)}' is " +
+                        aligned_void_header_reason(a, p.1, found.unwrap()))
+
+        if no_value(f.ret_ty) || mentions_unknown(f.ret_ty) then continue
+        if aligned_void(l, target, f.ret_ty, false).is_some() then continue
+
+        val answered = aligned_void(l, target, f.ret_ty, true)
+
+        if answered.is_some()
+            a.fault(scope, f.span, s"the exported '${qualified_name(f.name)}' returns " +
+                    aligned_void_header_reason(a, f.ret_ty, answered.unwrap()))
+
+    for v in storage
+        val d = a.tables.vals.get(v.symbol)
+
+        if d.is_none() || mentions_unknown(v.ty) then continue
+
+        val found = aligned_void(l, target, v.ty, true)
+
+        if found.is_some()
+            a.fault(d.unwrap().scope, d.unwrap().span, s"the exported storage '${qualified_name(v.symbol)}' is " +
+                    aligned_void_header_reason(a, v.ty, found.unwrap()))
+end export_header_aligned_void
+
+// "holds no data but occupies 16 bytes in sysl, for its alignment, and none in C on '<target>'".
+private aligned_void_sizes(a: &Analysis, room: Type) -> string
+    val target = a.tables.target
+    val c = aligned_void_c_size(a.tables.layout, target, room)
+    val c_said = if c == 0 then "none" else s"$c"
+    val c_name = if c_sizes_empty(target) then "Microsoft's C" else "C"
+
+    s"holds no data but occupies ${a.tables.layout.size(room)} bytes in sysl, for its alignment, and " +
+    s"$c_said in $c_name on '${target.name}'"
+end aligned_void_sizes
+
+// The tail of the by-value refusal, after "'t' of the 'extern' 'send' is" or "... returns".
+private aligned_void_call_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
+    val shown = type_show(t)
+    val room = type_show(found.1)
+    val lead = if found.0.is_empty() then s"$shown, which" else s"$shown, whose field '${found.0}' is $room, which"
+    val way_out = if found.0.is_empty() then s"keep $room out of the call" else s"take '${found.0}' out of $shown"
+
+    s"$lead ${aligned_void_sizes(a, found.1)}, so $shown is laid out differently on the two sides of " +
+    s"the call. Give the empty struct a field, or $way_out"
+end aligned_void_call_reason
+
+// The tail of the header refusal, after "'p' of the exported 'f' is" or "... returns".
+private aligned_void_header_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
+    val shown = type_show(t)
+    val room = type_show(found.1)
+    val reached = if !found.0.is_empty() then s"$shown, whose field '${found.0}' reaches $room, which"
+                  else if shown == room then s"$shown, which"
+                  else s"$shown, which reaches $room, which"
+
+    s"$reached ${aligned_void_sizes(a, found.1)}: the header's declaration of $room gives it a size " +
+    s"sysl does not, so C finds what lies after it where sysl did not put it. Give the empty struct a " +
+    s"field, or keep $room out of what the header declares"
+end aligned_void_header_reason
+
 // The tail of the refusal, after "'v' of the 'extern' 'take' is" or "... returns".
 private nested_empty_reason(a: &Analysis, t: Type, found: (string, Type)) -> string
     val shown = type_show(t)
@@ -1455,8 +1577,9 @@ end nested_empty_reason
 // R` is lowered by the `extern` call's own `gen_foreign_call`, and C calls through one it was handed
 // under its own layout of `A` and `R`. So a `*extern` type is refused where an `extern` of its
 // signature would be, and for the same reasons: taking or answering, by value, a struct holding an
-// empty struct on the machines `check_nested_empty_externs` refuses one on, and an `f128` (itself or
-// in a struct passed by value) on the machines `check_quad_externs` refuses one on.
+// empty struct on the machines `check_nested_empty_externs` refuses one on, an `f128` (itself or
+// in a struct passed by value) on the machines `check_quad_externs` refuses one on, and a struct
+// holding no data that sysl gives room, as `check_aligned_void_externs` refuses one, on every machine.
 //
 // **The refusal is of the type**, wherever the program this build emits mentions it -- an `extern`'s
 // signature, module storage, a function's signature, a struct's or an enum's field, any depth of
@@ -1465,8 +1588,6 @@ end nested_empty_reason
 // the same disagreement. Each type is refused once, where the walk first meets it; a struct's fields
 // are blamed on the struct's own declaration.
 check_fn_pointer_signatures(a: &Analysis, p: TProgram)
-    if !c_sizes_empty(a.tables.target) && c_long_double_is_quad(a.tables.target) then return
-
     var types: Set[string] = set()
     var structs: Set[string] = set()
     val met = &types
@@ -1564,8 +1685,8 @@ private fn_pointers_in(a: &Analysis, scope: Scope, at: Span, t: Type, met: *Set[
 end fn_pointers_in
 
 // The refusals one C function pointer type earns: each parameter, then the result, that crosses by
-// value holding an empty struct inside a struct that occupies bytes, or holding an `f128` where C has
-// no binary128 type.
+// value holding an empty struct inside a struct that occupies bytes, holding an `f128` where C has
+// no binary128 type, or holding a struct of no data that C sizes otherwise than sysl.
 private refuse_fn_pointer(a: &Analysis, scope: Scope, at: Span, t: Type)
     val shown = type_show(t)
     val target = a.tables.target
@@ -1583,11 +1704,23 @@ private refuse_fn_pointer(a: &Analysis, scope: Scope, at: Span, t: Type)
                     a.fault(scope, at, s"parameter ${i + 1} of the function pointer type '$shown' is " +
                             s"${type_show(params[i])}, ${quad_unspellable(target)}")
 
+                val room = aligned_void_by_value(a, params[i])
+
+                if room.is_some()
+                    a.fault(scope, at, s"parameter ${i + 1} of the function pointer type '$shown' is " +
+                            aligned_void_call_reason(a, params[i], room.unwrap()))
+
             val answered = nested_empty_here(a, *ret)
 
             if answered.is_some()
                 a.fault(scope, at, s"the function pointer type '$shown' returns " +
                         nested_empty_reason(a, *ret, answered.unwrap()))
+
+            val answered_room = aligned_void_by_value(a, *ret)
+
+            if answered_room.is_some()
+                a.fault(scope, at, s"the function pointer type '$shown' returns " +
+                        aligned_void_call_reason(a, *ret, answered_room.unwrap()))
 
             if quad_unspelled(target, *ret)
                 a.fault(scope, at, s"the function pointer type '$shown' returns ${type_show(*ret)}, " +
