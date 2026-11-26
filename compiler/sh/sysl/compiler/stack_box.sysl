@@ -3,6 +3,7 @@ module sh.sysl.compiler
 import sh.sysl.parsing.{Source, Span}
 import sysl.buf.{Buf, buf}
 import sysl.container.{Map, map, Set, set}
+import sysl.slices.sort
 import sysl.text.from_utf8_unchecked
 
 // **A `&T` nothing keeps past its frame is laid in that frame** (`reference/memory.md § A box nothing
@@ -20,7 +21,10 @@ import sysl.text.from_utf8_unchecked
 // call of a **factory** -- a function every way out of which may answer one box it built and kept
 // nowhere else, like `vector() -> &Vector[E] = Vector(slot_storage(0), 0, 0)` -- keyed by the call's
 // span. A factory call laid in the frame reaches the factory's **frame entry** (`<symbol>-frame`),
-// the same body taking one more parameter first: the caller's slot, which that one box is laid in.
+// the same body taking one more parameter first: the caller's slot, which that one box is laid in. A
+// body whose one site is a factory call it may answer, kept nowhere else, is a factory as well
+// (`vector_with(x)` answering `vector_of_size(1)`'s box): its frame entry hands the slot on to that
+// call's frame entry.
 //
 // **The question is a may-escape question, so every unknown answers "escapes".** A box is followed
 // through the locals that may hold it (a fixed point), each value built around it, each answer that
@@ -79,7 +83,8 @@ private stack_box_limit() -> usize = 1024
 stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
     var out = no_stack_boxes()
     val tables: Option[TraitTables] = if p.entry_point then Some(tables_by_trait(p.vtables)) else None
-    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set(), tables, map(), map())
+    val cx: &BoxCx = BoxCx(map(), p.funcs, map(), set(), map(), set(), map(), set(), tables, map(), map(),
+                           map())
     val noting = explaining_escapes()
 
     for i in 0..<p.funcs.len()
@@ -104,12 +109,43 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
             if !w.escaped && w.answers
                 cx.factories.put(f.name, site.0)
 
-                if answers_only_site(f, site.0) then out.whole.add(f.name)
+                if answers_only_site(f, site.0, false) then out.whole.add(f.name)
 
                 break
             end if
         end for
     end for
+
+    // **A factory of a factory is a factory**: a body that builds no box of its own but may answer the
+    // box another factory's call answers it, and keeps that box nowhere else, has a frame entry too --
+    // one that hands its own caller's slot on to that call's frame entry. Each round may make the
+    // callers of the last round's factories factories in turn; a body is asked only once it is not one
+    // yet, so recursion among bodies none of which builds a box of its own makes none of them one.
+    var grew = true
+
+    while grew
+        grew = false
+
+        for f in p.funcs
+            if cx.factories.has(f.name) || !factory_shaped(p, f) || drops_a_param(e, f) then continue
+
+            for site in factory_calls(cx, f)
+                if mangle(ref_inner(site_ret(cx, site.1))) != mangle(ref_inner(f.ret_ty)) then continue
+
+                val w = follow_site(cx, f, site.0, true, true)
+
+                if !w.escaped && w.answers
+                    cx.factories.put(f.name, site.0)
+                    cx.chains.put(f.name, site.1)
+
+                    if out.whole.has(site.1) && answers_only_site(f, site.0, true) then out.whole.add(f.name)
+
+                    grew = true
+                    break
+                end if
+            end for
+        end for
+    end while
 
     for f in p.funcs
         if !frame_shaped(f)
@@ -166,7 +202,13 @@ stack_boxes(e: *Emit, p: TProgram) -> StackBoxes
             good_calls.push(site.0)
             out.payloads.add(mangle(ref_inner(site_ret(cx, site.1))))
 
-            if !out.entries.has(site.1) then out.entries.put(site.1, cx.factories.get(site.1).unwrap())
+            // A factory of a factory's frame entry reaches the frame entry of the factory it calls.
+            var name = Some(site.1)
+
+            while name is Some(n) && !out.entries.has(n)
+                out.entries.put(n, cx.factories.get(n).unwrap())
+                name = cx.chains.get(n)
+            end while
         end for
 
         // Two boxes written at one span are told apart by nothing the emitter sees: either both are
@@ -207,6 +249,25 @@ drop_unentered(e: *Emit, p: TProgram, sb: StackBoxes) -> StackBoxes
 
     val noting = explaining_escapes()
 
+    // A factory of a factory whose frame entry would reach one taken back is taken back with it.
+    var through: Map[string, string] = map()
+    var grew = true
+
+    while grew
+        grew = false
+
+        for f in p.funcs
+            if !sb.entries.has(f.name) || gone.has(f.name) then continue
+
+            if called_at(f, sb.entries.get(f.name).unwrap(), gone)
+                gone.add(f.name)
+                grew = true
+
+                if noting then through.put(f.name, called_name_at(f, sb.entries.get(f.name).unwrap()))
+            end if
+        end for
+    end while
+
     var calls: Map[string, Buf[Span]] = map()
 
     for f in p.funcs
@@ -220,7 +281,7 @@ drop_unentered(e: *Emit, p: TProgram, sb: StackBoxes) -> StackBoxes
                     else if noting
                         val name = called_name_at(f, s)
 
-                        note_unentered(f, s, name, lent.get(name).unwrap_or(""))
+                        note_unentered(f, s, name, lent.get(name), through.get(name))
                     end if
 
                 if !left.is_empty() then calls.put(f.name, left)
@@ -264,14 +325,16 @@ private struct SbName
     name: string
 
 // Whether every way out of a factory answers its one site: the site is the body's value, and nothing
-// in the body returns, becomes another call, or leaves through `?`.
-private answers_only_site(f: TFunc, site: Span) -> bool
+// in the body returns, becomes another call, or leaves through `?`. A `call_site` is a factory call
+// keyed by its own span; any other, a box keyed by its payload's.
+private answers_only_site(f: TFunc, site: Span, call_site: bool) -> bool
     val last = f.body.result
 
     if last.is_none() then return false
 
     val direct = *last.unwrap().kind match
-        TBox(v, _) -> v.span == site
+        TBox(v, _) -> !call_site && v.span == site
+        TCall(_, _, _, _) -> call_site && last.unwrap().span == site
         _ -> false
 
     if !direct then return false
@@ -343,7 +406,7 @@ private site_payload_why(e: *Emit, cx: &BoxCx, inner: Type) -> Option[BoxWhy]
     if size > stack_box_limit() then return Some(WhyTooBig(size))
 
     cx.dtor_fns.get(mangle(inner)) match
-        Some(name) -> if summary(cx, name, 0, 1).0 then Some(WhyDestructor(inner, name)) else None
+        Some(name) -> if summary(cx, name, 0, 1, None).0 then Some(WhyDestructor(inner, name)) else None
         None -> None
 end site_payload_why
 
@@ -480,6 +543,9 @@ private struct BoxCx
     // `StackBoxes.table_args`, joined over every walk that reached the call: a "may" from any wins.
     table_args: Map[string, (bool, bool)]
 
+    // Each factory of a factory, with the factory whose call its one site is.
+    chains: Map[string, string]
+
     // Every `name|k` of `memo` whose parameter may get out, with the first way out its walk met: what
     // `--explain-escapes` says a callee does with what it is handed.
     whys: Map[string, BoxWhy]
@@ -490,6 +556,16 @@ end BoxCx
 // the loops each local is declared in, as `,1,4,`; `site_loop` the innermost loop the site is built
 // in (-1 for none). `answers` is set where a way out may answer it, which is an escape only for a
 // site that is not its factory's.
+//
+// **A closure's environment is a holder per capture** (`env`, `sb_slot_carries`). Each closure literal
+// is one struct type built at one place, so a walk that sees every construction of it knows which of
+// its slots may hold what is followed: `env` has the literal's base once one is seen, and `base#slot`
+// for each slot an argument that may carry it was built into. A read of any other slot of that
+// environment carries nothing. The record is only as good as the walk's sight of every such value:
+// `exact` says no value that may carry what is followed came from anywhere the walk cannot see the
+// making of (a call's answer, a store into a slot), and a parameter's walk inherits its caller's
+// record (`summary`), since that caller built what it hands over. Where it is not exact, or the
+// literal was never seen built, every slot may carry, as before.
 private struct BoxWalk
     cx: &BoxCx
     site: Span
@@ -505,6 +581,8 @@ private struct BoxWalk
     escaped: bool
     answers: bool
     changed: bool
+    exact: bool
+    env: Set[string]
 
     // The first way out the walk met, set with `escaped` (`sb_escape`).
     why: Option[BoxWhy]
@@ -514,6 +592,19 @@ private struct BoxWalk
             self.holders.add(name)
             self.changed = true
     end hold
+
+    note_env(*self, entry: string)
+        if !self.env.has(entry)
+            self.env.add(entry)
+            self.changed = true
+    end note_env
+
+    // A value that may carry what is followed came from where the walk cannot see it built.
+    inexact(*self)
+        if self.exact
+            self.exact = false
+            self.changed = true
+    end inexact
 
     declare(*self, name: string)
         var text = ","
@@ -538,15 +629,24 @@ end BoxWalk
 // parameter, to a fixed point over the locals that may hold it.
 private follow_site(cx: &BoxCx, f: TFunc, site: Span, call_site: bool, factory: bool) -> &BoxWalk
     val w: &BoxWalk = BoxWalk(cx, site, call_site, false, factory, set(), set(), map(), buf(), 0, -1, false,
-                              false, true, None)
+                              false, true, true, set(), None)
 
     run_walk(w, f)
     w
 end follow_site
 
-private follow_param(cx: &BoxCx, f: TFunc, j: usize) -> &BoxWalk
+// `env` is the caller's record of the closure environments it built (`BoxWalk.env`), `None` where the
+// caller's is not exact.
+private follow_param(cx: &BoxCx, f: TFunc, j: usize, env: Option[Set[string]]) -> &BoxWalk
+    var given: Set[string] = set()
+
+    if env.is_some()
+        for entry in env.unwrap()
+            given.add(entry)
+    end if
+
     val w: &BoxWalk = BoxWalk(cx, span_zero(), false, true, false, set(), set(), map(), buf(), 0, -1, false,
-                              false, true, None)
+                              false, true, env.is_some(), given, None)
 
     w.holders.add(f.params[j].0)
     run_walk(w, f)
@@ -643,8 +743,31 @@ end sb_write
 // A value that may be what is followed, written into `place`: a local's own storage holds it, and
 // anything else keeps it.
 private sb_store(w: &BoxWalk, place: TExpr) = sb_root(w, place) match
-    Some(n) -> w.hold(n)
+    Some(n) ->
+        // A slot of a closure's environment stored into after it was built holds what its
+        // construction did not say.
+        if in_closure_slot(place) then w.inexact()
+
+        w.hold(n)
     None -> sb_escape(w, WhyStored(whole_place(place)))
+
+// Whether a place steps through a field of a closure's environment.
+private in_closure_slot(place: TExpr) -> bool = *place.kind match
+    TField(r, _, _) -> is_closure_literal(underlying(texpr_type(r))) || in_closure_slot(r)
+    TIndex(r, _, _) -> in_closure_slot(r)
+    _ -> false
+
+// Whether slot `slot` of a value of type `ty` may carry what is followed: any slot of anything but a
+// closure's environment whose every construction the walk has seen (`BoxWalk.env`), and of that, a
+// slot built from something that may carry it.
+private sb_slot_carries(w: &BoxWalk, ty: Type, slot: int) -> bool = underlying(ty) match
+    Struct(st) ->
+        if !is_closure_literal(Struct(st)) || !w.exact || !w.env.has(st.base) then true
+        else w.env.has(s"${st.base}#$slot")
+    _ -> true
+
+// The caller's record of closure environments a callee's walk inherits: `None` unless it is exact.
+private sb_env(w: &BoxWalk) -> Option[Set[string]] = if w.exact then Some(w.env) else None
 
 // The local a place is inside of by value: a chain of field and element steps, never through a
 // pointer, a reference or a `ref`.
@@ -719,9 +842,9 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
 
         for k in 0..<args.len()
             if sb_carry(w, args[k])
-                val s = summary(w.cx, name, k, args.len())
+                val s = summary(w.cx, name, k, args.len(), sb_env(w))
 
-                if s.0 then sb_escape(w, handed_why(w.cx, name, k, args[k].span))
+                if s.0 then sb_escape(w, handed_why(w.cx, name, k, sb_env(w), args[k].span))
                 if s.1 then answered = true
             end if
         end for
@@ -732,10 +855,22 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
             return true
         end if
 
+        if answered && may_carry(texpr_type(x)) then w.inexact()
+
         answered
     TStructNew(st, args) ->
-        val c = sb_all(w, args)
+        val closure = is_closure_literal(Struct(st))
+        var c = false
 
+        for i in 0..<args.len()
+            if sb_carry(w, args[i])
+                c = true
+
+                if closure then w.note_env(s"${st.base}#${st.slot(i)}")
+            end if
+        end for
+
+        if closure then w.note_env(st.base)
         if c && w.cx.dtors.has(mangle(Struct(st))) then sb_escape(w, WhyDropper(x.span, Struct(st)))
 
         c
@@ -768,7 +903,7 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
 
     // A step into a reference's payload reads what the payload holds, which the box can be part of only
     // by a store this walk has already called an escape.
-    TField(r, _, _) -> sb_carry(w, r) && !is_ref_type(texpr_type(r))
+    TField(r, slot, _) -> sb_carry(w, r) && !is_ref_type(texpr_type(r)) && sb_slot_carries(w, texpr_type(r), slot)
     TIndex(r, i, _) ->
         sb_see(w, i)
         sb_carry(w, r) && !is_ref_type(texpr_type(r))
@@ -923,9 +1058,9 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
                 var seen = w.cx.table_args.get(key).unwrap_or((false, false))
 
                 for name in callees.unwrap()
-                    val s = summary(w.cx, name, k, given)
+                    val s = summary(w.cx, name, k, given, sb_env(w))
 
-                    if s.0 then sb_escape(w, handed_why(w.cx, name, k, arg.span))
+                    if s.0 then sb_escape(w, handed_why(w.cx, name, k, sb_env(w), arg.span))
                     if s.1 then answered = true
 
                     seen = (seen.0 || s.0, seen.1 || s.1)
@@ -934,6 +1069,8 @@ private sb_kind(w: &BoxWalk, x: TExpr) -> bool = *x.kind match
                 w.cx.table_args.put(key, seen)
             end if
         end for
+
+        if answered && may_carry(texpr_type(x)) then w.inexact()
 
         answered
     _ ->
@@ -1103,8 +1240,10 @@ end table_callees
 // What the function `name` does with its parameter `k`: whether it may let it out (`.0`), and whether
 // its answer may be it or hold it (`.1`). Where no body is in sight, the arguments do not line up, the
 // body is a task's or is being worked out further up this very question, the answer is "it escapes".
-private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool)
-    val key = s"$name|$k"
+// `env` is the asking walk's record of the closure environments it built (`BoxWalk.env`), which the
+// parameter's walk starts from; each record is its own question.
+private summary(cx: &BoxCx, name: string, k: usize, given: usize, env: Option[Set[string]]) -> (bool, bool)
+    val key = s"$name|$k" + env_key(env)
 
     cx.memo.get(key) match
         Some(known) -> return known
@@ -1123,7 +1262,7 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
 
     cx.busy.add(name)
 
-    val w = follow_param(cx, f, k)
+    val w = follow_param(cx, f, k, env)
 
     cx.busy.remove(name)
 
@@ -1131,11 +1270,31 @@ private summary(cx: &BoxCx, name: string, k: usize, given: usize) -> (bool, bool
 
     cx.memo.put(key, out)
 
-    if out.1 then cx.answering.add(key)
+    if out.1 then cx.answering.add(s"$name|$k")
     if w.why.is_some() then cx.whys.put(key, w.why.unwrap())
 
     out
 end summary
+
+// A record of closure environments as a memo key: its entries in one order, or nothing where there
+// is no record.
+private env_key(env: Option[Set[string]]) -> string
+    if env.is_none() then return ""
+
+    var entries: Buf[string] = buf()
+
+    for entry in env.unwrap()
+        entries.push(entry)
+
+    sort(entries.view_mut())
+
+    var text = "|"
+
+    for entry in entries
+        text = text + entry + ","
+
+    text
+end env_key
 
 // -- why a box is on the heap: what `--explain-escapes` says ----------------------------------------
 
@@ -1150,8 +1309,9 @@ enum BoxWhy
     WhySetter(at: Span)
     // Returned, other than as a factory's answer.
     WhyReturned(at: Span)
-    // Handed to parameter `k` of a callee whose body may let it out (`BoxCx.whys` says how).
-    WhyHanded(at: Span, callee: string, k: usize)
+    // Handed to parameter `k` of a callee whose body may let it out (`BoxCx.whys` at `key`, the
+    // summary's own memo key, says how).
+    WhyHanded(at: Span, callee: string, k: usize, key: string)
     // Handed to a callee still being worked out further up the same question: a recursion.
     WhyRecursive(at: Span, callee: string)
     // Handed to a callee whose body cannot be asked: none in sight, a task's, or one the call does
@@ -1181,9 +1341,12 @@ enum BoxWhy
     WhyUnknown
 end BoxWhy
 
-// Why a value handed to parameter `k` of `callee` may get out, as the callee's summary found it.
-private handed_why(cx: &BoxCx, callee: string, k: usize, at: Span) -> BoxWhy
-    if cx.whys.has(s"$callee|$k") then return WhyHanded(at, callee, k)
+// Why a value handed to parameter `k` of `callee` may get out, as the callee's summary asked with the
+// record `env` found it.
+private handed_why(cx: &BoxCx, callee: string, k: usize, env: Option[Set[string]], at: Span) -> BoxWhy
+    val key = s"$callee|$k" + env_key(env)
+
+    if cx.whys.has(key) then return WhyHanded(at, callee, k, key)
     if cx.busy.has(callee) then return WhyRecursive(at, callee)
 
     WhyUnseen(at, callee)
@@ -1207,10 +1370,15 @@ end take_box_notes
 private note_box(cx: &BoxCx, f: TFunc, at: Span, what: string, why: BoxWhy) =
     push_box_note(f, at, what, box_why_said(cx, why, f))
 
-private note_unentered(f: TFunc, at: Span, factory: string, param: string) =
-    push_box_note(f, at, factory_subject(factory),
-                  s"'${said_func(factory)}' has no frame entry, since its parameter '${said_local(param)}' " +
-                  "is lent by address")
+// A factory call taken back because its factory has no frame entry: a parameter of its own lent by
+// address, or the factory it answers the box of has none.
+private note_unentered(f: TFunc, at: Span, factory: string, param: Option[string], via: Option[string])
+    val why = if param is Some(n) then s"its parameter '${said_local(n)}' is lent by address"
+    else if via is Some(g) then s"'${said_func(g)}', whose box it answers, has none"
+    else "its frame entry was taken back"
+
+    push_box_note(f, at, factory_subject(factory), s"'${said_func(factory)}' has no frame entry, since $why")
+end note_unentered
 
 // `file:line:col: <what> is boxed on the heap, because <why>`, at the box's payload or the call.
 private push_box_note(f: TFunc, at: Span, what: string, because: string)
@@ -1241,7 +1409,7 @@ private box_why_said(cx: &BoxCx, why: BoxWhy, f: TFunc) -> string = why match
     WhyStored(at) -> s"it is stored in '${said_text(f, at)}'${said_line(f, at)}"
     WhySetter(at) -> s"it is handed to the setter of '${said_text(f, at)}'${said_line(f, at)}"
     WhyReturned(at) -> s"it is returned from '${said_func(f.name)}'${said_line(f, at)}"
-    WhyHanded(at, callee, k) -> handed_said(cx, at, callee, k, f)
+    WhyHanded(at, callee, k, key) -> handed_said(cx, at, callee, k, key, f)
     WhyRecursive(at, callee) ->
         s"it is handed to '${said_func(callee)}'${said_line(f, at)}, a recursion whose answer is still " +
             "being worked out"
@@ -1268,10 +1436,10 @@ private box_why_said(cx: &BoxCx, why: BoxWhy, f: TFunc) -> string = why match
     WhyUnknown -> "the analysis found a way out it does not name"
 
 // A callee that lets out what it is handed, and the way out its own body has.
-private handed_said(cx: &BoxCx, at: Span, callee: string, k: usize, f: TFunc) -> string
+private handed_said(cx: &BoxCx, at: Span, callee: string, k: usize, key: string, f: TFunc) -> string
     val g = cx.funcs[cx.index.get(callee).unwrap()]
     val param = if k < g.params.len() then said_local(g.params[k].0) else s"#${k + 1}"
-    val inner = box_why_said(cx, cx.whys.get(s"$callee|$k").unwrap(), g)
+    val inner = box_why_said(cx, cx.whys.get(key).unwrap(), g)
 
     s"it is handed to '${said_func(callee)}'${said_line(f, at)}, which keeps its parameter '$param' ($inner)"
 end handed_said
@@ -1281,11 +1449,13 @@ private unseen_said(cx: &BoxCx, callee: string) -> string = cx.index.get(callee)
     Some(i) ->
         if cx.funcs[i].marks.is_async() then "whose body is a task's" else "which the call does not line up with"
 
-private destructor_said(cx: &BoxCx, ty: Type, dtor: string) -> string = cx.whys.get(s"$dtor|0") match
-    Some(why) ->
-        s"the destructor of '${show_bare(ty)}' may let its payload out " +
-            s"(${box_why_said(cx, why, cx.funcs[cx.index.get(dtor).unwrap()])})"
-    None -> s"the destructor of '${show_bare(ty)}' may let its payload out"
+private destructor_said(cx: &BoxCx, ty: Type, dtor: string) -> string
+    val lead = s"the destructor of '${show_bare(ty)}' may let its payload out"
+
+    cx.whys.get(s"$dtor|0" + env_key(None)) match
+        Some(why) -> s"$lead (${box_why_said(cx, why, cx.funcs[cx.index.get(dtor).unwrap()])})"
+        None -> lead
+end destructor_said
 
 // A node the walk does not follow a value into, as a line names what it does with the box.
 private node_said(x: TExpr) -> string = *x.kind match

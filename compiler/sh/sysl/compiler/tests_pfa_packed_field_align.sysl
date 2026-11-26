@@ -1,0 +1,308 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{join, replace_all, split}
+
+// **An ordinary access to a field of a `@packed` struct is at no boundary** (`emit.sysl`'s
+// `packed_aligned`): the field sits at its declared offset and the struct needs no alignment of its own
+// (`reference/attributes.md § @packed`), so a `u32` after a `u8` is at an odd address. LLVM, told nothing,
+// assumed a word boundary there -- `ldr r1, [r0, r2]` with `r2` = 1 -- which an ARMv6-M core (Cortex-M0+,
+// the RP2040's) faults on, and which is undefined behaviour everywhere else.
+//
+// The axes: where the packed storage is reached (through a pointer, a local built in place, an element
+// of an array of packed structs, a packed struct as a field of an ordinary one, an ordinary struct as a
+// field of a packed one, module storage), read and written (a compound assignment is both), and what
+// leaves the packed storage behind (a pointer read out of a packed field, then followed, is an ordinary
+// `*T`). One cell pins the control (an ordinary struct keeps its boundary) and one what is outside the
+// fix: a volatile field keeps its full-width access (`tests_vpa_volatile_plain_access.sysl`).
+//
+// Skipped cells, and why: a bitfield struct's container is read at its own width and boundary
+// (`tests_bfd_bitfield.sysl`); a C bitfield's unit states its boundary itself (`emit_c_bits.sysl`).
+
+private val pfa_fixture: string = raw"""
+    @packed
+    struct Head
+        tag: u8
+        len: u32
+
+    struct Outer
+        pad: u8
+        h: Head
+
+    struct Inner
+        x: u32
+
+    @packed
+    struct Holds
+        tag: u8
+        inner: Inner
+        at: *u32
+
+    struct Plain
+        tag: u8
+        len: u32
+
+    @packed
+    struct Reg
+        tag: u8
+        word: volatile u32
+
+    var stored: Head = Head(1, 2)
+
+    @export("bump")
+    bump(h: *Head) -> u32
+        h.len += 1
+        h.len
+
+    @export("local")
+    local(x: u32) -> u32
+        var h = Head(7, x)
+
+        h.len += 1
+        h.len
+    end local
+
+    @export("arr")
+    arr(hs: *[4]Head) -> u32 = hs[1].len + hs[2].len
+
+    @export("nested")
+    nested(o: *Outer) -> u32
+        o.h.len = 5
+        o.h.len
+
+    @export("inner")
+    inner(p: *Holds) -> u32
+        p.inner.x = 9
+        p.inner.x
+
+    @export("follow")
+    follow(p: *Holds) -> u32 = *p.at
+
+    @export("module")
+    module_storage() -> u32
+        stored.len = 3
+        stored.len
+
+    @export("plain")
+    plain(p: *Plain) -> u32
+        p.len = 4
+        p.len
+
+    @export("reg")
+    reg(r: *Reg) -> u32
+        r.word = 1
+        r.word
+    """
+
+private pfa_objdump() -> Option[string]
+    for d in ["/opt/homebrew/opt/llvm/bin/llvm-objdump", "/usr/local/opt/llvm/bin/llvm-objdump"]
+        if is_file(d) then return Some(d)
+
+    None
+end pfa_objdump
+
+// `sysl build-c` of the fixture for `machine` at `-O<level>`: the LLVM module and the disassembly of the
+// archive, or `None` where the standard module's source or llvm-objdump is not on this machine.
+private pfa_build(machine: string, level: string) -> Option[(string, string)]
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return None
+
+    if pfa_objdump().is_none()
+        print("skipped: no llvm-objdump here")
+        return None
+
+    val dir = replace_all(make_temp_dir("sysl-pfa").unwrap(), "//", "/")
+
+    make_dir_all(dir).unwrap()
+    write_text(s"$dir/main.sysl", pfa_fixture).unwrap()
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    var argv: Buf[string] = buf()
+
+    for a in ["sysl", "build-c", dir, "--target", machine, s"-O$level", "--emit-llvm", s"$dir/k.ll", "-o",
+              s"$dir/libk.a"]
+        argv.push(a)
+
+    val code = run_cli(argv.view(), (line) -> sink.push(line))
+
+    assert_eq(code, Fine, join(lines.view(), "\n"))
+
+    val ir = read_text(s"$dir/k.ll").unwrap()
+    val dis = capture(pfa_objdump().unwrap(), ["-d", "--no-show-raw-insn", "--no-leading-addr", s"$dir/libk.a"],
+                      "", [], true)
+
+    remove_dir_all(dir).unwrap_or(())
+
+    dis match
+        Ok(out) -> Some((ir, out.text))
+        Err(_) -> Some((ir, ""))
+end pfa_build
+
+// The define of `symbol` (its `$$sysl` body, where it has one).
+private pfa_define(ir: string, symbol: string) -> string
+    val lines = split(ir, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.starts_with("define ") then inside = line.contains(s"@$symbol$$")
+        if inside then out = out + line + "\n"
+        if line == "}" then inside = false
+
+    out
+end pfa_define
+
+// The instructions of `symbol` in a listing, the exported thunk and the body it calls.
+private pfa_body(dis: string, symbol: string) -> string
+    val lines = split(dis, "\n")
+    var out = ""
+    var inside = false
+
+    for i in 0..<lines.len
+        val line = lines[i]
+
+        if line.starts_with("<") || line.starts_with("Disassembly")
+            inside = line == s"<$symbol>:" || line.starts_with(s"<$symbol" + "$")
+        else if inside && line != ""
+            out = out + line + "\n"
+
+    out
+end pfa_body
+
+// Whether `define` reads and writes some `ty` at no boundary, and never at its own.
+private pfa_unaligned(define: string, ty: string) -> bool =
+    define.contains(s"load $ty, ptr %") && define.contains(", align 1") && !define.contains(s"$ty, align 4")
+
+@test("a u32 after a u8 in a @packed struct, through a pointer, is read and written at no boundary")
+pfa_through_a_pointer()
+    pfa_build("thumbv6m-freestanding", "0") match
+        Some(built) ->
+            val bump = pfa_define(built.0, "bump")
+
+            assert(pfa_unaligned(bump, "i32"), bump)
+            assert(pfa_every_line(bump, "i32"), bump)
+        None -> ()
+
+// Whether every load and store of `ty` in `define` is at no boundary.
+private pfa_every_line(define: string, ty: string) -> bool
+    val lines = split(define, "\n")
+
+    for i in 0..<lines.len
+        val moves = lines[i].contains(s" = load $ty, ptr %") || lines[i].contains(s"store $ty ")
+
+        if moves && !lines[i].ends_with(", align 1") then return false
+
+    true
+end pfa_every_line
+
+@test("so is it in a local built in place, in an element of an array of them, and in module storage")
+pfa_local_element_module()
+    pfa_build("thumbv6m-freestanding", "0") match
+        Some(built) ->
+            val local = pfa_define(built.0, "local")
+
+            // The parameter's own slot is an ordinary i32; every access into the packed local is not.
+            assert(pfa_unaligned(local, "i32"), local)
+            assert(local.contains("store i32 %x.param, ptr %x.addr\n"), local)
+            assert(pfa_unaligned(pfa_define(built.0, "arr"), "i32"), pfa_define(built.0, "arr"))
+
+            // Module storage is written at the field and read as the whole packed struct, whose own LLVM
+            // type is at no boundary.
+            val stored = pfa_define(built.0, "module_storage")
+
+            assert(stored.contains("store i32 3, ptr %") && stored.contains(", align 1"), stored)
+            assert(pfa_every_line(stored, "i32"), stored)
+        None -> ()
+
+@test("and in a packed struct that is a field of an ordinary one, and an ordinary one that is a field of it")
+pfa_nested_either_way()
+    pfa_build("thumbv6m-freestanding", "0") match
+        Some(built) ->
+            assert(pfa_unaligned(pfa_define(built.0, "nested"), "i32"), pfa_define(built.0, "nested"))
+            assert(pfa_unaligned(pfa_define(built.0, "inner"), "i32"), pfa_define(built.0, "inner"))
+        None -> ()
+
+@test("a pointer read out of a packed field is an ordinary pointer: what it points at keeps its boundary")
+pfa_followed_pointer_is_ordinary()
+    pfa_build("thumbv6m-freestanding", "0") match
+        Some(built) ->
+            val follow = pfa_define(built.0, "follow")
+
+            // The pointer itself is a packed field, read at no boundary; the u32 it points at is a u32's.
+            val lines = split(follow, "\n")
+            var field = false
+            var target = false
+
+            for i in 0..<lines.len
+                if lines[i].contains(" = load ptr, ptr %") && lines[i].ends_with(", align 1") then field = true
+                if lines[i].contains(" = load i32, ptr %") && !lines[i].contains("align 1") then target = true
+
+            assert(field, follow)
+            assert(target, follow)
+        None -> ()
+
+@test("an ordinary struct's field keeps its boundary")
+pfa_ordinary_struct_keeps_its_boundary()
+    pfa_build("thumbv6m-freestanding", "0") match
+        Some(built) ->
+            val plain = pfa_define(built.0, "plain")
+
+            assert(plain.contains("store i32 4, ptr %"), plain)
+            assert(!plain.contains("align 1"), plain)
+        None -> ()
+
+@test("a volatile field of a packed struct keeps its one access of its width")
+pfa_volatile_keeps_its_width()
+    pfa_build("thumbv6m-freestanding", "0") match
+        Some(built) ->
+            val reg = pfa_define(built.0, "reg")
+
+            assert(reg.contains("call void asm sideeffect \"str $0, [$1]\""), reg)
+            assert(reg.contains("call i32 asm sideeffect \"ldr $0, [$1]\""), reg)
+        None -> ()
+
+// Every word access of `body` that a Cortex-M0+ would make at an offset it cannot be sure of.
+private pfa_word_accesses(body: string) -> int
+    val lines = split(body, "\n")
+    var n = 0
+
+    for i in 0..<lines.len
+        val parts = split(lines[i], "\t")
+
+        if parts.len < 3 then continue
+
+        if (parts[1] == "ldr" || parts[1] == "str") && !parts[2].contains("[sp") && !parts[2].contains("[pc")
+            n += 1
+
+    n
+end pfa_word_accesses
+
+@test("on an M0+ at every level, a packed u32 at an odd offset is moved a byte at a time, never as a word")
+pfa_m0_never_a_word()
+    for level in ["0", "1", "2", "s"]
+        pfa_build("thumbv6m-freestanding", level) match
+            Some(built) ->
+                for symbol in ["bump", "arr", "nested", "inner"]
+                    val body = pfa_body(built.1, symbol)
+
+                    assert(body.contains("ldrb") || body.contains("strb"), s"-O$level $symbol:\n$body")
+                    assert_eq(pfa_word_accesses(body), 0, s"-O$level $symbol:\n$body")
+            None -> return
+end pfa_m0_never_a_word
+
+@test("every other processor reads a packed field at no boundary too")
+pfa_every_processor()
+    for machine in ["aarch64-freestanding", "x86_64-freestanding", "riscv32-freestanding", "thumb-freestanding"]
+        pfa_build(machine, "0") match
+            Some(built) ->
+                assert(pfa_every_line(pfa_define(built.0, "bump"), "i32"), s"$machine:\n${pfa_define(built.0, "bump")}")
+                assert(!pfa_define(built.0, "plain").contains("align 1"), s"$machine:\n${pfa_define(built.0, "plain")}")
+            None -> return
+end pfa_every_processor

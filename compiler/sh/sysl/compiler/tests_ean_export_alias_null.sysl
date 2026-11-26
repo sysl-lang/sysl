@@ -1,0 +1,380 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, read_text, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.join
+
+// **An exported `type` is its base under a second name** (`reference/ffi.md § Naming a type in the
+// header`): a sysl caller is unaffected by the `@export`, and the alias flows to and from its base
+// with no conversion. An exported alias of a function pointer or a data pointer had lost two of its
+// base's behaviours -- `null` was refused in every position that expected the alias, and `==` / `!=`
+// were "not defined" for it -- because `null_literal` and `is_equatable` asked the type as written
+// rather than the base it names. An exported `bool` lost `==` the same way. Each cell below is one
+// position or one operator, through `sysl build`, `build-c` and `build-c --shared`.
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private ean_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end ean_ready
+
+private ean_exited_zero(s: Status) -> bool = s match
+    Exited(code) -> code == 0
+    _ -> false
+
+// The exported names every cell builds on.
+private ean_names() -> string = raw"""
+    @export("ean_cb")
+    type Cb = *extern(i32) -> i32
+
+    @export("ean_data")
+    type Data = *u8
+
+    @export("ean_n")
+    type N = i32
+
+    @export("ean_flag")
+    type Flag = bool
+
+    @export("ean_pt")
+    struct Pt
+        x: N
+        y: N
+
+    @export("ean_pt_ref")
+    type PtRef = *Pt
+
+    @export("ean_holder")
+    struct Holder
+        f: Cb
+        d: Data
+
+    @export("ean_twice")
+    twice(n: i32) -> i32 = n * 2
+    """
+
+// A program of the exported names and `body`, built with `sysl build`'s own path and run: what it
+// printed.
+private ean_prints(body: string, expected: string)
+    if !ean_ready() then return
+
+    val root = make_temp_dir("sysl-ean-").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", ean_names() + body).unwrap()
+
+    val exe = s"$root/built"
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    built match
+        Err(why) -> assert(false, failure_text(why))
+        Ok(_) -> ()
+
+    said match
+        Err(_) -> assert(false, "the program that was built could not be run")
+        Ok(out) ->
+            assert_eq(out.text, expected)
+            assert(ean_exited_zero(out.status), "the program did not exit normally")
+end ean_prints
+
+// The same program refused: the analysis report holds `message`.
+private ean_refused(body: string, message: string)
+    if !ean_ready() then return
+
+    val root = make_temp_dir("sysl-ean-").unwrap()
+    val src = s"$root/main.sysl"
+
+    make_dir_all(root).unwrap()
+    write_text(src, ean_names() + body).unwrap()
+
+    val said = emit_llvm_text(src, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+
+    assert(said.contains(message), said)
+end ean_refused
+
+// -- `sysl build`: every position `null` reaches, and both comparisons ---------------------------
+
+@test("null initialises a module variable of an exported function-pointer alias, which then equals null")
+ean_null_module_var()
+    ean_prints(raw"""
+        var named: Cb = null
+
+        main()
+            print(named == null)
+            named = &twice
+            print(named == null, named(4))
+        """, "true\nfalse 8\n")
+
+@test("'!=' is defined on an exported function-pointer alias, with null on either side")
+ean_not_equal()
+    ean_prints(raw"""
+        main()
+            val f: Cb = &twice
+            val g: Cb = null
+            print(f != null, null != f, g != null, null != g)
+        """, "true true false false\n")
+
+@test("two values of an exported function-pointer alias compare with each other and with the bare type")
+ean_compare_two()
+    ean_prints(raw"""
+        main()
+            val f: Cb = &twice
+            val g: Cb = &twice
+            val bare: *extern(i32) -> i32 = f
+            print(f == g, f == bare, bare == f, f != bare)
+        """, "true true true false\n")
+
+@test("null is an argument where an exported function-pointer alias is the parameter")
+ean_null_argument()
+    ean_prints(raw"""
+        missing(f: Cb) -> bool = f == null
+
+        main() = print(missing(null), missing(&twice))
+        """, "true false\n")
+
+@test("null is the result of a function returning an exported function-pointer alias")
+ean_null_result()
+    ean_prints(raw"""
+        none() -> Cb = null
+
+        main() = print(none() == null)
+        """, "true\n")
+
+@test("null fills a struct field of an exported function-pointer alias and of a data-pointer alias")
+ean_null_field()
+    ean_prints(raw"""
+        main()
+            val h = Holder(null, null)
+            print(h.f == null, h.d == null)
+        """, "true true\n")
+
+@test("a struct field and a call's result of an exported function-pointer alias are called through")
+ean_call_field_and_result()
+    ean_prints(raw"""
+        pick() -> Cb = &twice
+
+        main()
+            val h = Holder(&twice, null)
+            print(h.f(5), pick()(6))
+        """, "10 12\n")
+
+@test("null is the payload of an Option of an exported function-pointer alias")
+ean_null_in_option()
+    ean_prints(raw"""
+        main()
+            val o: Option[Cb] = Some(null)
+            print(o.unwrap() == null)
+        """, "true\n")
+
+@test("an exported data-pointer alias takes null, compares, indexes and dereferences as its base does")
+ean_data_pointer()
+    ean_prints(raw"""
+        main()
+            var bytes: [3]u8 = [7, 8, 9]
+            var d: Data = null
+            print(d == null)
+            d = &bytes[0]
+            print(d != null, d[1], *d)
+        """, "true\ntrue 8 7\n")
+
+@test("an exported alias of a struct pointer reads its fields and compares with null")
+ean_struct_pointer()
+    ean_prints(raw"""
+        main()
+            var p = Pt(3, 4)
+            val r: PtRef = &p
+            val none: PtRef = null
+            print(r.x + r.y, r == null, none == null)
+        """, "7 false true\n")
+
+@test("an exported integer alias takes literals, does arithmetic and compares as its base does")
+ean_integer_alias()
+    ean_prints(raw"""
+        main()
+            val n: N = 5
+            val m = n * 3 - 1
+            print(m, m == 14, m != 14, m < 20)
+        """, "14 true false true\n")
+
+@test("an exported bool alias compares with '==' and '!=' as bool does")
+ean_bool_alias()
+    ean_prints(raw"""
+        main()
+            val a: Flag = true
+            val b: Flag = false
+            print(a == b, a != b, a == true, b == false)
+        """, "false true true true\n")
+
+@test("an exported bool alias is a condition: under 'if', '!', '&&', '||' and 'while'")
+ean_bool_condition()
+    ean_prints(raw"""
+        main()
+            val a: Flag = true
+            var b: Flag = false
+            if a then print("if")
+            print(!a, a && b, a || b)
+            while !b
+                b = true
+            print(b)
+        """, "if\nfalse false true\ntrue\n")
+
+// -- what stays refused ---------------------------------------------------------------------------
+
+@test("null is still refused where an exported integer alias is expected")
+ean_null_integer_refused()
+    ean_refused(raw"""
+        main()
+            val n: N = null
+            print(n)
+        """, "'null' is a raw pointer, and N was expected here")
+
+@test("an exported function-pointer alias still has no ordering")
+ean_no_ordering()
+    ean_refused(raw"""
+        main()
+            val f: Cb = &twice
+            print(f < f)
+        """, "'<' is not defined for Cb")
+
+// -- `build-c` and `--shared`: the header and a C caller passing NULL ------------------------------
+
+private ean_library() -> string = raw"""
+    module mylib
+
+    """ + ean_names() + raw"""
+
+    var named: Cb = null
+
+    var held: Holder = Holder(null, null)
+
+    @export("ean_set")
+    set(f: Cb) -> bool
+        named = f
+        held = Holder(f, null)
+        named == null
+
+    @export("ean_call")
+    call(n: N) -> N = if named != null then named(n) else -1
+
+    @export("ean_held")
+    held_null() -> Flag = held.f == null && held.d == null
+
+    @export("ean_none")
+    none() -> Cb = null
+    """
+
+private ean_caller() -> string = raw"""
+    #include <stdio.h>
+    #include "libmylib.a.h"
+
+    static int32_t thrice(int32_t n) { return n * 3; }
+
+    int main(void) {
+        ean_cb none = ean_none();
+        int a = ean_set(NULL);
+        int b = ean_call(5);
+        int c = ean_held();
+        int d = ean_set(thrice);
+        int e = ean_call(5);
+        int f = ean_held();
+        printf("%d %d %d %d %d %d %d\n", none == NULL, a, b, c, d, e, f);
+        return 0;
+    }
+    """
+
+// A project of `ean_library` built by `build-c` (`shared` asks for `--shared`), its header, and a C
+// program that links against it: the header's text and what the program printed.
+private ean_c_side(shared: bool) -> (string, string)
+    val root = make_temp_dir("sysl-ean-").unwrap()
+
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/lib.sysl", ean_library()).unwrap()
+
+    var line: Buf[string] = buf()
+
+    for word in ["sysl", "build-c", root] do line.push(word)
+
+    if shared
+        for word in ["--shared", "-o", s"$root/libmylib.dylib", "--header", s"$root/libmylib.a.h"] do
+            line.push(word)
+    else
+        for word in ["-o", s"$root/libmylib.a"] do line.push(word)
+    end if
+
+    var lines: Buf[string] = buf()
+    val sink = &lines
+    val code = run_cli(line.view(), (said) -> sink.push(said))
+
+    assert(code == 0, join(lines.view(), "\n"))
+
+    val header = read_text(s"$root/libmylib.a.h").unwrap()
+
+    write_text(s"$root/main.c", ean_caller()).unwrap()
+
+    var cc: Buf[string] = buf()
+
+    for word in ["-Werror", s"$root/main.c"] do cc.push(word)
+
+    if shared
+        for word in [s"$root/libmylib.dylib", s"-Wl,-rpath,$root"] do cc.push(word)
+    else
+        cc.push(s"$root/libmylib.a")
+
+    for word in ["-o", s"$root/caller"] do cc.push(word)
+
+    val built = capture("clang", cc.view(), "", [], true).unwrap()
+
+    assert(ean_exited_zero(built.status), built.err.unwrap_or(built.text))
+
+    val ran = capture(s"$root/caller", [], "", [], true, 20000).unwrap()
+
+    assert(ean_exited_zero(ran.status), ran.err.unwrap_or(ran.text))
+    remove_dir_all(root).unwrap_or(())
+    (header, ran.text.trim())
+end ean_c_side
+
+@test("build-c declares the exported function-pointer alias as a typedef, and a C caller passes it NULL")
+ean_build_c()
+    if !ean_ready() then return
+
+    val got = ean_c_side(false)
+
+    assert(got.0.contains("typedef int32_t (*ean_cb)(int32_t);"), got.0)
+    assert(got.0.contains("bool ean_set(ean_cb f);"), got.0)
+    assert(got.0.contains("ean_cb ean_none(void);"), got.0)
+    assert(got.0.contains("ean_flag ean_held(void);"), got.0)
+    assert(got.0.contains("ean_n ean_call(ean_n n);"), got.0)
+    assert_eq(got.1, "1 1 -1 1 0 15 0")
+
+@test("and the same from the shared library build-c --shared links")
+ean_build_c_shared()
+    if !ean_ready() then return
+
+    if host_os() != MacOS
+        print("skipped: the shared-library link here is macOS's")
+        return
+    end if
+
+    val got = ean_c_side(true)
+
+    assert(got.0.contains("typedef int32_t (*ean_cb)(int32_t);"), got.0)
+    assert_eq(got.1, "1 1 -1 1 0 15 0")

@@ -1,0 +1,396 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status}
+import sysl.text.{cstring, split}
+
+// **Every other failed check is one call to a cold, never-returning helper too** (`bounds_fail.sysl`'s
+// `report_check`, `contract_unless`, `clause_unless`): the block a division, a range, a `where`
+// predicate, a `require`/`ensure` or a struct invariant branches to on failure holds one call to its
+// private `cold noinline noreturn` helper (`sysl.check.<n>.<sentence>`, `sysl.contract`,
+// `sysl.contract.clause`) and `unreachable`; the helper makes the report through `sysl_trap` and then
+// the stop. With the stop at the site as a second call, two divisions priced a function at 290 against
+// clang's `-O2` threshold of 225; with one call per block it is 170 and inlines.
+//
+// The axes: the kind of check (a division by zero, a remainder by zero, the least value divided by -1,
+// a `within` range, a `where` predicate, a `require`, an `ensure`, a struct invariant -- the clause
+// helper), the build mode (debug, release) and the level (`-O0`, the default), the target (hosted,
+// whose stop is `@sysl.trap`; freestanding, whose stop is `@llvm.trap`), and what is asserted (the
+// IR's shape at the site, the helper's own text, what the program says and how it stops, and that an
+// optimizer now inlines a function holding checks).
+//
+// Cells skipped, with the reason: an override of `sysl_trap` that returns is still stopped -- the
+// stop is in the helper after the hook -- and is `tests_trh_trap_hook.sysl`'s ("the trap still
+// follows"); a check in a `@track_caller` function hands the helper the caller's location exactly as
+// before, and is `trh_tracked_names_the_caller`'s; each sentence's exact text at one level is
+// `tests_trh_trap_hook.sysl`'s and `tests_rqm_contract_report.sysl`'s; a bounds failure is
+// `tests_bfc_bounds_fail_cold.sysl`'s.
+
+private cfc_ready() -> bool = std_root().is_ok() && clang_available()
+
+private cfc_main(text: string) -> []const (string, string) = [("main.sysl", text)]
+
+private cfc_col(line: string, part: string) -> usize = line.index_of(part).unwrap() + 1
+
+private cfc_count(text: string, part: string) -> int
+    var n = 0
+    var rest = text
+
+    loop
+        rest.index_of(part) match
+            None -> return n
+            Some(at) ->
+                n += 1
+                rest = rest[at + part.bytes.len..]
+end cfc_count
+
+// -- the shape at the check ------------------------------------------------------------------------
+
+// Every call in `ir` of a helper whose name starts `helper` is followed at once by `unreachable`, and
+// there is at least one; no block calls the stop after a helper; and every helper `define` of that
+// name is `cold noinline noreturn` and ends with the hook, then `stop`, then `unreachable`.
+private cfc_shape(ir: string, helper: string, stop: string = "sysl.trap")
+    val lines = split(ir, "\n")
+    var calls = 0
+    var defines = 0
+
+    for i in 0..<lines.len
+        val l = lines[i]
+
+        if l.starts_with(s"  call void @$helper")
+            calls += 1
+            assert(i + 1 < lines.len && lines[i + 1] == "  unreachable", s"after '$l':\n$ir")
+        end if
+
+        if l.starts_with(s"define private void @$helper")
+            defines += 1
+            assert(l.ends_with(" cold noinline noreturn {") || l.ends_with(" cold noinline noreturn #99 {"),
+                   s"'$l':\n$ir")
+
+            var j = i + 1
+
+            while j < lines.len && lines[j] != "}"
+                j += 1
+
+            assert(j >= 3, ir)
+            assert(lines[j - 3].starts_with("  call void @sysl_trap(i32 "), s"in '$l':\n$ir")
+            assert_eq(lines[j - 2], s"  call void @$stop()")
+            assert_eq(lines[j - 1], "  unreachable")
+        end if
+    end for
+
+    assert(calls > 0, ir)
+    assert(defines > 0, ir)
+end cfc_shape
+
+@test("a division by zero's failure block is one call to its cold helper and unreachable")
+cfc_division_shape()
+    if !cfc_ready() then return
+
+    val ir = xvr_ir(cfc_main("quot(a: int, b: int) -> int = a / b\n\nprint(quot(7, 2))\n"))
+
+    assert(ir.contains("div.bad"), ir)
+    cfc_shape(ir, "sysl.check.20.integer_division_by_zero")
+    cfc_shape(ir, "sysl.check.16.")
+
+@test("a remainder by zero fails through the same one call")
+cfc_remainder_shape()
+    if !cfc_ready() then return
+
+    cfc_shape(xvr_ir(cfc_main("rem(a: u32, b: u32) -> u32 = a % b\n\nprint(rem(7, 2))\n")),
+              "sysl.check.20.integer_division_by_zero")
+
+@test("a within range and a where predicate fail through one call each")
+cfc_range_and_where_shape()
+    if !cfc_ready() then return
+
+    val ir = xvr_ir(cfc_main("type Slot = new int within 0..<8\ntype Even = new int where value % 2 == 0\n\n" +
+                             "f(n: int) -> int = int(Slot(n)) + int(Even(n))\n\nprint(f(2))\n"))
+
+    cfc_shape(ir, "sysl.check.18.")
+    cfc_shape(ir, "sysl.check.19.")
+
+@test("a require and an ensure fail through one call to the contract helper")
+cfc_contract_shape()
+    if !cfc_ready() then return
+
+    cfc_shape(xvr_ir(cfc_main("f(x: int) -> int\n    require x > 0\n    ensure result > 1\n    x + 1\n\n" +
+                              "print(f(2))\n")), "sysl.contract(")
+
+@test("a struct invariant fails through one call to the clause helper")
+cfc_clause_shape()
+    if !cfc_ready() then return
+
+    cfc_shape(xvr_ir(cfc_main("struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n\n" +
+                              "var hi = 4\nval s = Span(3, hi)\nprint(s.lo)\n")), "sysl.contract.clause(")
+
+@test("a freestanding target's helpers stop with llvm.trap, and the site is still one call")
+cfc_freestanding_shape()
+    if !cfc_ready() then return
+
+    val root = absolute_path(make_temp_dir("sysl-cfc-thumb").unwrap())
+
+    write_text(s"$root/main.sysl", "@export(\"quot\")\nquot(a: i32, b: i32) -> i32\n    require b != 7\n" +
+                                   "    a / b\n").unwrap()
+
+    val (code, out, err) = clx_ran(["sysl", "emit-llvm", "--target", "thumb-freestanding", s"$root/main.sysl"])
+
+    remove_dir_all(root).unwrap_or(())
+    assert(code == Fine, s"emit-llvm failed:\n$out$err")
+    cfc_shape(out, "sysl.check.20.integer_division_by_zero", "llvm.trap")
+    cfc_shape(out, "sysl.contract(", "llvm.trap")
+    assert(!out.contains("@sysl.trap("), out)
+end cfc_freestanding_shape
+
+// -- what it buys: a small function holding checks inlines ----------------------------------------
+
+private cfc_define(out: string, name: string) -> string
+    var body = ""
+    var inside = false
+
+    for l in split(out, "\n")
+        if !inside && l.starts_with("define") && l.contains(name) then inside = true
+
+        if inside
+            body = body + l + "\n"
+
+            if l == "}" then return body
+        end if
+
+    s"no define of $name in:\n$out"
+end cfc_define
+
+// `mix` holds two signed divisions, four checks. With the report and the stop as two calls in every
+// failure block, clang's `-O2` priced it at 290 against 225 and kept the call; with one call it is 170.
+@test("a function holding two checked divisions is inlined by -O2 into its caller")
+cfc_checks_do_not_block_inlining()
+    if !cfc_ready() then return
+
+    val ir = xvr_ir(cfc_main("mix(a: int, b: int, c: int) -> int = a / b +% c / a\n\n" +
+                             "walk(n: int, d: int, e: int) -> int\n    var acc = 0\n    for r in 1..<n\n" +
+                             "        acc +%= mix(r, d, e)\n    acc\n\nprint(walk(100, 3, 4))\n"))
+    val dir = make_temp_dir("sysl-cfc").unwrap()
+    val file = s"$dir/t.ll"
+
+    write_text(file, ir).unwrap()
+
+    val flags = ["-O2", "-S", "-emit-llvm", "-Wno-override-module", "-o", "-", file]
+    val got = capture("clang", flags, "", [], true).unwrap()
+
+    remove_dir_all(dir).unwrap_or(())
+    assert(got.status.ok(), s"clang refused the emitted IR:\n${got.err.unwrap_or("")}")
+
+    val walk = cfc_define(got.text, "walk$$sysl")
+
+    assert(walk.starts_with("define"), walk)
+    assert(!walk.contains("mix$$sysl\"(") && !walk.contains("@mix$$sysl("), walk)
+    assert(walk.contains("unreachable"), walk)
+end cfc_checks_do_not_block_inlining
+
+// -- what the program says, and how it stops -------------------------------------------------------
+
+private cfc_run(text: string, flag: string, level: string) -> (Status, string, string)
+    val root = make_temp_dir("sysl-cfc").unwrap()
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var flags: [1]string = [flag]
+
+    assert_eq(took_search_flag(flags[..], 0), 1)
+
+    val exe = s"$root/built"
+    val built = build_native_program(root, None, None, level, Some(exe))
+
+    reset_search_paths()
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (Status.Exited(-1), "", failure_text(why))
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> (Status.Exited(-1), "", "the program that was built could not be run")
+        Ok(out) -> (out.status, out.text, out.err.unwrap_or(""))
+end cfc_run
+
+// Debug and release, at both levels: the program prints `before`, then stops on SIGTRAP having
+// written exactly `said` to standard error.
+private cfc_traps(text: string, before: string, said: string)
+    if !cfc_ready() then return
+
+    for mode in ["--debug", "--release"]
+        for level in ["0", DefaultOptimization]
+            val (state, printed, err) = cfc_run(text, mode, level)
+
+            assert_eq(err, said, s"$mode -O$level")
+            assert_eq(printed, before, s"$mode -O$level")
+            assert(state == Status.Signalled(5), s"$mode -O$level stopped with $state, having printed '$printed'")
+        end for
+end cfc_traps
+
+@test("a division by zero says the same and stops the same, debug and release, at -O0 and the default")
+cfc_division_runs()
+    val line = "quot(a: int, b: int) -> int = a / b"
+
+    cfc_traps(s"$line\n\nvar d = 2\nprint(quot(7, d))\nd = 0\nprint(quot(7, d))\nprint(\"not reached\")\n",
+              "3\n", s"integer division by zero (main.sysl:1:${cfc_col(line, "a / b")})\n")
+
+@test("the least value divided by -1 says the same and stops the same, debug and release")
+cfc_least_by_minus_one_runs()
+    if !cfc_ready() then return
+
+    val line = "quot(a: i32, b: i32) -> i32 = a / b"
+    val text = s"$line\n\nvar d: i32 = 2\nprint(quot(-7, d))\nd = -1\nprint(quot(-2147483648, d))\n" +
+               "print(\"not reached\")\n"
+
+    for mode in ["--debug", "--release"]
+        for level in ["0", DefaultOptimization]
+            val (state, printed, err) = cfc_run(text, mode, level)
+
+            assert_eq(err, s"integer overflow: the least value divided by -1 (main.sysl:1:${cfc_col(line, "a / b")})\n",
+                      s"$mode -O$level")
+            assert_eq(printed, "-3\n", s"$mode -O$level")
+            assert(state == Status.Signalled(5), s"$mode -O$level stopped with $state")
+        end for
+end cfc_least_by_minus_one_runs
+
+@test("a failed require says the same and stops the same, debug and release")
+cfc_require_runs()
+    cfc_traps("f(x: int) -> int\n    require x > 0, \"x must be positive\"\n    x\n\nprint(f(2))\n" +
+              "print(f(-1))\nprint(\"not reached\")\n",
+              "2\n", "require failed: x must be positive (main.sysl:2:13)\n")
+
+@test("a broken struct invariant says the same and stops the same, debug and release")
+cfc_struct_invariant_runs()
+    cfc_traps("struct Span\n    lo: int\n    hi: int\n    invariant lo <= hi\n\nvar hi = 4\n" +
+              "print(Span(3, hi).lo)\nhi = 1\nprint(Span(3, hi).lo)\nprint(\"not reached\")\n",
+              "3\n", "invariant of 'Span' failed: clause 'lo <= hi' at main.sysl:4:15 (main.sysl:9:7)\n")
+
+// -- the other build forms: four codegen units, and link-time optimization -------------------------
+
+private extern "setenv" cfc_c_setenv(name: *u8, value: *u8, overwrite: int) -> int
+private extern "unsetenv" cfc_c_unsetenv(name: *u8) -> int
+
+// One function per kind of check, and a `main` that makes the one its argument count picks fail.
+private val cfc_every_kind: string = raw"""
+    type Slot = new int within 0..<8
+
+    struct Span
+        lo: int
+        hi: int
+        invariant lo <= hi
+
+    f1(a: int, b: int) -> int = a / b
+
+    f2(a: int, b: int) -> int = a % b
+
+    f3(x: int) -> int
+        require x > 0, "x must be positive"
+        x
+
+    f4(n: int) -> int = int(Slot(n))
+
+    f5(lo: int, hi: int) -> int = Span(lo, hi).hi
+
+    f6(a: i32, b: i32) -> i32 = a / b
+
+    f7(x: int) -> int
+        ensure result > 0
+        x - 1
+
+    main(args: []string)
+        val k = int(args.len) - 1
+        print(f1(7, 2), f2(7, 2), f3(1), f4(3), f5(1, 2), f6(7, 2), f7(5))
+        k match
+            1 -> print(f1(7, k - 1))
+            2 -> print(f2(7, k - 2))
+            3 -> print(f3(k - 3))
+            4 -> print(f4(k + 10))
+            5 -> print(f5(k, 0))
+            6 -> print(f6(i32(-2147483647 - 1), i32(5 - k)))
+            7 -> print(f7(k - 7))
+            _ -> print("none")
+    """
+
+// What each case writes to standard error: the sentence, and the line its check is on.
+private val cfc_every_said: [7](string, string) = [
+    ("integer division by zero (main.sysl:", ":8:"),
+    ("integer division by zero (main.sysl:", ":10:"),
+    ("require failed: x must be positive (main.sysl:", ":13:"),
+    ("value outside the range of 'Slot' (main.sysl:", ":16:"),
+    ("invariant of 'Span' failed: clause 'lo <= hi' at main.sysl:6:15 (main.sysl:", ":18:"),
+    ("integer overflow: the least value divided by -1 (main.sysl:", ":20:"),
+    ("ensure failed (main.sysl:", ":23:"),
+]
+
+// `exe` run with `k` arguments: its status, its standard output and its standard error.
+private cfc_run_with(exe: string, k: int) -> (Status, string, string)
+    var args: Buf[string] = buf()
+
+    for _ in 0..<k
+        args.push("x")
+
+    val out = capture(exe, args.view(), "", [], true).unwrap()
+
+    (out.status, out.text, out.err.unwrap_or(""))
+end cfc_run_with
+
+@test("every kind of check says the same and stops the same in one unit, four units and under LTO")
+cfc_every_kind_in_every_build_form()
+    if !cfc_ready() then return
+
+    val root = absolute_path(make_temp_dir("sysl-cfc-forms").unwrap())
+
+    write_text(s"$root/main.sysl", cfc_every_kind).unwrap()
+
+    val units = cstring("SYSL_CODEGEN_UNITS")
+    val one = cstring("1")
+    val four = cstring("4")
+
+    cfc_c_setenv(units.ptr, one.ptr, 1)
+    build_native_program(root, None, None, DefaultOptimization, Some(s"$root/one")).unwrap()
+    cfc_c_setenv(units.ptr, four.ptr, 1)
+    build_native_program(root, None, None, DefaultOptimization, Some(s"$root/four")).unwrap()
+    cfc_c_unsetenv(units.ptr)
+
+    val (code, out, err) = clx_ran(["sysl", "build", "--lto", "full", "-o", s"$root/lto", s"$root/main.sysl"])
+
+    assert(code == Fine, s"the LTO build failed:\n$out$err")
+
+    for k in 1..<8
+        val want = cfc_run_with(s"$root/one", k)
+        val said = cfc_every_said[k - 1]
+
+        assert_eq(want.1, "3 1 1 3 2 3 4\n", s"k=$k")
+        assert(want.0 == Status.Signalled(5), s"k=$k stopped with ${want.0}")
+        assert(want.2.starts_with(said.0) && want.2.contains(said.1) && want.2.ends_with(")\n"),
+               s"k=$k: ${want.2}")
+
+        for form in ["four", "lto"]
+            val got = cfc_run_with(s"$root/$form", k)
+
+            assert_eq(got.2, want.2, s"$form k=$k")
+            assert_eq(got.1, want.1, s"$form k=$k")
+            assert(got.0 == want.0, s"$form k=$k stopped with ${got.0}")
+        end for
+    end for
+
+    val fine = cfc_run_with(s"$root/lto", 0)
+
+    assert_eq(fine.1, "3 1 1 3 2 3 4\nnone\n")
+    assert(fine.0.ok(), s"${fine.0}")
+    remove_dir_all(root).unwrap_or(())
+end cfc_every_kind_in_every_build_form
+
+@test("a value outside a within range says the same and stops the same, debug and release")
+cfc_within_runs()
+    cfc_traps("type Slot = new int within 0..<8\nvar n = 3\nprint(int(Slot(n)))\nn = 9\n" +
+              "print(int(Slot(n)))\nprint(\"not reached\")\n",
+              "3\n", "value outside the range of 'Slot' (main.sysl:5:11)\n")

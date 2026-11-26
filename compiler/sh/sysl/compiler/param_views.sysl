@@ -26,9 +26,10 @@ import sysl.container.{Map, map, Set, set}
 // - **The local only reads the view**: its length, an element, a `for` over it, a slice of it read the
 //   same way, the initializer of another such local, or an argument of a direct call. Stored,
 //   returned, captured, built into a value or handed anywhere else, it keeps the view past what the
-//   rule can see, so it is counted. A view of a string's bytes that may be short is not handed to a
-//   call either: a callee that keeps it is handed a heap copy with a count of its own
-//   (`escape.sysl`'s `bytes_temp`).
+//   rule can see, so it is counted. A view of a string's bytes that may be short (the short form on) is
+//   not handed to a call either: a callee that keeps it is handed a heap copy with a count of its own
+//   (`escape.sysl`'s `bytes_temp`). With the form off, a string's bytes are its own storage, handed to
+//   a call as a slice is.
 // - **The local is written once**: never assigned, its address never taken, no `ref` bound to it, not
 //   named in a `defer`.
 param_view_locals(f: TFunc) -> Set[string]
@@ -166,9 +167,14 @@ private view_source(x: TExpr, short: bool) -> Option[(string, bool)] = *x.kind m
         underlying(texpr_type(base)) match
             Array(_, _, _) -> referent_root(base).map(n -> (n, short))
             _ -> None
-    TBytes(r) -> view_source(r, short || !string_known_long(r))
+    TBytes(r) -> view_source(r, short || bytes_may_be_short(r))
     TConstView(arg) -> view_source(arg, short)
     _ -> None
+
+// Whether a string's `.bytes` may be its own words: only where the short form is on, and the string is
+// not known to hold its bytes elsewhere -- the same answer `escape.sysl`'s `bytes_temp` gives, so a view
+// the emitter builds over the string's own storage is never classed as a copy it might hand a callee.
+private bytes_may_be_short(r: TExpr) -> bool = short_strings_on() && !string_known_long(r)
 
 // The `&T` parameter whose referent an array lies in by value, through fields and array elements --
 // never behind a second reference, which the first referent may let go of.

@@ -564,6 +564,15 @@ struct Emit
     // which slots have a +0 entry after them, in order (`table_zero.sysl`).
     table_zeros: Set[string]
     zero_slots: Map[string, (usize, Buf[int])]
+
+    // Every struct of the program, by the name LLVM knows it by (`note_struct_decls`): a volatile access
+    // to a whole one on a machine whose volatiles are each one plain instruction is made field by field
+    // (`emit_plain_aggregate`), which asks a named type what it holds.
+    struct_decls: Map[string, &StructType]
+
+    // The registers of the body being written that address storage inside a `@packed` struct, and so
+    // need not be on their type's boundary (`packed_aligned`).
+    packed_ptrs: Set[string]
 end Emit
 
 const PeelNone: int = 0
@@ -787,7 +796,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
           "", set(), false, None, None, set(), None, map(), buf(), buf(), buf(), false, set(), None,
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
           held_args_none(), PeelNone, set(), false, false, map(), map(), map(), no_stack_boxes(), buf(), buf(),
-          None, buf(), set(), set(), buf(), map(), set(), map())
+          None, buf(), set(), set(), buf(), map(), set(), map(), map(), set())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -830,6 +839,7 @@ start_function(e: *Emit)
     e.temp = 0
     e.label = 0
     e.terminated = false
+    e.packed_ptrs.clear()
     e.reached.clear()
     e.reached_at.clear()
     e.loops.clear()
@@ -895,38 +905,251 @@ end fresh_label
 emit(e: *Emit, i: Inst)
     if e.terminated then return
 
-    if e.target.cpu == Aarch64 then emit_a64_access(e, i) else e.current.push(i)
+    val j = packed_aligned(e, i)
+
+    e.target.cpu match
+        Aarch64 -> emit_plain_access(e, j, false)
+        Thumb -> emit_plain_access(e, j, true)
+        _ -> e.current.push(j)
 end emit
 
-// On AArch64, a volatile load or store that one plain instruction can make is marked to be written as
-// that instruction (`AccVolatileA64`): one `ldr` or `str` of its declared width from a bare register
-// address, never written back to the register, paired, merged or split. An integer narrower than its
-// storage (`a64_narrow`) is moved at the storage's width and converted beside it, as LLVM's own `load`
-// and `store` of it would be.
-private emit_a64_access(e: *Emit, i: Inst)
+// **An ordinary load or store inside a `@packed` struct's storage is at no boundary** (`align 1`): a
+// field sits at its declared offset and the struct itself needs no alignment
+// (`reference/attributes.md § @packed`), so a `u32` field is very often not on a word -- and LLVM, told
+// nothing, assumes it is, which an ARMv6-M core (an M0+) faults on. An address is such storage where it
+// was reached by stepping into a packed struct, or from such an address; one loaded from memory (a
+// `*T`) is not. A volatile access keeps its own width (`emit_plain_access`).
+private packed_aligned(e: *Emit, i: Inst) -> Inst = i match
+    InGep(d, ty, p, _) ->
+        if packed_step(e, ty, p) then note_packed(e, d)
+        i
+    InGepInBounds(d, ty, p, _) ->
+        if packed_step(e, ty, p) then note_packed(e, d)
+        i
+    InLoad(d, ty, p, acc, None) if is_plain_access(acc) && in_packed(e, p) -> InLoad(d, ty, p, acc, Some(1))
+    InStore(ty, v, p, acc, None) if is_plain_access(acc) && in_packed(e, p) -> InStore(ty, v, p, acc, Some(1))
+    _ -> i
+
+// Whether a step from `p` over `ty` lands inside a packed struct's storage.
+private packed_step(e: *Emit, ty: LType, p: Val) -> bool
+    if in_packed(e, p) then return true
+
+    ty match
+        LPackedStruct(_) -> true
+        LNamed(n) -> e.struct_decls.get(n) match
+            Some(d) -> d.packed
+            None -> false
+        _ -> false
+end packed_step
+
+private note_packed(e: *Emit, d: Val) = d match
+    VReg(n) ->
+        e.packed_ptrs.add(n)
+        ()
+    _ -> ()
+
+private in_packed(e: *Emit, p: Val) -> bool = p match
+    VReg(n) -> e.packed_ptrs.has(n)
+    _ -> false
+
+// On AArch64 and on 32-bit ARM (`arm`), a volatile load or store that one plain instruction can make is
+// marked to be written as that instruction (`AccVolatileA64`, `AccVolatileArm`): one `ldr` or `str` of
+// its declared width from a bare register address, never written back to the register, paired, made
+// one of a multiple, merged or split. An integer narrower than its storage (`a64_narrow`) is moved at
+// the storage's width and converted beside it, as LLVM's own `load` and `store` of it would be.
+private emit_plain_access(e: *Emit, i: Inst, arm: bool)
+    val acc = if arm then AccVolatileArm else AccVolatileA64
+
+    if emit_plain_aggregate(e, i) then return
+    if arm && emit_arm_words(e, i) then return
+
     i match
-        InLoad(d, ty, p, AccVolatile, align) if a64_volatile_bytes(ty, align).is_some() ->
-            val bytes = a64_volatile_bytes(ty, align).unwrap()
+        InLoad(d, ty, p, AccVolatile, align) if plain_fits(ty, align, arm).is_some() ->
+            val bytes = plain_fits(ty, align, arm).unwrap()
 
             if a64_narrow(ty, bytes)
                 val wide = fresh_reg(e)
 
-                e.current.push(InLoad(wide, LInt(bytes * 8), p, AccVolatileA64, align))
+                e.current.push(InLoad(wide, LInt(bytes * 8), p, acc, align))
                 e.current.push(InCast(d, CastTrunc, LInt(bytes * 8), wide, ty))
             else
-                e.current.push(InLoad(d, ty, p, AccVolatileA64, align))
-        InStore(ty, v, p, AccVolatile, align) if a64_volatile_bytes(ty, align).is_some() ->
-            val bytes = a64_volatile_bytes(ty, align).unwrap()
+                e.current.push(InLoad(d, ty, p, acc, align))
+        InStore(ty, v, p, AccVolatile, align) if plain_fits(ty, align, arm).is_some() ->
+            val bytes = plain_fits(ty, align, arm).unwrap()
 
             if a64_narrow(ty, bytes)
                 val wide = fresh_reg(e)
 
                 e.current.push(InCast(wide, CastZExt, ty, v, LInt(bytes * 8)))
-                e.current.push(InStore(LInt(bytes * 8), wide, p, AccVolatileA64, align))
+                e.current.push(InStore(LInt(bytes * 8), wide, p, acc, align))
             else
-                e.current.push(InStore(ty, v, p, AccVolatileA64, align))
+                e.current.push(InStore(ty, v, p, acc, align))
         _ -> e.current.push(i)
-end emit_a64_access
+end emit_plain_access
+
+private plain_fits(ty: LType, align: Option[int], arm: bool) -> Option[int] =
+    if arm then arm_volatile_bytes(ty, align) else a64_volatile_bytes(ty, align)
+
+// On 32-bit ARM a volatile wider than a word (`arm_volatile_words`: a `u64`, an `f64`, a `u128`) is made
+// as one plain `ldr` or `str` of each 32-bit word, the lowest address first: separate accesses, neither
+// atomic nor one bus transaction. A load gathers the words into the integer of the whole width (a float
+// is that integer reinterpreted); a store takes each word out of it. Answers whether `i` was such an
+// access, and is now emitted.
+private emit_arm_words(e: *Emit, i: Inst) -> bool
+    i match
+        InLoad(d, ty, p, AccVolatile, align) if arm_volatile_words(ty, align).is_some() ->
+            val n = arm_volatile_words(ty, align).unwrap()
+            val whole = LInt(n * 32)
+            val is_float = ty match
+                LFloat(_, _) -> true
+                _ -> false
+
+            var acc = VUndef
+
+            for k in 0..<n
+                val word = fresh_reg(e)
+                val wide = fresh_reg(e)
+
+                e.current.push(InLoad(word, LInt(32), arm_word_at(e, p, k), AccVolatileArm, None))
+                e.current.push(InCast(wide, CastZExt, LInt(32), word, whole))
+
+                if k == 0
+                    acc = wide
+                else
+                    val moved = fresh_reg(e)
+                    val joined = if k == n - 1 && !is_float then d else fresh_reg(e)
+
+                    e.current.push(InBin(moved, OpShl, whole, wide, VInt(from_int(long(32 * k)))))
+                    e.current.push(InBin(joined, OpOr, whole, acc, moved))
+                    acc = joined
+
+            if is_float then e.current.push(InCast(d, CastBitCast, whole, acc, ty))
+
+            true
+        InStore(ty, v, p, AccVolatile, align) if arm_volatile_words(ty, align).is_some() ->
+            val n = arm_volatile_words(ty, align).unwrap()
+            val whole = LInt(n * 32)
+            var bits = v
+
+            ty match
+                LFloat(_, _) ->
+                    bits = fresh_reg(e)
+                    e.current.push(InCast(bits, CastBitCast, ty, v, whole))
+                _ -> ()
+
+            for k in 0..<n
+                var from = bits
+
+                if k > 0
+                    from = fresh_reg(e)
+                    e.current.push(InBin(from, OpLShr, whole, bits, VInt(from_int(long(32 * k)))))
+
+                val word = fresh_reg(e)
+
+                e.current.push(InCast(word, CastTrunc, whole, from, LInt(32)))
+                e.current.push(InStore(LInt(32), word, arm_word_at(e, p, k), AccVolatileArm, None))
+
+            true
+        _ -> false
+end emit_arm_words
+
+// **A volatile access to a whole aggregate is made one part at a time, lowest address first**, each part
+// as the volatile access of its own type -- one plain `ldr`/`str` where one moves it (`emit`). A copy of a
+// whole register block (`var u = *regs`), a block stored whole (`*regs = Uart(1, 2, 3)`) and a register
+// changed `with` new fields are such accesses; LLVM's own `load volatile` of the aggregate splits it as it
+// likes, into an `ldrd`, an offset `ldr`, the fields in any order, or a 32-bit register's four bytes
+// where it cannot see the boundary. Answers whether `i` was such an access, and is now emitted.
+private emit_plain_aggregate(e: *Emit, i: Inst) -> bool
+    i match
+        InLoad(d, ty, p, AccVolatile, align) if aggregate_parts(e, ty, align).is_some() ->
+            val parts = aggregate_parts(e, ty, align).unwrap()
+            var acc = VUndef
+
+            for k in 0..<int(parts.len())
+                val part = fresh_reg(e)
+                val joined = if k == int(parts.len()) - 1 then d else fresh_reg(e)
+                var at: Buf[int] = buf()
+
+                at.push(k)
+                emit(e, InLoad(part, parts[k].0, aggregate_part_at(e, ty, p, k), AccVolatile, parts[k].1))
+                e.current.push(InInsert(joined, ty, acc, parts[k].0, part, at))
+                acc = joined
+
+            true
+        InStore(ty, v, p, AccVolatile, align) if aggregate_parts(e, ty, align).is_some() ->
+            val parts = aggregate_parts(e, ty, align).unwrap()
+
+            for k in 0..<int(parts.len())
+                val part = fresh_reg(e)
+                var at: Buf[int] = buf()
+
+                at.push(k)
+                e.current.push(InExtract(part, ty, v, at))
+                emit(e, InStore(parts[k].0, part, aggregate_part_at(e, ty, p, k), AccVolatile, parts[k].1))
+
+            true
+        _ -> false
+end emit_plain_aggregate
+
+// The parts of an aggregate `ty` in address order, each with the boundary an access to it may assume
+// (`None` for its type's own), or `None` where `ty` is not an aggregate this can take apart: only a
+// program's struct (by its LLVM name) and an array are. **An anonymous aggregate is never taken apart**
+// -- a string or a view (`emit_str.sysl` alone reads past its first word), a trait object, a tuple -- so
+// one held in a register block is moved whole, as LLVM's volatile access of it. A part of a
+// `@packed` struct with more than one is assumed at no boundary at all; the one integer a bitfield
+// register is, is moved at its own width and boundary, exactly as an access to one of its fields is
+// (`reference/attributes.md`: never narrowed).
+private aggregate_parts(e: *Emit, ty: LType, align: Option[int]) -> Option[Buf[(LType, Option[int])]]
+    var out: Buf[(LType, Option[int])] = buf()
+
+    ty match
+        LNamed(n) ->
+            val decl = e.struct_decls.get(n)
+
+            if decl.is_none() then return None
+
+            val d = decl.unwrap()
+            val def = struct_type_def(d, e.layout)
+
+            if def.is_none() then return None
+
+            val fields = def.unwrap().fields
+            val each = if !def.unwrap().packed || fields.len() == 1 then align else Some(1)
+
+            for f in fields
+                out.push((f, each))
+        LArr(n, elem) ->
+            for k in 0..<n
+                out.push((*elem, align))
+        _ -> return None
+
+    if out.is_empty() then None else Some(out)
+end aggregate_parts
+
+// The address of part `k` of the aggregate `ty` at `p`.
+private aggregate_part_at(e: *Emit, ty: LType, p: Val, k: int) -> Val
+    if k == 0 then return p
+
+    val r = fresh_reg(e)
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(32), VInt(from_int(0))))
+    idx.push(ir_arg(LInt(32), VInt(from_int(long(k)))))
+    e.current.push(InGep(r, ty, p, idx))
+    r
+end aggregate_part_at
+
+// The address of the `k`th 32-bit word from `p`.
+private arm_word_at(e: *Emit, p: Val, k: int) -> Val
+    if k == 0 then return p
+
+    val r = fresh_reg(e)
+    var idx: Buf[IrArg] = buf()
+
+    idx.push(ir_arg(LInt(32), VInt(from_int(long(4 * k)))))
+    e.current.push(InGep(r, LInt(8), p, idx))
+    r
+end arm_word_at
 
 // Emits a stack slot into the function's entry block rather than where it is needed. Every name is
 // unique within a function, so hoisting is safe -- and it keeps a slot inside a loop from growing
@@ -945,6 +1168,13 @@ slot_align(e: *Emit, ty: LType) -> Option[int] = ty match
     LNamed(n) -> e.raised_types.get(n)
     LArr(_, elem) -> slot_align(e, *elem)
     _ -> None
+
+// Records every struct of the program under the name LLVM knows it by (`Emit.struct_decls`).
+note_struct_decls(e: *Emit, p: TProgram)
+    for item in p.structs
+        item match
+            Struct(d) -> e.struct_decls.put(l_render(struct_lty(d)), d)
+            _ -> ()
 
 // Records the boundary of every struct and data enum of the program that holds a raised
 // `@align(n)`, under the name LLVM knows it by.
