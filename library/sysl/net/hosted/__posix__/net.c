@@ -452,7 +452,7 @@ int sysl_net_posix_close(int fd) {
 
 /* The level and name of option `k` of the flags `sysl_net_posix_option` sets: 0 `TCP_NODELAY`,
  * 1 `SO_REUSEPORT`, 2 `SO_KEEPALIVE`, 3 the keepalive idle time, 4 its probe interval, 5 its probe
- * count. **The idle time is `TCP_KEEPALIVE` on Darwin and `TCP_KEEPIDLE` everywhere else**; the other
+ * count, 6 `IPV6_V6ONLY`. **The idle time is `TCP_KEEPALIVE` on Darwin and `TCP_KEEPIDLE` everywhere else**; the other
  * two are `TCP_KEEPINTVL` and `TCP_KEEPCNT` on both. Answers 0 where the platform has no such option.
  */
 static int flag_option(int k, int *level, int *name) {
@@ -473,8 +473,23 @@ static int flag_option(int k, int *level, int *name) {
 #ifdef TCP_KEEPCNT
     case 5: *level = IPPROTO_TCP; *name = TCP_KEEPCNT; return 1;
 #endif
+#ifdef IPV6_V6ONLY
+    case 6: *level = IPPROTO_IPV6; *name = IPV6_V6ONLY; return 1;
+#endif
     default: return 0;
     }
+}
+
+/* Zero if `fd` is an IPv6 socket, else the errno to answer (`EBADF` for a closed one). `IPV6_V6ONLY` on an IPv4 one is `ENOPROTOOPT` on Linux and `EINVAL`
+ * on Darwin, so it is asked here and refused with one code (`EINVAL`) on both.
+ */
+static int not_v6_socket(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t n = sizeof ss;
+
+    memset(&ss, 0, sizeof ss);
+    if (getsockname(fd, (struct sockaddr *) &ss, &n) != 0) return failed(fd);
+    return ss.ss_family == AF_INET6 ? 0 : EINVAL;
 }
 
 /* A timeout in milliseconds (`which` 0 for receiving, 1 for sending; zero is none), the address
@@ -532,16 +547,23 @@ int sysl_net_posix_option(int fd, int which, long long value) {
 
     /* The TCP and socket flags, numbered as `sysl.net.sys` numbers them: `TCP_NODELAY` (8),
      * `SO_REUSEPORT` (9), `SO_KEEPALIVE` (10), and the keepalive idle time (11, seconds), probe
-     * interval (12, seconds) and probe count (13). A platform without the option answers `ENOTSUP`.
+     * interval (12, seconds) and probe count (13), and `IPV6_V6ONLY` (20). A platform without the
+     * option answers `ENOTSUP`; `IPV6_V6ONLY` on a socket that is not IPv6 answers `EINVAL`.
      */
-    if (which >= 8 && which <= 13) {
+    if ((which >= 8 && which <= 13) || which == 20) {
         int level = 0, name = 0;
+        int k = which == 20 ? 6 : which - 8;
 
-        if (!flag_option(which - 8, &level, &name)) return ENOTSUP;
+        if (!flag_option(k, &level, &name)) return ENOTSUP;
+        if (k == 6) {
+            int bad = not_v6_socket(fd);
+
+            if (bad) return bad;
+        }
 
         int v;
 
-        if (which <= 10)
+        if (which <= 10 || which == 20)
             v = value ? 1 : 0;
         else {
             if (value <= 0 || value > 2147483647LL) return EINVAL;
@@ -555,20 +577,25 @@ int sysl_net_posix_option(int fd, int which, long long value) {
     return EINVAL;
 }
 
-/* A flag or a count read back (`which` 0 to 5, as `which` 8 to 13 of `sysl_net_posix_option`). A
+/* A flag or a count read back (`which` 0 to 6, as `which` 8 to 13 and 20 of `sysl_net_posix_option`). A
  * flag is 0 or 1.
  */
 int sysl_net_posix_flag(int fd, int which, long long *out) {
     int level = 0, name = 0;
 
     if (!flag_option(which, &level, &name)) return ENOTSUP;
+    if (which == 6) {
+        int bad = not_v6_socket(fd);
+
+        if (bad) return bad;
+    }
 
     int got = 0;
     socklen_t n = sizeof got;
 
     if (getsockopt(fd, level, name, &got, &n) != 0) return failed(fd);
 
-    *out = which <= 2 ? (got != 0) : got;
+    *out = which <= 2 || which == 6 ? (got != 0) : got;
     return 0;
 }
 

@@ -139,6 +139,105 @@ reuse_port_shares_a_port()
     second.close().unwrap()
     first.close().unwrap()
 
+// ## IPV6_V6ONLY
+
+private v6_any(port: u16) -> Address = ipv6([0, 0, 0, 0, 0, 0, 0, 0], port)
+
+// A machine with no IPv6 stack cannot make the socket; those cells then have nothing to say.
+private v6_socket() -> Option[Socket]
+    socket(v6_any(0)) match
+        Ok(s) -> Some(s)
+        Err(_) -> None
+
+@test("v6_only is dual-stack by default, then read back as set, on a TCP socket and on a UDP one")
+v6_only_round_trip()
+    v6_socket() match
+        None -> return
+        Some(s) ->
+            assert_eq(s.v6_only().unwrap(), false)
+            s.set_v6_only().unwrap()
+            assert_eq(s.v6_only().unwrap(), true)
+            s.set_v6_only(false).unwrap()
+            assert_eq(s.v6_only().unwrap(), false)
+            s.close().unwrap()
+
+    val u = udp_socket(v6_any(0)).unwrap()
+
+    assert_eq(u.v6_only().unwrap(), false)
+    u.set_v6_only().unwrap()
+    assert_eq(u.v6_only().unwrap(), true)
+    u.close().unwrap()
+
+@test("without v6_only a listener on :: takes the port from one on 0.0.0.0, and with it both bind")
+v6_only_lets_two_listeners_share_a_port()
+    v6_socket() match
+        None -> return
+        Some(first) ->
+            // Dual-stack: `::` holds the IPv4 side of the port too, so the IPv4 listener is refused.
+            first.bind(v6_any(0)).unwrap()
+            first.listen().unwrap()
+
+            val port = u16(first.local().unwrap().port())
+            val v4 = socket(ipv4(0, 0, 0, 0, port)).unwrap()
+
+            assert(v4.bind(ipv4(0, 0, 0, 0, port)).is_err(), "0.0.0.0 bound beside a dual-stack ::")
+            v4.close().unwrap()
+            first.close().unwrap()
+
+    val a = socket(v6_any(0)).unwrap()
+
+    a.set_v6_only().unwrap()
+    a.bind(v6_any(0)).unwrap()
+    a.listen().unwrap()
+
+    val port = u16(a.local().unwrap().port())
+    val b = socket(ipv4(0, 0, 0, 0, port)).unwrap()
+
+    b.bind(ipv4(0, 0, 0, 0, port)).unwrap()
+    b.listen().unwrap()
+    b.close().unwrap()
+    a.close().unwrap()
+
+@test("the same holds for two UDP sockets")
+v6_only_lets_two_datagram_sockets_share_a_port()
+    val a = udp_socket(v6_any(0)).unwrap()
+
+    a.set_v6_only().unwrap()
+    a.bind(v6_any(0)).unwrap()
+
+    val port = u16(a.local().unwrap().port())
+    val b = udp_socket(ipv4(0, 0, 0, 0, port)).unwrap()
+
+    b.bind(ipv4(0, 0, 0, 0, port)).unwrap()
+    b.close().unwrap()
+    a.close().unwrap()
+
+@test("v6_only on an IPv4 socket is refused, set or read, TCP or UDP")
+v6_only_refuses_an_ipv4_socket()
+    val s = socket(ipv4(127, 0, 0, 1, 0)).unwrap()
+
+    assert(s.set_v6_only().is_err(), "set on IPv4 TCP")
+    assert(s.v6_only().is_err(), "read on IPv4 TCP")
+    s.close().unwrap()
+
+    val u = udp_socket(ipv4(127, 0, 0, 1, 0)).unwrap()
+
+    assert(u.set_v6_only().is_err(), "set on IPv4 UDP")
+    assert(u.v6_only().is_err(), "read on IPv4 UDP")
+    u.close().unwrap()
+
+// The system decides what a bound socket may do: Darwin and Linux both refuse the change, with
+// different codes, and the setting stays as it was.
+@test("v6_only set after bind is refused and leaves the setting as it was")
+v6_only_after_bind()
+    v6_socket() match
+        None -> return
+        Some(s) ->
+            s.bind(v6_any(0)).unwrap()
+            assert(s.set_v6_only().is_err(), "changed after bind")
+            assert_eq(s.v6_only().unwrap(), false)
+            s.close().unwrap()
+
 @test("every option on a closed socket answers NotOpen")
 options_on_a_closed_socket()
     val (c, a) = pair()
@@ -158,6 +257,8 @@ options_on_a_closed_socket()
     assert_eq(c.keepalive_interval(), Err(NotOpen))
     assert_eq(c.set_keepalive_count(5), Err(NotOpen))
     assert_eq(c.keepalive_count(), Err(NotOpen))
+    assert_eq(c.set_v6_only(), Err(NotOpen))
+    assert_eq(c.v6_only(), Err(NotOpen))
 
 // ## Receivers
 
