@@ -268,6 +268,7 @@ vlt_is_passed_by_value() =
 //
 // The point of the whole exercise: storage that costs nothing to reach and nothing to set up.
 
+// guards: a val is a constant global in the object, no initializing code
 @test("a 'val' is laid into the object file as a constant global, with no code to initialize it")
 vlt_laid_as_a_constant_global()
     if !vlt_ready() then return
@@ -275,6 +276,7 @@ vlt_laid_as_a_constant_global()
     vlt_has(vlt_ir("static val k: [3]u32 = [7, 8, 9]\nprint(k[0].to_string())"),
             "@k = private constant [3 x i32] [i32 7, i32 8, i32 9]")
 
+// guards: repeat in a val is written out, a global has no loop
 @test("a 'val' is laid down with a repeat written out, since a global has no loop to run")
 vlt_laid_with_a_repeat_written_out()
     if !vlt_ready() then return
@@ -285,6 +287,7 @@ vlt_laid_with_a_repeat_written_out()
 // A narrow float has to be rounded where the constant is written, there being no `fptrunc` to run
 // before the program starts -- and LLVM refuses a hex constant a `float` cannot hold, so the f64
 // bits of `0.1` (0x3FB999999999999A) would not merely be imprecise, it would not build.
+// guards: narrow float val is rounded to its own width in the object
 @test("a 'val' is laid down with a narrow float rounded to its own width, not to a double's")
 vlt_laid_with_a_narrow_float_rounded()
     if !vlt_ready() then return
@@ -302,6 +305,7 @@ vlt_an_element_is_a_gep_from_the_global()
 
 // A struct is fields laid side by side, so it is a constant tree exactly when its fields are -- the
 // same rule the array above follows.
+// guards: a struct val is laid down field by field, no prologue stores
 @test("a 'val' is laid down as a struct constant, field by field, rather than stores a prologue makes")
 vlt_laid_as_a_struct_constant()
     if !vlt_ready() then return
@@ -311,6 +315,7 @@ vlt_laid_as_a_struct_constant()
     vlt_has(out, "@p = private constant %struct.Pair { i32 1, i32 2 }")
     vlt_has_not(out, "@p = private global")
 
+// guards: a table-of-structs val is constant data, like a driver's device list
 @test("and a 'val' is a table of structs, which is the shape a driver's device list has")
 vlt_laid_as_a_table_of_structs()
     if !vlt_ready() then return
@@ -321,6 +326,7 @@ vlt_laid_as_a_table_of_structs()
 
 // The other side of the line, which is what keeps the arm above from being vacuous: one field that
 // has to be computed makes the whole struct code, and the storage writable again.
+// guards: a struct val with one computed field is computed storage
 @test("while a struct 'val' with one computed field is a computed 'val' like any other")
 vlt_one_computed_field_is_computed()
     if !vlt_ready() then return
@@ -341,6 +347,7 @@ vlt_one_computed_field_is_computed()
 vlt_a_string_is_read_by_name() =
     vlt_prints("static val greeting: string = \"hello\"\nprint(greeting)", "hello\n")
 
+// guards: string val is three words with a null owner, in the object
 @test("a string 'val' is three words with a null owner, laid straight into the object file")
 vlt_a_string_is_three_words_with_a_null_owner()
     if !vlt_ready() then return
@@ -398,6 +405,7 @@ vlt_strings_in_a_no_alloc_module() =
 // A constant expression is written out in full rather than built, so every shape that can nest
 // inside another has to be spelled correctly at every depth.
 
+// guards: a constant tree nests a struct inside a struct
 @test("a constant tree nests a struct inside a struct")
 vlt_nests_a_struct_inside_a_struct()
     if !vlt_ready() then return
@@ -406,6 +414,7 @@ vlt_nests_a_struct_inside_a_struct()
                    "end Outer\nstatic val o: Outer = Outer(Inner(1, 2), 3)\nprint(o.i.b.to_string())"),
             "@o = private constant %struct.Outer { %struct.Inner { i32 1, i32 2 }, i32 3 }")
 
+// guards: a constant tree nests an array inside a struct
 @test("a constant tree nests an array inside a struct")
 vlt_nests_an_array_inside_a_struct()
     if !vlt_ready() then return
@@ -414,6 +423,7 @@ vlt_nests_an_array_inside_a_struct()
                    "print(s.xs[1].to_string())"),
             "@s = private constant %struct.S { [2 x i32] [i32 4, i32 5], i32 6 }")
 
+// guards: constant tree holds a bool and a narrow float at their widths
 @test("a constant tree holds a bool and a narrow float in one, each at its own width")
 vlt_nests_a_bool_and_a_narrow_float()
     if !vlt_ready() then return
@@ -425,6 +435,7 @@ vlt_nests_a_bool_and_a_narrow_float()
 // A pointer written as a number is an `inttoptr`, which is itself a constant expression -- so it
 // nests inside a struct constant the same way a number does. This is the driver's register block
 // with its own name beside it.
+// guards: a constant tree holds a datasheet address inside a struct
 @test("a constant tree holds an address the datasheet gives, inside a struct beside its name")
 vlt_nests_a_datasheet_address()
     if !vlt_ready() then return
@@ -487,6 +498,7 @@ vlt_a_literal_handed_to_the_heap() =
 // itself. A field over a constant is converted while compiling, so an in-range one is laid down as
 // data and an out-of-range one is a compile error; a field over a computed value is filled at
 // startup, and its check runs there. The load-bearing assertion is the computed out-of-range one.
+// guards: a computed constrained field is filled by code so its check runs
 @test("a struct 'val' with a constrained field is filled by code, so the field's check still runs")
 vlt_a_constrained_field_is_filled_by_code()
     if !vlt_ready() then return
@@ -499,6 +511,7 @@ vlt_a_constrained_field_is_filled_by_code()
     vlt_has_not(out, "@p = private constant")
     assert(vlt_exits(computed + "static val p: P = P(years(100))\nprint(p.age)"))
 
+// guards: a constant constrained field is compile-time checked, laid down as data
 @test("a struct 'val' whose constrained field is a constant is checked while compiling")
 vlt_a_constant_constrained_field_is_checked_at_compile_time()
     if !vlt_ready() then return

@@ -294,6 +294,7 @@ xrc_bitwise_compound_assignment()
 // -- declarations ----------------------------------------------------------------------------------
 
 // `zeroext` on the `bool` argument and on the `u8` result; the `i32` and the `double` take nothing.
+// guards: a called extern is declared with its lowered C signature
 @test("a called extern is declared with its lowered signature")
 xrc_declared_with_lowered_signature()
     if xvr_no_library() then return
@@ -302,6 +303,7 @@ xrc_declared_with_lowered_signature()
 
     assert(out.contains("declare zeroext i8 @f(i32, double, i1 zeroext)"), out)
 
+// guards: an extern with no result is declared void
 @test("no result at all is declared void")
 xrc_no_result_declared_void()
     if xvr_no_library() then return
@@ -310,6 +312,7 @@ xrc_no_result_declared_void()
 
     assert(out.contains("declare void @f()"), out)
 
+// guards: a never extern result is declared void
 @test("a 'never' result is declared void too, since nothing comes back")
 xrc_never_declared_void()
     if xvr_no_library() then return
@@ -319,6 +322,7 @@ xrc_never_declared_void()
     assert(out.contains("declare void @stop(i32)"), out)
 
 // A view is three words, more than AAPCS64 puts in registers, so it crosses by address.
+// guards: externs take pointers as ptr, views as the ABI passes aggregates
 @test("a pointer lowers as it does everywhere else, and a view as the ABI passes an aggregate")
 xrc_pointer_and_view_cross()
     if xvr_no_library() then return
@@ -352,6 +356,7 @@ xrc_extern_declared_once()
     assert_eq(xrc_declares(out, "f"), 1)
 
 // The runtime declares `malloc` for its own use, so the extern defers to that declaration.
+// guards: an extern does not redeclare a runtime-declared name
 @test("an extern does not redeclare a name the runtime already declared")
 xrc_extern_defers_to_runtime()
     if xvr_no_library() then return
@@ -364,6 +369,7 @@ xrc_extern_defers_to_runtime()
 
 // -- a link name -----------------------------------------------------------------------------------
 
+// guards: an extern with a link name declares and calls the C symbol
 @test("declares and calls the symbol, not the sysl name")
 xrc_link_name_symbol()
     if xvr_no_library() then return
@@ -374,6 +380,7 @@ xrc_link_name_symbol()
     assert(out.contains("call void @abort()"), out)
     assert(!out.contains("@stop"), out)
 
+// guards: an extern link name carries the ellipsis to the symbol
 @test("carries the ellipsis to the symbol as well")
 xrc_link_name_ellipsis()
     if xvr_no_library() then return
@@ -385,6 +392,7 @@ xrc_link_name_ellipsis()
     assert(!out.contains("@say"), out)
 
 // The library reaches `snprintf` under a name of its own, so a program may still declare it.
+// guards: two extern declarations may share one C symbol
 @test("lets two declarations share one symbol")
 xrc_two_declarations_one_symbol()
     if xvr_no_library() then return
@@ -411,6 +419,7 @@ xrc_link_name_rejected()
 end xrc_link_name_rejected
 
 // `_`, `$` and `.` are what LLVM's unquoted identifier admits, so the name goes through as written.
+// guards: an extern link name may hold every linker-symbol character
 @test("may hold every character a linker symbol may hold, unquoted")
 xrc_link_name_characters()
     if xvr_no_library() then return
@@ -423,6 +432,7 @@ xrc_link_name_characters()
 
 // -- variadic --------------------------------------------------------------------------------------
 
+// guards: a variadic extern's declaration carries the ellipsis
 @test("the declaration carries the ellipsis")
 xrc_variadic_declaration()
     if xvr_no_library() then return
@@ -448,6 +458,7 @@ xrc_variadic_no_tail()
     assert(out.contains("call i32 (i32, ...) @f(i32 1)"), out)
 
 // An ordinary callee keeps the short form, so the ellipsis is what makes the difference.
+// guards: a non-variadic extern is called by result type alone
 @test("a non-variadic extern is still called by result type alone")
 xrc_non_variadic_short_form()
     if xvr_no_library() then return
@@ -457,6 +468,7 @@ xrc_non_variadic_short_form()
     assert(out.contains("call i32 @f(i32 1)"), out)
     assert(out.contains("declare i32 @f(i32)"), out)
 
+// guards: two variadic externs each get their own call signature
 @test("two variadic externs each get their own signature")
 xrc_two_variadics()
     if xvr_no_library() then return
@@ -468,6 +480,7 @@ xrc_two_variadics()
     assert(out.contains("declare void @f(i32, ...)"), out)
     assert(out.contains("declare i32 @g(ptr, ...)"), out)
 
+// guards: a raw pointer crosses an extern call as it stands
 @test("a raw pointer crosses as it stands")
 xrc_raw_pointer_crosses()
     if xvr_no_library() then return
@@ -477,6 +490,7 @@ xrc_raw_pointer_crosses()
     assert(out.contains("call void (i32, ...) @f(i32 1, ptr %x.addr)"), out)
 
 // `printf` is an ordinary foreign name: declared where a program asks for it, and nowhere else.
+// guards: printf is declared only by a program that declares it
 @test("printf is declared only by a program that declares it")
 xrc_printf_on_demand()
     if xvr_no_library() then return
@@ -491,6 +505,7 @@ xrc_printf_on_demand()
     assert(!plain.contains("@printf"), plain)
 end xrc_printf_on_demand
 
+// guards: declaring snprintf does not collide with the runtime's
 @test("declaring snprintf does not collide with the runtime's own either")
 xrc_snprintf_no_collision()
     if xvr_no_library() then return
@@ -501,6 +516,7 @@ xrc_snprintf_no_collision()
     assert_eq(xrc_declares(out, "snprintf"), 1)
     assert(out.contains("declare i32 @snprintf(ptr, i64, ptr, ...)"), out)
 
+// guards: a never-returning variadic extern call ends its block
 @test("a variadic that does not return still ends its block")
 xrc_variadic_never_ends_block()
     if xvr_no_library() then return
@@ -515,6 +531,7 @@ xrc_variadic_never_ends_block()
 
 // Three calls, two element types. Each ordinary entry has a place entry beside it (`unwrap`'s answer
 // is the payload a `match` binds), which is not counted.
+// guards: unwrap is monomorphized once per element type
 @test("unwrap is monomorphized once per element type, not once per call")
 xrc_unwrap_once_per_type()
     if xvr_no_library() then return
@@ -625,6 +642,7 @@ xrc_expect_stops_through_abort()
 
 // A bare machine has no `abort` to call: its panic stops through `exit(1)`, so that is what is
 // declared there, and every call is still to something stated.
+// guards: freestanding unwrap stops through a declared exit
 @test("on a freestanding target unwrap stops through exit, declared")
 xrc_freestanding_unwrap_stops_through_exit()
     if xvr_no_library() then return
@@ -638,6 +656,7 @@ xrc_freestanding_unwrap_stops_through_exit()
     assert_eq(xrc_unstated_callee(out), "")
 end xrc_freestanding_unwrap_stops_through_exit
 
+// guards: unwrap and expect are separate on-demand members
 @test("unwrap and expect are separate members, each on demand")
 xrc_unwrap_and_expect()
     if xvr_no_library() then return
@@ -659,6 +678,7 @@ xrc_forces_nothing()
 
 // -- a call that does not return -------------------------------------------------------------------
 
+// guards: a never-returning extern call ends its block unreachable
 @test("ends its block with unreachable")
 xrc_never_call_ends_block()
     if xvr_no_library() then return
@@ -669,6 +689,7 @@ xrc_never_call_ends_block()
     assert(out.contains("unreachable"), out)
 
 // The `ret` codegen would otherwise place is dropped: the block is already closed.
+// guards: a diverging function body needs no return
 @test("a function whose body diverges needs no return")
 xrc_diverging_body_no_return()
     if xvr_no_library() then return
@@ -679,6 +700,7 @@ xrc_diverging_body_no_return()
     assert(!out.contains("ret void\n}"), out)
 
 // A merge slot is a slot for a value, and `never` has none.
+// guards: an if whose branches diverge allocates no slot
 @test("an if whose branches both diverge allocates no slot")
 xrc_diverging_if_no_slot()
     if xvr_no_library() then return
@@ -688,6 +710,7 @@ xrc_diverging_if_no_slot()
     assert(!out.contains("alloca void"), out)
     assert(out.contains("define void @f$$sysl(i1 %c.param)"), out)
 
+// guards: a match whose arms diverge allocates no slot
 @test("a match whose arms all diverge allocates no slot")
 xrc_diverging_match_no_slot()
     if xvr_no_library() then return
@@ -697,6 +720,7 @@ xrc_diverging_match_no_slot()
 
     assert(!out.contains("alloca void"), out)
 
+// guards: a diverging branch stores nothing into the merge slot
 @test("a diverging branch stores nothing into the merge slot")
 xrc_diverging_branch_stores_nothing()
     if xvr_no_library() then return
@@ -708,6 +732,7 @@ xrc_diverging_branch_stores_nothing()
 
 // -- a merge nothing reaches -----------------------------------------------------------------------
 
+// guards: an all-returning if ends in unreachable, not a valueless ret
 @test("an all-returning if ends in unreachable, not a valueless ret")
 xrc_all_returning_if()
     if xvr_no_library() then return
@@ -719,6 +744,7 @@ xrc_all_returning_if()
     assert(out.contains("unreachable"), out)
     assert(!xrc_has_line(out, "ret i32"), out)
 
+// guards: an all-returning match ends in unreachable too
 @test("an all-returning match does too")
 xrc_all_returning_match()
     if xvr_no_library() then return
@@ -729,6 +755,7 @@ xrc_all_returning_match()
     assert(!xrc_has_line(out, "ret i32"), out)
     assert(out.contains("unreachable"), out)
 
+// guards: a loop whose break and else diverge ends unreachable
 @test("a loop whose break and else both diverge ends the same way")
 xrc_diverging_loop()
     if xvr_no_library() then return

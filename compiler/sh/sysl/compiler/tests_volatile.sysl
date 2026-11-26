@@ -202,6 +202,7 @@ private vo_counted(spelled: string) -> string =
 
 // -- a register block is a struct whose registers are qualified -------------------------------------
 
+// guards: reading a volatile register is a volatile load
 @test("reading one is a load marked volatile")
 vo_reading_one_is_a_volatile_load()
     if !vo_ready() then return
@@ -212,6 +213,7 @@ end vo_reading_one_is_a_volatile_load
 
 // The load-bearing half: lowering `regs.status` as "read the block, take field 0" would read the data
 // register as a side effect of looking at the status register, which on real hardware pops a FIFO.
+// guards: building a register block reads nothing from it
 @test("and the block itself is not read on the way to it")
 vo_the_block_is_not_read_on_the_way()
     if !vo_ready() then return
@@ -223,6 +225,7 @@ vo_the_block_is_not_read_on_the_way()
     assert(!vo_has(out, "extractvalue"))
 end vo_the_block_is_not_read_on_the_way
 
+// guards: writing a register is a volatile store
 @test("writing one is a store marked volatile")
 vo_writing_one_is_a_volatile_store()
     if !vo_ready() then return
@@ -233,6 +236,7 @@ end vo_writing_one_is_a_volatile_store
 
 // A reserved word or a shadow value in RAM sits in the middle of nearly every real block, and
 // qualifying per field rather than per struct is exactly what lets it stay ordinary.
+// guards: a non-volatile field keeps the ordinary store
 @test("while a field that is not a register keeps the ordinary instruction")
 vo_an_unqualified_field_keeps_the_ordinary_store()
     if !vo_ready() then return
@@ -243,6 +247,7 @@ vo_an_unqualified_field_keeps_the_ordinary_store()
     assert(!vo_has(out, "store volatile"))
 end vo_an_unqualified_field_keeps_the_ordinary_store
 
+// guards: a compound assignment on a register is one volatile read and write
 @test("a compound assignment is one volatile read and one volatile write")
 vo_a_compound_assignment_is_a_read_and_a_write()
     if !vo_ready() then return
@@ -253,6 +258,7 @@ vo_a_compound_assignment_is_a_read_and_a_write()
     assert(vo_has(out, "store volatile i32"))
 end vo_a_compound_assignment_is_a_read_and_a_write
 
+// guards: an increment of a register is volatile read and write
 @test("and so is an increment")
 vo_an_increment_is_a_read_and_a_write()
     if !vo_ready() then return
@@ -265,6 +271,7 @@ end vo_an_increment_is_a_read_and_a_write
 
 // -- a lone register is the pointee of a '*volatile T' ----------------------------------------------
 
+// guards: a read through * of a volatile pointer is volatile
 @test("read through the '*'")
 vo_read_through_the_star()
     if !vo_ready() then return
@@ -274,6 +281,7 @@ vo_read_through_the_star()
     assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
 end vo_read_through_the_star
 
+// guards: a read through a subscript of volatile storage is volatile
 @test("read through a subscript, which is the same address arrived at the other way")
 vo_read_through_a_subscript()
     if !vo_ready() then return
@@ -283,6 +291,7 @@ vo_read_through_a_subscript()
     assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile i32"))
 end vo_read_through_a_subscript
 
+// guards: a register is written volatile through either pointer spelling
 @test("written through either")
 vo_written_through_either()
     if !vo_ready() then return
@@ -295,6 +304,7 @@ end vo_written_through_either
 
 // The pointer is an ordinary value: what it *addresses* is a device, and copying the address touches
 // no device at all.
+// guards: a register-block pointer is itself read as an ordinary value
 @test("while the pointer holding the address is read like any other value")
 vo_the_pointer_itself_is_an_ordinary_value()
     if !vo_ready() then return
@@ -307,6 +317,7 @@ end vo_the_pointer_itself_is_an_ordinary_value
 
 // -- the qualifier travels with an address taken of a register --------------------------------------
 
+// guards: & of a volatile field is a *volatile pointer
 @test("'&' of a qualified field yields a '*volatile T'")
 vo_address_of_a_qualified_field()
     if !vo_ready() then return
@@ -317,6 +328,7 @@ end vo_address_of_a_qualified_field
 
 // Not that the spelling was accepted, but that every access through the result is still an access
 // to a register.
+// guards: reading through a volatile field address stays volatile
 @test("and reading through the result is still volatile")
 vo_reading_through_the_address_is_volatile()
     if !vo_ready() then return
@@ -328,6 +340,7 @@ end vo_reading_through_the_address_is_volatile
 
 // An address taken of ordinary storage is an ordinary address, so the qualifier is not something `&`
 // invents.
+// guards: & of a non-volatile field is an ordinary pointer
 @test("while '&' of an unqualified field yields an ordinary '*T'")
 vo_address_of_an_unqualified_field()
     if !vo_ready() then return
@@ -341,6 +354,7 @@ end vo_address_of_an_unqualified_field
 
 // The whole design in one test: if the qualifier survived the read, this binding would be a volatile
 // one and every mention of `s` below would be a volatile load of a stack slot.
+// guards: a volatile read binds to ordinary, non-volatile storage
 @test("so what it is bound to is ordinary storage")
 vo_a_read_is_bound_to_ordinary_storage()
     if !vo_ready() then return
@@ -352,6 +366,7 @@ vo_a_read_is_bound_to_ordinary_storage()
     assert(vo_has(out, "store i32"))
 end vo_a_read_is_bound_to_ordinary_storage
 
+// guards: a volatile read stands wherever an ordinary value is expected
 @test("and it stands where an ordinary value is asked for")
 vo_a_read_stands_where_a_value_is_asked_for()
     if !vo_ready() then return
@@ -416,6 +431,7 @@ end vo_a_float_literal_at_a_qualified_field
 
 // -- a bank of registers is an array of them --------------------------------------------------------
 
+// guards: indexing a register bank is a volatile load at the element
 @test("indexing one is a volatile load at the element")
 vo_indexing_a_bank_is_a_volatile_load()
     if !vo_ready() then return
@@ -426,6 +442,7 @@ vo_indexing_a_bank_is_a_volatile_load()
 end vo_indexing_a_bank_is_a_volatile_load
 
 // The qualifier changes the instruction and nothing about the rules around it.
+// guards: a register-bank index is bounds-checked like any array
 @test("and the index is checked, as it is for any other array")
 vo_a_bank_index_is_checked()
     if !vo_ready() then return
@@ -437,6 +454,7 @@ end vo_a_bank_index_is_checked
 
 // A view is three words that say where the elements are, so what it is a view *of* is still where
 // the qualifier lives.
+// guards: a view of registers indexes with volatile loads
 @test("and a view of registers indexes volatile too")
 vo_a_view_of_registers_indexes_volatile()
     if !vo_ready() then return
@@ -447,6 +465,7 @@ vo_a_view_of_registers_indexes_volatile()
 end vo_a_view_of_registers_indexes_volatile
 
 // `const` says this handle may not write, `volatile` says the elements are a device's.
+// guards: const composes with volatile views, loads stay volatile
 @test("and 'const' composes with it, being a property of the view rather than of the element")
 vo_const_composes_with_volatile()
     if !vo_ready() then return
@@ -458,6 +477,7 @@ end vo_const_composes_with_volatile
 
 // A copy of a whole register block reads every register in it, so the aggregate access is marked
 // too rather than being the one hole in the rule.
+// guards: copying a register block is a volatile access to every register
 @test("copying a whole block is an access to every register in it")
 vo_copying_a_whole_block_is_volatile()
     if !vo_ready() then return
@@ -589,6 +609,7 @@ end vo_refuses_a_data_enum
 
 // A simple enum is its underlying integer and nothing else, so reading one is the single load the
 // qualifier promises -- what a register's mode field wants to be declared as.
+// guards: a volatile field may be a simple enum
 @test("while a simple enum, which is one integer, is admitted")
 vo_admits_a_simple_enum()
     if !vo_ready() then return
@@ -613,6 +634,7 @@ vo_refuses_a_constrained_subtype()
 end vo_refuses_a_constrained_subtype
 
 // `new` alone changes a type's identity and promises nothing about which values it has.
+// guards: a volatile field may be a bare new derivation
 @test("while a bare 'new' derivation, which constrains no value, is admitted")
 vo_admits_a_bare_new_derivation()
     if !vo_ready() then return
@@ -633,6 +655,7 @@ end vo_refuses_writing_it_twice
 
 // -- a raw pointer may itself sit in device memory --------------------------------------------------
 
+// guards: volatile *T field is distinct from *volatile T
 @test("so 'volatile *T' is a field, distinct from '*volatile T'")
 vo_a_volatile_pointer_field()
     if !vo_ready() then return
@@ -643,6 +666,7 @@ vo_a_volatile_pointer_field()
     assert(vo_has(vo_define(vo_ir(src), "read"), "load volatile ptr"))
 end vo_a_volatile_pointer_field
 
+// guards: a volatile function-address field loads volatile
 @test("and so may the address of a function")
 vo_a_volatile_function_address()
     if !vo_ready() then return
@@ -746,6 +770,7 @@ private vo_driver() -> string =
 private vo_riscv(text: string) -> string =
     vo_ir_for(target_named("riscv64-freestanding").unwrap(), [("main.sysl", text)])
 
+// guards: a register block is constant data, readable before any code runs
 @test("the register block is readable before anything has run")
 vo_the_block_is_readable_before_anything_ran()
     if !vo_ready() then return
@@ -755,6 +780,7 @@ end vo_the_block_is_readable_before_anything_ran
 
 // The poll is the reason the qualifier exists: an unmarked load here is a loop that spins on the
 // value it saw first.
+// guards: a status poll loop issues volatile loads
 @test("the status poll is a volatile load inside the loop")
 vo_the_status_poll_is_volatile()
     if !vo_ready() then return
@@ -775,6 +801,7 @@ end vo_the_shadow_field_touches_no_device
 
 // A register block is a type like any other, so it may be declared in one module and driven from
 // another.
+// guards: a register block's volatility crosses a module boundary
 @test("a register block crosses a module boundary")
 vo_a_block_crosses_a_module_boundary()
     if !vo_ready() then return
@@ -807,6 +834,7 @@ vo_a_register_block_carries_no_invariant()
                   "register where it is read"))
 end vo_a_register_block_carries_no_invariant
 
+// guards: the same struct without the volatile clause is ordinary
 @test("while the same struct without the clause is ordinary")
 vo_the_same_struct_without_the_clause()
     if !vo_ready() then return
@@ -837,6 +865,7 @@ end vo_a_type_parameter_does_not_carry_the_qualifier
 // -- the edges of the rule --------------------------------------------------------------------------
 
 // The second occurrence is the one an optimizer would have folded into the first.
+// guards: reading a register twice is two volatile loads
 @test("reading one register twice is two loads")
 vo_reading_one_register_twice_is_two_loads()
     if !vo_ready() then return
@@ -847,6 +876,7 @@ vo_reading_one_register_twice_is_two_loads()
 end vo_reading_one_register_twice_is_two_loads
 
 // A built value touches nothing until it lands, and where it lands is the device.
+// guards: storing a built block whole is one volatile aggregate store
 @test("building a block and storing it whole is one volatile aggregate store")
 vo_storing_a_built_block_whole()
     if !vo_ready() then return
@@ -869,6 +899,7 @@ end vo_storing_a_built_block_whole
 
 // A zero-sized field takes no slot, so the field written third lands second -- and the marker has to
 // follow the field rather than the slot.
+// guards: a zero-sized field does not shift volatile onto its neighbour
 @test("a field that occupies nothing does not shift the qualifier onto its neighbour")
 vo_a_zero_sized_field_does_not_shift_the_qualifier()
     if !vo_ready() then return
@@ -899,6 +930,7 @@ end vo_a_qualified_instantiation_is_its_own_body
 
 // `ptr_cast` is how a device address is reached at all, so it is also the way between the two
 // pointer types.
+// guards: ptr_cast converts between *T and *volatile T
 @test("'ptr_cast' is what goes between a '*T' and a '*volatile T'")
 vo_ptr_cast_goes_between_the_two()
     if !vo_ready() then return
@@ -918,6 +950,7 @@ vo_one_pointer_is_not_the_other()
 end vo_one_pointer_is_not_the_other
 
 // A driver is exactly the code that runs where there is no allocator.
+// guards: a register driver module compiles under no_alloc keeping volatile stores
 @test("a driver module compiles under 'no alloc'")
 vo_a_driver_module_compiles_under_no_alloc()
     if !vo_ready() then return
@@ -983,6 +1016,7 @@ private vo_shcsr() -> string =
     "    _: volatile u14\n    memfaultena: volatile u1\n    busfaultena: volatile u1\n" +
     "    usgfaultena: volatile u1\n    _: volatile u13\n\nstruct Block\n    shcsr: Shcsr\n\n"
 
+// guards: with on a register is one volatile load and one volatile store
 @test("a register changed with 'with' is one volatile load and one volatile store, with nothing between")
 vo_a_register_changed_with_with()
     if !vo_ready() then return
@@ -995,6 +1029,7 @@ vo_a_register_changed_with_with()
     assert_eq(vo_count(body, "store volatile"), 1)
 end vo_a_register_changed_with_with
 
+// guards: a register changed from a constant with with is one volatile store
 @test("and a register written from a constant changed with 'with' is the one volatile store")
 vo_a_constant_changed_with_with()
     if !vo_ready() then return
@@ -1093,6 +1128,7 @@ vo_wide_u64_accepted()
     for m in vo_wide_machines
         assert(vo_has(vo_on(m, "@export(\"w\")\nw(p: *volatile u64) = *p = *p + 1\n"), "define"))
 
+// guards: a volatile u128 is LLVM's volatile access on x86_64 and riscv64
 @test("a volatile u128 is accepted on x86_64 and riscv64, and stays LLVM's volatile access")
 vo_wide_other_processors_keep_it()
     if !vo_ready() then return

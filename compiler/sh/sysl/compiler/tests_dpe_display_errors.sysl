@@ -127,6 +127,7 @@ private dpe_sized() -> string = raw"""
 
 // `library/core.md § Rendering to standard output`: the one rendering that builds no sink is the
 // one to emit, and a program that only prints numbers carries no method table at all.
+// guards: a printed scalar calls its renderer directly, no buffer
 @test("a printed scalar calls its renderer directly")
 dpe_a_printed_scalar_calls_its_renderer_directly()
     dpe_ir("print(5)\n") match
@@ -138,6 +139,7 @@ dpe_a_printed_scalar_calls_its_renderer_directly()
             assert(!main.contains("insertvalue { ptr, ptr }"), main)
 end dpe_a_printed_scalar_calls_its_renderer_directly
 
+// guards: printing only scalars carries no writer machinery
 @test("a program that prints only scalars carries no writer")
 dpe_a_program_that_prints_only_scalars_carries_no_writer()
     dpe_ir("print(5, \"a\", true)\n") match
@@ -148,6 +150,7 @@ dpe_a_program_that_prints_only_scalars_carries_no_writer()
             assert(!ir.contains("@sysl.w.buf.write"), ir)
 end dpe_a_program_that_prints_only_scalars_carries_no_writer
 
+// guards: str of a scalar renders without a buffer
 @test("str of a scalar still renders without a buffer")
 dpe_str_of_a_scalar_still_renders_without_a_buffer()
     dpe_ir("print((5).to_string())\n") match
@@ -163,6 +166,7 @@ end dpe_str_of_a_scalar_still_renders_without_a_buffer
 
 // The sink is a value the library hands out, so what `print` emits is a call to it -- the two
 // words it comes back as are assembled inside that function, never laid down by the compiler.
+// guards: a print step calls the library's routine, not compiler-laid words
 @test("is a call to the library's own, not two words the compiler laid down")
 dpe_is_a_call_to_the_librarys_own()
     dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
@@ -185,6 +189,7 @@ end dpe_hands_the_value_the_sink_and_the_specifier_to_display
 // The `write` a print ends in is a library function like any other, so the program carries a table
 // pointing at it rather than a body the compiler wrote. The table's line carries the type's
 // identity, a hash, in front of the slots, so what is asserted is the shape and the slot list.
+// guards: printing goes through a table at the library's Writer
 @test("through a table pointing at the library's own writer")
 dpe_through_a_table_pointing_at_the_librarys_own_writer()
     dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
@@ -198,6 +203,7 @@ end dpe_through_a_table_pointing_at_the_librarys_own_writer
 
 // A stack slot zeroed on arrival rather than once: an alloca is hoisted to the entry block, so a
 // render inside a loop meets the same slot every time round and has to start it empty.
+// guards: the render buffer is a zeroed stack slot, no heap
 @test("is a stack slot the render zeroes each time")
 dpe_is_a_stack_slot_the_render_zeroes_each_time()
     dpe_ir(dpe_point() + "print(Point(1, 2).to_string())\n") match
@@ -226,6 +232,7 @@ end dpe_turns_what_landed_there_into_a_string_the_statement_owns
 // puts the required trait's members first, so slot 0 is `failed` and slot 1 is `write`. The
 // buffer's table is laid out by hand and the sink's is derived from the library's `impl`, and the
 // two have to agree -- which is why both are checked here.
+// guards: the Writer table orders hold-failed before write
 @test("hold failed first and write second, the order the trait offers them")
 dpe_hold_failed_first_and_write_second()
     dpe_ir(dpe_point() + "print(Point(1, 2))\nprint(Point(3, 4).to_string())\n") match
@@ -246,6 +253,7 @@ dpe_are_emitted_once_however_many_values_render()
         Some(ir) -> assert_eq(dpe_lines_starting(ir, "@vt.sysl$Writer.sysl$Stdout ="), 1)
 end dpe_are_emitted_once_however_many_values_render
 
+// guards: printing only a user type carries no buffer writer
 @test("a program that only prints a user type carries no buffer")
 dpe_a_program_that_only_prints_a_user_type_carries_no_buffer()
     dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
@@ -260,6 +268,7 @@ end dpe_a_program_that_only_prints_a_user_type_carries_no_buffer
 // The symbol an integer's `display` lowers to is spelled by the compiler -- the blanket's members
 // are emitted per receiver -- so it has to carry the library's key, or a program declaring a trait
 // called `Integer` could collide with it.
+// guards: a render helper is emitted under the library's own key
 @test("is emitted under the library's key, wherever the family lives")
 dpe_is_emitted_under_the_librarys_key()
     dpe_ir(dpe_point() + "print(Point(1, 2))\n") match
@@ -311,6 +320,7 @@ end dpe_and_a_closed_family_still_reaches_the_renderer_its_own_impl_names
 
 // An ordinary erasure, so `write`'s `*self` lands in the slot with no adapter between; the required
 // trait's slot comes first, and `C.failed` is the DEFAULT `Fallible` supplied.
+// guards: a type's own impl goes straight into the trait table
 @test("puts its own implementation straight into the table")
 dpe_puts_its_own_implementation_straight_into_the_table()
     dpe_ir(dpe_sink() + "display_int(1, w, FormatSpec(0, -1, false))\n") match
@@ -322,6 +332,7 @@ end dpe_puts_its_own_implementation_straight_into_the_table
 
 // A gathered rendering reaches `sysl.str.concat`, and reaching it at all is the defect -- one string
 // per part plus one per separator, every one thrown away as soon as it is written.
+// guards: a derived Display writes its parts directly, no concatenation
 @test("a derived Display writes its parts straight through")
 dpe_a_derived_display_writes_its_parts_straight_through()
     dpe_ir(dpe_sized() + "print(Size(3, 4))\n") match
@@ -335,6 +346,7 @@ end dpe_a_derived_display_writes_its_parts_straight_through
 // A width is measured into `Counting`, which stores nothing, rather than gathered into a buffer.
 // The specifier is handed over directly: an f-string concatenates its own pieces, so it would put
 // `sysl.str.concat` in the output whatever the rendering did.
+// guards: a print width is measured, not gathered into a string
 @test("and a width is measured rather than gathered")
 dpe_and_a_width_is_measured_rather_than_gathered()
     dpe_ir(dpe_sized() + dpe_sink() + "Size(3, 4).display(w, FormatSpec(12, -1, false))\n") match
@@ -344,6 +356,7 @@ dpe_and_a_width_is_measured_rather_than_gathered()
             assert(ir.contains("@sysl$Counting.write"), ir)
 end dpe_and_a_width_is_measured_rather_than_gathered
 
+// guards: printing a tuple builds no intermediate string
 @test("a tuple builds none either, padded or not")
 dpe_a_tuple_builds_none_either_padded_or_not()
     val text = dpe_sink() + "(1, 2).display(w, FormatSpec(0, -1, false))\n" +
@@ -371,6 +384,7 @@ end dpe_and_a_shape_with_no_parts_gets_no_renderer
 // Nothing is refused for having no `Display`: the value prints through the `Debug` every type has,
 // the one the compiler supplies for a struct or an enum (`reference/traits.md § Every type has a
 // Debug`), and what is lowered is a call to that member with the sink and the specifier.
+// guards: a struct without Display prints through its Debug
 @test("a struct with no Display prints through its supplied Debug")
 dpe_a_struct_prints_through_its_debug()
     dpe_ir("struct Q\n    a: int\nprint(Q(1))\nprint(Q(2).to_string())\n") match
@@ -379,6 +393,7 @@ dpe_a_struct_prints_through_its_debug()
             assert(ir.contains("call void @Q.debug(%struct.Q "), ir)
             assert(ir.contains("define void @Q.debug("), ir)
 
+// guards: enums, references and arrays print through the direct path
 @test("so does an enum, a reference to one, and an array of them")
 dpe_an_enum_a_reference_and_an_array_print()
     dpe_ir("enum Colour\n    Red\nvar c: &Colour = Red\nvar a: [2]Colour = [Red, Red]\nprint(c, a)\n") match
@@ -391,6 +406,7 @@ dpe_a_pointer_prints_its_address()
         None -> ()
         Some(ir) -> assert(ir.contains("@sysl$debug_address("), ir)
 
+// guards: a trait object prints through its table's Debug slot
 @test("a trait object with no Display prints through the Debug slot its table carries")
 dpe_a_trait_object_prints_through_its_debug_slot()
     val text = raw"""

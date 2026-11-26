@@ -6,7 +6,7 @@ import sysl.buf.{Buf, buf}
 import sysl.posix.time.sleep
 import sysl.time.millis
 import sysl.fs.{IoError, executable, link_metadata, make_temp_dir, metadata, remove_dir_all}
-import sysl.fs.{set_link_owner, set_owner, set_permissions, space, symlink, write_text}
+import sysl.fs.{set_link_owner, set_owner, set_permissions, space, symlink, unchanged, write_text}
 import sysl.process.sys as psys
 import sysl.slices.as_mut_ptr
 import sysl.testing.skip
@@ -566,6 +566,163 @@ id_link_owner_to_root_is_refused()
         Ok(_) -> assert(false, "a file was given to root")
         Err(e) -> assert_eq(e, IoError.NotPermitted)
 end id_link_owner_to_root_is_refused
+
+/** A group of the program's own, other than `not` -- one `chgrp` an unprivileged program may make --
+ * or `unchanged` when it belongs to no other.
+ */
+private other_group(not: u32) -> u32
+    val out = capture("id", ["-G"]).unwrap()
+
+    assert(out.status.ok(), "id -G failed")
+
+    var found: u32 = unchanged
+    var n: u32 = 0
+    var digits = false
+
+    for b in out.text.bytes
+        if b >= u8('0') && b <= u8('9')
+            n = n * 10 + u32(b - u8('0'))
+            digits = true
+        else
+            if digits && n != not && found == unchanged then found = n
+
+            n = 0
+            digits = false
+
+    if digits && n != not && found == unchanged then found = n
+
+    found
+end other_group
+
+@test("unchanged is 4294967295, the (uid_t)-1 that chown(2) reads as no change")
+id_unchanged_is_minus_one()
+    assert_eq(unchanged, 0xFFFFFFFF)
+    assert_eq(unchanged, 4294967295)
+end id_unchanged_is_minus_one
+
+@test("set_owner with unchanged for the owner keeps the owner and sets the group")
+id_set_owner_unchanged_owner()
+    val dir = make_temp_dir("sysl-proc-unch").unwrap()
+    val path = s"$dir/f"
+
+    write_text(path, "x").unwrap()
+
+    val before = metadata(path).unwrap()
+    val other = other_group(before.group)
+
+    if other == unchanged
+        remove_dir_all(dir)
+        skip("the program has no group but the file's own")
+
+    set_owner(path, unchanged, other).unwrap()
+
+    val after = metadata(path).unwrap()
+
+    remove_dir_all(dir)
+    assert_eq(after.owner, before.owner)
+    assert_eq(after.group, other)
+end id_set_owner_unchanged_owner
+
+@test("set_owner with unchanged for the group keeps the group and sets the owner")
+id_set_owner_unchanged_group()
+    val dir = make_temp_dir("sysl-proc-unch").unwrap()
+    val path = s"$dir/f"
+
+    write_text(path, "x").unwrap()
+
+    val other = other_group(metadata(path).unwrap().group)
+
+    if other != unchanged then set_owner(path, user(), other).unwrap()
+
+    val before = metadata(path).unwrap()
+
+    set_owner(path, user(), unchanged).unwrap()
+
+    val after = metadata(path).unwrap()
+
+    remove_dir_all(dir)
+    assert_eq(after.owner, user())
+    assert_eq(after.group, before.group)
+end id_set_owner_unchanged_group
+
+@test("set_owner with unchanged for both changes nothing, and a missing path is still NotFound")
+id_set_owner_unchanged_both()
+    val dir = make_temp_dir("sysl-proc-unch").unwrap()
+    val path = s"$dir/f"
+
+    write_text(path, "x").unwrap()
+
+    val before = metadata(path).unwrap()
+
+    set_owner(path, unchanged, unchanged).unwrap()
+
+    val after = metadata(path).unwrap()
+    val missing = set_owner(s"$dir/missing", unchanged, unchanged)
+    val missing_link = set_link_owner(s"$dir/missing", unchanged, unchanged)
+
+    remove_dir_all(dir)
+    assert_eq(after.owner, before.owner)
+    assert_eq(after.group, before.group)
+    assert_eq(missing.unwrap_err(), IoError.NotFound)
+    assert_eq(missing_link.unwrap_err(), IoError.NotFound)
+end id_set_owner_unchanged_both
+
+@test("set_link_owner with unchanged for the owner sets the link's group and leaves the target alone")
+id_set_link_owner_unchanged_owner()
+    val dir = make_temp_dir("sysl-proc-unch").unwrap()
+    val path = s"$dir/f"
+    val link = s"$dir/l"
+
+    write_text(path, "x").unwrap()
+    symlink(path, link).unwrap()
+
+    val target = metadata(path).unwrap()
+    val before = link_metadata(link).unwrap()
+    val other = other_group(before.group)
+
+    if other == unchanged
+        remove_dir_all(dir)
+        skip("the program has no group but the file's own")
+
+    set_link_owner(link, unchanged, other).unwrap()
+
+    val after = link_metadata(link).unwrap()
+    val target_after = metadata(path).unwrap()
+
+    remove_dir_all(dir)
+    assert_eq(after.owner, before.owner)
+    assert_eq(after.group, other)
+    assert_eq(target_after.owner, target.owner)
+    assert_eq(target_after.group, target.group)
+end id_set_link_owner_unchanged_owner
+
+@test("set_link_owner with unchanged for the group sets the link's owner and keeps its group")
+id_set_link_owner_unchanged_group()
+    val dir = make_temp_dir("sysl-proc-unch").unwrap()
+    val path = s"$dir/f"
+    val link = s"$dir/l"
+
+    write_text(path, "x").unwrap()
+    symlink(path, link).unwrap()
+
+    val target = metadata(path).unwrap()
+    val other = other_group(target.group)
+
+    if other != unchanged then set_link_owner(link, user(), other).unwrap()
+
+    val before = link_metadata(link).unwrap()
+
+    set_link_owner(link, user(), unchanged).unwrap()
+
+    val after = link_metadata(link).unwrap()
+    val target_after = metadata(path).unwrap()
+
+    remove_dir_all(dir)
+    assert_eq(after.owner, user())
+    assert_eq(after.group, before.group)
+    assert_eq(target_after.owner, target.owner)
+    assert_eq(target_after.group, target.group)
+end id_set_link_owner_unchanged_group
 
 /** `df -P -k` prints the size in 1024-byte blocks in the format POSIX fixes, read off the same
  * `statvfs`, so the total agrees to the kilobyte -- a reading multiplied by `f_bsize` rather than
