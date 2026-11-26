@@ -246,6 +246,12 @@ buffer never given storage.
 The twins are written over two raw-tier forms, `try_slot_storage(n)` and `try_heap(v)`
 ([below](#slot-storage-room-that-holds-no-value-yet)); a program writes the twins.
 
+**An export can answer every refusal inside its call instead.** `@out_of_memory(value)` beside an
+`@export` turns an allocation refused anywhere the call reaches, a twin or not, into `value` for the
+export's C caller. Every frame in between is unwound by returning, its `defer`s, `errdefer`s and
+destructors run, and nothing it made stays allocated. That is the form for a library whose C API
+answers an out-of-memory status ([ffi](/reference/ffi/#an-export-that-answers-out-of-memory)).
+
 ### References compare through their referent
 
 **`==` and `!=` on two `&T`s (or two `&sync T`s) compare the objects as `T` does wherever `T` has an

@@ -1867,8 +1867,14 @@ private lay_deferred(e: *Emit, run: Buf[TStmt])
 
     e.exit = Leaving
 
+    // A way out is being laid, part-way through giving back what the scope holds: an allocation
+    // refused in it traps rather than unwinding a second time over what is half let go
+    // (`oom_boundary.sysl`).
+    e.oom_quiet += 1
+
     if on_failure(run[0]) then failure_run(e, exit, run) else lay_in_order(e, run[0])
 
+    e.oom_quiet -= 1
     e.exit = exit
     nowrap_resume(e)
 end lay_deferred
@@ -1900,6 +1906,7 @@ private on_failure(s: TStmt) -> bool = s match
 private failure_run(e: *Emit, exit: ExitMode, run: Buf[TStmt])
     exit match
         Leaving -> ()
+        Refused -> lay_unbound_run(e, run)
         Failing(v, ty) -> lay_failure_run(e, run, v, ty)
         Returning(v, ty) ->
             val parts = fallible_parts(ty)
@@ -1952,6 +1959,24 @@ private lay_failure_run(e: *Emit, run: Buf[TStmt], v: Val, ty: Type)
             _ -> ()
 end lay_failure_run
 
+// Lays a run down on the way out an allocation refused inside an export answering out of memory
+// takes (`oom_boundary.sysl`): a failure, so each `errdefer` runs -- except one binding the error,
+// since the function is not returning one and there is nothing to bind.
+private lay_unbound_run(e: *Emit, run: Buf[TStmt])
+    for s in run
+        s match
+            TDefer(stmts, TFailureExit(binder)) ->
+                if binder.is_none() || zero_sized(binder.unwrap().1)
+                    push_owned(e)
+
+                    for stmt in stmts
+                        gen_stmt(e, stmt)
+
+                    pop_owned(e)
+                end if
+            _ -> ()
+end lay_unbound_run
+
 // How a way out leaves the function, for the `errdefer`s it lays down. A block's end, a `break`, a
 // `continue`, a task destroyed while it waits and an `@abandons` call are `Leaving`, which is no
 // failure. A `return`, a `?` and a body's last value say which they are: `Failing` where the value
@@ -1959,6 +1984,8 @@ end lay_failure_run
 // and the function's result type.
 enum ExitMode
     Leaving
+    // An allocation refused inside an export answering out of memory (`oom_boundary.sysl`).
+    Refused
     Failing(value: Val, ty: Type)
     Returning(value: Val, ty: Type)
 

@@ -100,7 +100,10 @@ gen_export_thunk(e: *Emit, f: TFunc, symbol: string, enters: bool) -> Option[IrF
     for i in 0..<types.len()
         if !zero_sized(types[i]) then passed.push(thunk_argument(e, types[i], incoming[i]))
 
-    gen_thunk_call(e, f, symbol, passed, sret)
+    // An export answering out of memory counts itself in first (`oom_boundary.sysl`).
+    val was = if oom_opted(e, f.name) then Some(oom_enter_export(e)) else None
+
+    gen_thunk_call(e, f, symbol, passed, sret, was)
 
     if has_gap(e) then return None
 
@@ -237,7 +240,12 @@ private thunk_slot(e: *Emit, t: Type, value: Val) -> Val
 end thunk_slot
 
 // The call to the definition, and the `ret` that hands its result back the way C reads one.
-private gen_thunk_call(e: *Emit, f: TFunc, symbol: string, passed: Buf[IrArg], sret: Option[Val])
+//
+// Where the export answers out of memory, `was` is the count its thunk found on the way in: once the
+// definition is back, a set bit means it unwound a refused allocation, and the answer is the
+// `@out_of_memory` value's, called with the same arguments, in place of the definition's.
+private gen_thunk_call(e: *Emit, f: TFunc, symbol: string, passed: Buf[IrArg], sret: Option[Val],
+                       was: Option[Val])
     // Where **both** sides return through storage the caller supplies, C's is handed straight to
     // sysl and the value is never a first-class LLVM value at any point -- which is the whole of
     // what an out-parameter buys, and copying it into a slot of this function's own to copy it back
@@ -285,6 +293,17 @@ private gen_thunk_call(e: *Emit, f: TFunc, symbol: string, passed: Buf[IrArg], s
         emit(e, form_call(what, Some(v), VGlobal(symbol), args))
         returned = Some(v)
     else emit(e, form_call(what, None, VGlobal(symbol), args))
+
+    was match
+        Some(count) ->
+            val answer_l = fresh_label(e, "oom.answer")
+            val fine_l = fresh_label(e, "oom.fine")
+
+            oom_leave_export(e, count, answer_l, fine_l)
+            emit_label(e, answer_l)
+            gen_thunk_call(e, f, symbol_of(e, oom_value_name(f.name)), passed, sret, None)
+            emit_label(e, fine_l)
+        None -> ()
 
     gen_thunk_return(e, f.ret_ty, returned, sysl_slot, sret)
 end gen_thunk_call

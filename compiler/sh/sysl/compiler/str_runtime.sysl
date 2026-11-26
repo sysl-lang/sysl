@@ -28,21 +28,24 @@ import sysl.math.bigint.{BigInt, from_int, pow, sub as big_sub, to_string}
 // **A null answer traps before anything is stored**, as every box's does (`emit_box.sysl`'s
 // `allocate_box`); the trap is the module's stop (`trap_symbol`), and the block the header ends in is
 // `got`, which is what a `phi` after it names as its way in.
-str_buf_header(e: *Emit, n: string) -> string
+//
+// **In a module whose bodies unwind a refusal** (`oom_boundary.sysl`) the refused block carries the
+// refusal out instead -- trapping only where no boundary is open -- and the helper returns `zero`
+// (`void`, or its type and zero value), which no caller reads: each tests the bit first.
+str_buf_header(e: *Emit, n: string, zero: string) -> string
     val word = s"i${e.word_bits}"
     val trap = trap_symbol(e)
     val hook = drop_buf_fn(e, byte_type()) match
         VGlobal(name) -> name
         _ -> "arc.drop.plain"
+    val refused = oom_refused_text(e, zero).unwrap_or(s"  call void @$trap()\n  unreachable\n")
 
     heap_take_text(e, "%p", "%size", e.layout.pointer_bytes()) +
     s"""
       %given = icmp ne ptr %p, null
       br i1 %given, label %got, label %refused
     refused:
-      call void @$trap()
-      unreachable
-    got:
+    ${refused}got:
       store $word 1, ptr %p
       %hook = getelementptr %arc.header, ptr %p, i32 0, i32 1
       store ptr @$hook, ptr %hook
@@ -403,7 +406,7 @@ str_concat_text(e: *Emit, str: string) -> string
     entry:
       %total = add $word %an, %bn
     ${pick}${str_buf_lead(word)}  %size = add $word %hsize, %total
-    ${str_buf_header(e, "%total")}  br label %acond
+    ${str_buf_header(e, "%total", s"$str zeroinitializer")}  br label %acond
     acond:
       %i = phi $word [ 0, %got ], [ %inext, %abody ]
       %amore = icmp ult $word %i, %an
@@ -541,7 +544,7 @@ private heap_copy_text(e: *Emit, str: string, name: string, pick: string) -> str
     define private $str @$name(ptr %src, $word %n) {
     entry:
     ${pick}${str_buf_lead(word)}  %size = add $word %hsize, %n
-    ${str_buf_header(e, "%n")}  br label %cond
+    ${str_buf_header(e, "%n", s"$str zeroinitializer")}  br label %cond
     cond:
       %i = phi $word [ 0, %got ], [ %next, %body ]
       %more = icmp ult $word %i, %n
