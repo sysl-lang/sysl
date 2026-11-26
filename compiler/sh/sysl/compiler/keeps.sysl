@@ -839,6 +839,14 @@ read_answers_of(cx: &KeepsCx, name: string, i: usize, steps: int) -> bool =
     if reads_past(cx, name, i, steps) then through_answers_of(cx, name, i)
     else summary(cx, name, i, s"$ReadAnswersQ$steps").kept
 
+// **The same, where the first step goes through one field of the pointee** (`path`, as `read_path_of`
+// takes it): a closure body answering what it reads along one capture's field of its environment
+// answers that capture, and not the others (`captures_answered`).
+read_answers_path_of(cx: &KeepsCx, name: string, i: usize, steps: int, path: string) -> bool =
+    if reads_past(cx, name, i, steps) then through_answers_of(cx, name, i)
+    else if path == "" then read_answers_of(cx, name, i, steps)
+    else summary(cx, name, i, s"$ReadAnswersQ$steps<$path>").kept
+
 // **The step a frame asks about where its own storage holds a cycle** (`read_cores`): from there on
 // every step reaches what it already reached, so the callee is asked what it lets out of anything it
 // reads through the argument (`deep_of`), which holds every step at once.
@@ -1147,7 +1155,7 @@ private answer(cx: &KeepsCx, name: string, i: usize, q: string) -> KeptWhy
     else if deep then walk_deep(cx, f, i, path_of(q))
     else if q == ThroughAnswersQ then walk_answers_through(cx, f, i)
     else if reading then walk_track(read_track(cx, f, i, q), i)
-    else if read_answering then answered(track_as(cx, f, i, false, true, steps_of(q)), f)
+    else if read_answering then answered(track_along(cx, f, i, false, true, steps_of(q), path_of(q)), f)
     else walk_answers(cx, f, i, q == RawAnswersQ)
 
     val held_on = keeping || q == ThroughQ || q == VesselQ || reading || deep
@@ -3245,6 +3253,54 @@ private handed_closures_kept(t: &Track, evs: &EvBuf, args: Buf[TExpr])
     t.gone = gone
 end handed_closures_kept
 
+// **A call of a closure answers what its body answers of a capture holding what is followed**:
+// `val g = () -> a` then `held = g()` stores `a` as surely as `held = a` does. The call hands the body
+// `&g`, and the whole environment is not asked (`value_reads`), so where the literal is in sight its
+// body is asked capture by capture what it answers of that field, as of where the literal was built
+// (`handed_closures_kept`'s rule). A closure out of sight -- a parameter, an answer of another call --
+// whose environment carries it is asked what it answers of anything it reads through its environment.
+private closure_answers(t: &Track, name: string, args: Buf[TExpr]) -> bool
+    if !closure_call(name) || args.is_empty() then return false
+
+    closure_literal_of(args[0], t.decls, 0) match
+        Some(lit) ->
+            *lit.kind match
+                TStructNew(st, captured) -> captures_answered(t, lit, st, captured)
+                _ -> false
+        None -> value_walk(t) && env_carries(t, args[0]) && through_answers_of(t.cx, name, 0)
+end closure_answers
+
+// Whether the environment a closure call is handed holds what is followed: `&g` for a local that does,
+// or the address of a temporary that does -- `g()()` hands the inner body `&(g())`.
+private env_carries(t: &Track, env: TExpr) -> bool = *env.kind match
+    TAddrOf(place, _) -> carries(t, env) || carries(t, place)
+    _ -> carries(t, env)
+
+private captures_answered(t: &Track, lit: TExpr, st: &StructType, args: Buf[TExpr]) -> bool
+    val body = s"${st.base}.call"
+    val gone = t.gone
+
+    t.gone = gone_where_made(t, lit)
+
+    var out = false
+
+    for c in 0..<args.len()
+        if c >= st.fields.len() then break
+
+        val arg = args[c]
+
+        if !carries(t, arg) then continue
+
+        if t.cx.find(body).is_none() ||
+           read_answers_path_of(t.cx, body, 0, capture_steps(arg), s".${st.fields[c].0}${capture_rest(t, arg)}")
+            out = true
+            break
+    end for
+
+    t.gone = gone
+    out
+end captures_answered
+
 // The copies overwritten on every way to where a closure literal was built, each time the walk built it
 // (`note_made`) -- none, where the walk has not been there yet.
 private gone_where_made(t: &Track, lit: TExpr) -> Buf[string]
@@ -3377,7 +3433,8 @@ private value_reads(t: &Track, arg: TExpr) -> Buf[int]
 
     // A closure's environment is asked where the closure is made, capture by capture
     // (`captures_kept`): asked of the whole environment at a call, everything the body lets out of
-    // any capture would be charged to each.
+    // any capture would be charged to each. What the call answers is asked capture by capture too
+    // (`closure_answers`).
     if is_closure_literal(env_type(texpr_type(arg))) then return out
 
     for s in ptr_steps(t, arg)
@@ -4209,7 +4266,7 @@ private carries(t: &Track, e: TExpr) -> bool = *e.kind match
     TCall(name, args, ty, _) ->
         (may_hold_pointer(t.cx, ty) || (t.raw && is_integer_type(ty) && t.cx.find(name).is_some())) &&
             (call_carries(t, name, args, ty) || (t.steps > 0 && !ptr_steps(t, e).is_empty()) ||
-             (may_hold_pointer(t.cx, ty) && reads_vessel(t, args)))
+             (may_hold_pointer(t.cx, ty) && reads_vessel(t, args)) || closure_answers(t, name, args))
     TVCall(recv, _, args, ty, _) ->
         may_hold_pointer(t.cx, ty) && (carries(t, recv) || any_carries(t, args))
     TCallPtr(callee, args, _, ty) ->

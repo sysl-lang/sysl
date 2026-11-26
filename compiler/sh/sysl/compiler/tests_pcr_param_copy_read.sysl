@@ -1682,8 +1682,7 @@ pcr_answers_struct_field_overwritten()
             print(*held)
         """, pcr_answer_kept("pick(&y)"))
 
-// TODO: un-ignore when a call of a closure value is followed into what its body answers of a capture.
-@test("an answer a closure built before the overwrite makes of what it captured", ignore: "a closure call's answer made of a capture is not followed")
+@test("an answer a closure built before the overwrite makes of what it captured")
 pcr_answers_closure_built_before()
     pcr_refused(raw"""
         pick(a: *int) -> *int
@@ -1701,8 +1700,7 @@ pcr_answers_closure_built_before()
             print(*held)
         """, pcr_answer_kept("pick(&y)"))
 
-// TODO: un-ignore when a call of a closure value is followed into what its body answers of a capture.
-@test("a parameter a closure captured, answered by a call of the closure", ignore: "a closure call's answer made of a capture is not followed")
+@test("a parameter a closure captured, answered by a call of the closure")
 pcr_answers_closure_of_the_parameter()
     pcr_refused(raw"""
         pick(a: *int) -> *int
@@ -1718,8 +1716,7 @@ pcr_answers_closure_of_the_parameter()
             print(*held)
         """, pcr_answer_kept("pick(&y)"))
 
-// TODO: un-ignore when a call of a closure value is followed into what its body answers of a capture.
-@test("a parameter a closure captured, stored from a call of the closure", ignore: "a closure call's answer made of a capture is not followed")
+@test("a parameter a closure captured, stored from a call of the closure")
 pcr_stores_closure_call_of_the_parameter()
     pcr_refused(raw"""
         key(a: *int)
@@ -1752,6 +1749,213 @@ pcr_answers_closure_built_after()
             other()
             print(*held)
         """, "7\n")
+
+// A call of a closure answers what its body answers of each capture (`keeps.sysl`'s
+// `closure_answers`): asked capture by capture where the literal is in sight, and of anything read
+// through the environment where it is not (a closure parameter, a closure another call answered).
+
+@test("a copy of the parameter a closure captured, stored from a call of the closure")
+pcr_stores_closure_call_of_a_copy()
+    pcr_refused(raw"""
+        key(a: *int)
+            var b = a
+            val g = () -> b
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a field of a struct holding the parameter, answered by a closure that captured the struct")
+pcr_stores_closure_call_of_a_captured_field()
+    pcr_refused(raw"""
+        struct S
+            p: *int
+
+        key(a: *int)
+            val s = S(a)
+            val g = () -> s.p
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a closure capturing the parameter, handed to a function that calls it and answers its answer")
+pcr_stores_closure_called_by_a_callee()
+    pcr_refused(raw"""
+        apply(f: () -> *int) -> *int = f()
+
+        key(a: *int)
+            held = apply(() -> a)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a closure bound to a local, handed to a function that calls it and answers its answer")
+pcr_stores_bound_closure_called_by_a_callee()
+    pcr_refused(raw"""
+        apply(f: () -> *int) -> *int = f()
+
+        key(a: *int)
+            val g = () -> a
+            held = apply(g)
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a closure answering a closure that captured the parameter, both called")
+pcr_stores_nested_closure_call()
+    pcr_refused(raw"""
+        key(a: *int)
+            val g = () -> (() -> a)
+            held = g()()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a closure behind a '&Fn' capturing the parameter, stored from a call of it")
+pcr_stores_boxed_closure_call()
+    pcr_refused(raw"""
+        key(a: *int)
+            val g: &Fn() -> *int = () -> a
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, pcr_kept("it is stored in 'held'"))
+
+@test("a closure behind a '&Fn' replaced before the call by one that captures nothing")
+pcr_stores_replaced_boxed_closure_call()
+    pcr_prints(raw"""
+        key(a: *int)
+            var g: &Fn() -> *int = () -> a
+            g = () -> &spare
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a closure that reads the parameter it captured but answers module storage")
+pcr_stores_closure_call_not_answering_the_capture()
+    pcr_prints(raw"""
+        var other_spare = 9
+
+        key(a: *int)
+            val g = () -> if *a > 3 then &spare else &other_spare
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a closure capturing the parameter and a module address answers only the module address")
+pcr_stores_closure_call_answering_the_other_capture()
+    pcr_prints(raw"""
+        key(a: *int)
+            val c = &spare
+            val g = () -> if *a > 0 then c else c
+            held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+// A `&T` parameter is counted, not lent: a closure call answering it keeps a share of the box, which
+// must therefore not be laid in the frame of the caller that made it (`stack_box.sysl`).
+@test("a '&' parameter a closure captured, stored from a call of the closure, outlives the frame")
+pcr_stores_closure_call_of_a_ref_parameter()
+    pcr_prints(raw"""
+        struct H
+            v: int
+
+        var kept_h: Option[&H] = None
+
+        key(a: &H)
+            val g = () -> a
+            kept_h = Some(g())
+
+        other()
+            key(H(5))
+
+        clobber(n: int) -> int
+            var arr = [n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n]
+            var s = 0
+            for i in 0..<16
+                arr[i] = arr[i] * 3 + i
+                s += arr[i]
+            s
+
+        main()
+            other()
+            print(clobber(41))
+            print(kept_h.unwrap().v)
+        """, "2088\n5\n")
+
+@test("a closure capturing the parameter, called only for a number")
+pcr_closure_call_answering_a_number()
+    pcr_prints(raw"""
+        key(a: *int)
+            val g = () -> *a + 1
+            *held = g()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, "6\n")
 
 @test("an answer made of a copy a 'defer' overwrites only on the way out")
 pcr_answers_copy_a_defer_overwrites()
