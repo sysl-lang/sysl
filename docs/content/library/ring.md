@@ -307,8 +307,10 @@ dropped, `r[i]` counts from the front and traps past the end as an array's index
 between the two by changing the type and the line that makes it; the only difference is that
 `inline_ring[T, N]()` takes no slice.
 
-- **A fresh one needs no value.** `inline_ring[T, N]()` and a plain `var r: InlineRing[T, N]` are both
-  empty rings, because a zeroed slot is an empty slot; a `T` with no default can still be held.
+- **A fresh one needs no value.** `inline_ring[T, N]()` makes its slots empty rather than from a
+  value, so a `T` with no zero value — a `&T`, an enum with no variant at zero — can be held. A plain
+  `var r: InlineRing[T, N]` is an empty ring too wherever `T` has a zero value, a zeroed slot being an
+  empty slot; where it has none the declaration is refused and `inline_ring()` is its initial value.
 - **`N` need not be a power of two**; wrapping is a compare and a subtract, as in `Ring`. `N` of 1 is a
   ring, and `N` of 0 is a ring that refuses every push and evicts every `overwrite`.
 - **It builds for a bare machine.** A struct holding one compiles for `thumb-freestanding-softfp` with
