@@ -2,8 +2,10 @@ module sh.sysl.compiler
 @tests
 
 import sysl.buf.{Buf, buf}
-import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
 import sysl.process.{capture, Var}
+import sysl.testing.skip
+import sysl.text.split
 
 // `r.is_unique()` (`unique_place.sysl`, `emit_box.sysl`'s `gen_is_unique`, `reference/memory.md § Asking
 // whether a reference is the only one`): whether the counted reference a place holds is the only one
@@ -20,6 +22,10 @@ import sysl.process.{capture, Var}
 //   object file), a closure's capture (lent and kept), a pattern's binding, a `for`'s element, a
 //   `var` read out of storage that would otherwise take no count, a `var` a lent parameter is copied
 //   into;
+// - a second local beside the place asked about, read out of a struct local's field, a nested
+//   struct's, an array's element and a field through a reference;
+// - the type referred to: a plain struct and a `@unique` one;
+// - the target: the host, and a freestanding Thumb archive (plain and atomic counts);
 // - where the box lies: the heap and the frame (compact and full header), told apart by the bytes
 //   the run allocates;
 // - generic twins: a generic function and a generic struct's member, each at two types;
@@ -32,9 +38,7 @@ import sysl.process.{capture, Var}
 //
 // Skipped cells, and why: early exits and `defer` (the form holds nothing to give back on any path);
 // codegen units and a library build (the lowering is per body, and a precompiled callee is code
-// nobody can see, across which every local keeps its count already); a bare-metal target (the form
-// is loads and compares of one word; a `&sync` one is the atomic load every `&sync` release's
-// thread-sanitized form already emits).
+// nobody can see, across which every local keeps its count already).
 
 // -- the harness ----------------------------------------------------------------------------------
 
@@ -429,6 +433,167 @@ isu_a_local_asked_holds_a_count()
     isu_check(isu_elided, "false false\ntrue\nfalse false 1\nfalse\nfalse false\nfalse\n4\n")
 end isu_a_local_asked_holds_a_count
 
+// -- a second local read out of the place asked about ------------------------------------------------
+
+private const isu_beside: string = raw"""
+    struct Tok
+        n: int
+
+    struct Shelf
+        held: &Tok
+
+    struct Pair
+        a: Shelf
+        b: int
+
+    main()
+        var s = Shelf(Tok(2))
+
+        print(s.held.is_unique())
+
+        val c = s.held
+
+        print(s.held.is_unique(), c.n)
+
+        var p = Pair(Shelf(Tok(3)), 0)
+        val d = p.a.held
+
+        print(p.a.held.is_unique(), d.n)
+
+        var xs: [2]&Tok = [Tok(4), Tok(5)]
+        val x = xs[0]
+
+        print(xs[0].is_unique(), xs[1].is_unique(), x.n)
+
+        val t: &Shelf = Shelf(Tok(6))
+        val g = t.held
+
+        print(t.held.is_unique(), g.n)
+    """
+
+@test("a local read out of a struct local's field, a nested one's or an array's element is counted beside the place asked about")
+isu_a_local_beside_the_place_asked()
+    if !enm_ready() then return
+
+    isu_check(isu_beside, "true\nfalse 2\nfalse 3\nfalse true 4\nfalse 6\n")
+end isu_a_local_beside_the_place_asked
+
+// -- a reference to a `@unique` type -----------------------------------------------------------------
+
+private const isu_unique_type: string = raw"""
+    @unique
+    struct Tok
+        n: int
+
+    struct Shelf
+        held: &Tok
+
+    main()
+        val a: &Tok = Tok(1)
+
+        print(a.is_unique())
+
+        val b = a
+
+        print(a.is_unique(), b.n)
+
+        var s = Shelf(Tok(2))
+
+        print(s.held.is_unique())
+
+        val c = s.held
+
+        print(s.held.is_unique(), c.n)
+    """
+
+@test("is_unique of a reference to a '@unique' type counts the references, which are copied as any other")
+isu_a_reference_to_a_unique_type()
+    if !enm_ready() then return
+
+    isu_check(isu_unique_type, "true\nfalse 1\ntrue\nfalse 2\n")
+end isu_a_reference_to_a_unique_type
+
+// -- bare metal ----------------------------------------------------------------------------------------
+
+private val IsuNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private const isu_bare: string = raw"""
+    struct Node
+        n: int
+
+    var sink = 0
+    var kept: Option[&Node] = None
+    var shared: Option[&sync Node] = None
+
+    @export("ask")
+    ask(n: int) -> int
+        val a: &Node = Node(n)
+        var got = 0
+
+        if a.is_unique() then got += 1
+
+        kept = Some(a)
+
+        if a.is_unique() then got += 2
+
+        val s: &sync Node = Node(n)
+
+        if s.is_unique() then got += 4
+
+        shared = Some(s)
+
+        if s.is_unique() then got += 8
+
+        got
+    end ask
+
+    @export("main")
+    main()
+        sink = ask(3)
+    """
+
+@test("is_unique builds for a freestanding Thumb target, plain and atomic, and needs nothing but the allocator")
+isu_on_bare_metal()
+    if !is_file(IsuNm) then skip(s"there is no llvm-nm at $IsuNm to read the archive")
+
+    find_backend_clang(target_named("thumb-freestanding-softfp").unwrap()) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(_) -> ()
+
+    val root = make_temp_dir("sysl-isu-thumb").unwrap()
+
+    write_text(s"$root/main.sysl", isu_bare).unwrap()
+
+    val archive = s"$root/probe.a"
+    val built = build_c_archive(root, Some("thumb-freestanding-softfp"), None, DefaultOptimization, Some(archive),
+                                None, (m) -> ())
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val listing = capture(IsuNm, ["-u", archive]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+    remove_dir_all(root).unwrap_or(())
+
+    var seen = 0
+
+    for line in split(listing, "\n")
+        val t = line.trim()
+
+        if t == "" || t.ends_with(":") then continue
+
+        seen += 1
+        assert(t == "U malloc" || t == "U free" || t == "U memcpy" || t == "U memset", s"the archive leaves $t undefined")
+
+    assert(seen > 0, listing)
+end isu_on_bare_metal
+
 // -- a closure's capture ------------------------------------------------------------------------------
 
 private const isu_captures: string = raw"""
@@ -436,6 +601,12 @@ private const isu_captures: string = raw"""
         n: int
 
     var job: Option[&Fn() -> bool] = None
+
+    // The kept closure is called where it lies, so no local holds a second copy of it.
+    ask() -> bool
+        job match
+            Some(f) -> f()
+            None -> false
 
     main()
         var lent: &Node = Node(7)
@@ -451,10 +622,15 @@ private const isu_captures: string = raw"""
 
         job = Some(() -> copied.is_unique())
 
-        val asked = job.unwrap()
+        print(ask(), copied.n)
 
-        print(asked(), copied.n)
-        job = None
+        // A local holding the closure holds its capture with it, for as long as the local lives.
+        if copied.n == 8
+            val asked = job.unwrap()
+
+            job = None
+            print(asked(), copied.is_unique())
+
         print(copied.is_unique())
     """
 
@@ -462,7 +638,7 @@ private const isu_captures: string = raw"""
 isu_a_closure_capture()
     if !enm_ready() then return
 
-    isu_check(isu_captures, "true\nfalse 7\nfalse 8\ntrue\n")
+    isu_check(isu_captures, "true\nfalse 7\nfalse 8\nfalse false\ntrue\n")
 end isu_a_closure_capture
 
 // -- a box laid in the frame answers as one on the heap ----------------------------------------------
