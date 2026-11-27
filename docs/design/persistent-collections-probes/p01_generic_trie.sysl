@@ -1,0 +1,48 @@
+// P01: a generic trie node holding `&Node[T]` children, path-copied, with an element type that has a
+// `Drop`. The old version must read unchanged after the update, every element must drop exactly once,
+// and SYSL_COUNT_ALLOCS=1 must report no net allocation.
+
+struct Res
+    n: int
+
+impl Drop for Res
+    drop(self) = print("drop", self.n)
+
+enum Node[T]
+    Branch(kids: []&Node[T])
+    Leaf(items: []T)
+
+with_at[T](xs: []T, i: usize, v: T) -> []T
+    var out: []T = slot_storage(xs.len)
+
+    slot_place_run(out, 0, xs)
+    out[i] = v
+    out
+
+get[T](n: &Node[T], shift: usize, i: usize) -> T
+    n match
+        Branch(kids) -> get(kids[(i >> shift) & 1], shift - 1, i)
+        Leaf(items) -> items[i & 1]
+
+set[T](n: &Node[T], shift: usize, i: usize, v: T) -> &Node[T]
+    n match
+        Branch(kids) ->
+            val k = (i >> shift) & 1
+            Branch(with_at(kids, k, set(kids[k], shift - 1, i, v)))
+        Leaf(items) -> Leaf(with_at(items, i & 1, v))
+
+run()
+    val a: &Node[&Res] = Leaf([Res(0), Res(1)])
+    val b: &Node[&Res] = Leaf([Res(2), Res(3)])
+    val v1: &Node[&Res] = Branch([a, b])
+    val v2 = set(v1, 1, 2, Res(9))
+
+    print("v1[2] =", get(v1, 1, 2).n, "v2[2] =", get(v2, 1, 2).n)
+    print("shared left leaf:", v1 match
+        Branch(k1) -> v2 match
+            Branch(k2) -> k1[0] === k2[0]
+            _ -> false
+        _ -> false)
+
+run()
+print("done")

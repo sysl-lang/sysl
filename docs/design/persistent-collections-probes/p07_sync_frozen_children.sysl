@@ -1,0 +1,33 @@
+// P07: a `&sync` node whose children and elements are `&sync Frozen` buffers -- exactly sized, any
+// length, and shareable. Two allocations per node (the node's box and the frozen buffer's storage).
+
+import sysl.buf.{Buf, buf, Frozen}
+import sysl.threads.scope
+
+struct FNode
+    kids: &sync Frozen[&sync FNode]
+    items: &sync Frozen[int]
+
+leaf(base: int) -> &sync FNode
+    var none: Buf[&sync FNode] = buf()
+    var xs: Buf[int] = buf()
+
+    for i in 0..<3 do xs.push(base + i)
+    FNode(none.freeze(), xs.freeze())
+
+total(n: &sync FNode) -> int
+    var s = 0
+
+    for x in n.items do s += x
+    for k in n.kids do s += total(k)
+    s
+
+var ks: Buf[&sync FNode] = buf()
+
+ks.push(leaf(0))
+ks.push(leaf(10))
+
+var empty: Buf[int] = buf()
+val root: &sync FNode = FNode(ks.freeze(), empty.freeze())
+
+print(scope((s) -> s.spawn(() -> total(root)).join() + s.spawn(() -> total(root)).join()))

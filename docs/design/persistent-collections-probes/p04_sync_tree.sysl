@@ -1,0 +1,36 @@
+// P04: an immutable generic tree of `&sync` nodes, its children in a fixed array held in the node's
+// own box, read by four threads at once with no lock and no copy.
+
+import sysl.threads.scope
+
+struct SNode[T]
+    kids: [4]Option[&sync SNode[T]]
+    items: [4]T
+
+leaf(base: int) -> &sync SNode[int] = SNode([None, None, None, None], [base, base + 1, base + 2, base + 3])
+
+sum[T](n: &sync SNode[T], f: T -> int) -> int
+    var s = 0
+
+    for x in n.items
+        s += f(x)
+
+    for k in n.kids
+        k match
+            Some(c) -> s += sum(c, f)
+            None -> ()
+
+    s
+end sum
+
+val root: &sync SNode[int] = SNode([Some(leaf(0)), Some(leaf(4)), Some(leaf(8)), Some(leaf(12))], [0, 0, 0, 0])
+
+val totals = scope((s) ->
+    val a = s.spawn(() -> sum(root, (x) -> x))
+    val b = s.spawn(() -> sum(root, (x) -> x * 2))
+    val c = s.spawn(() -> sum(root, (x) -> 1))
+    val d = s.spawn(() -> sum(root, (x) -> x))
+
+    a.join() + b.join() + c.join() + d.join())
+
+print(totals)

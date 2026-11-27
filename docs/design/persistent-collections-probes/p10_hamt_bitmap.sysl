@@ -1,0 +1,52 @@
+// P10: the pieces a HAMT node needs, generic over K and V: a `u32` bitmap with popcount, a compressed
+// child array of exactly `popcount` entries built with slot storage, a key's `Hash` and `Eq` through
+// a bound, and an enum entry that is either a key-value pair or a sub-node.
+
+import sysl.math.Bits
+
+enum Entry[K: Hash + Eq, V]
+    Pair(key: K, value: V)
+    Sub(node: &HNode[K, V])
+
+struct HNode[K: Hash + Eq, V]
+    bitmap: u32
+    entries: []Entry[K, V]
+
+insert_at[K: Hash + Eq, V](xs: []Entry[K, V], at: usize, e: Entry[K, V]) -> []Entry[K, V]
+    var out: []Entry[K, V] = slot_storage(xs.len + 1)
+
+    slot_place_run(out, 0, xs[0..<at])
+    slot_place(out, at, e)
+    slot_place_run(out, at + 1, xs[at..])
+    out
+
+put[K: Hash + Eq, V](n: &HNode[K, V], k: K, v: V) -> &HNode[K, V]
+    val bit = u32(1) << u32(k.hash() & 31)
+    val at = usize((n.bitmap & (bit - 1)).count_ones())
+
+    if n.bitmap & bit == 0 then return HNode(n.bitmap | bit, insert_at(n.entries, at, Pair(k, v)))
+
+    // a collision on the first level only, for the probe: replace the pair in place in a copy
+    var out: []Entry[K, V] = slot_storage(n.entries.len)
+
+    slot_place_run(out, 0, n.entries)
+    out[at] = Pair(k, v)
+    HNode(n.bitmap, out)
+
+get[K: Hash + Eq, V](n: &HNode[K, V], k: K) -> Option[V]
+    val bit = u32(1) << u32(k.hash() & 31)
+
+    if n.bitmap & bit == 0 then return None
+
+    n.entries[usize((n.bitmap & (bit - 1)).count_ones())] match
+        Pair(key, value) -> if key == k then Some(value) else None
+        Sub(_) -> None
+
+main()
+    val e: []Entry[string, int] = []
+    val m0: &HNode[string, int] = HNode(0, e)
+    val m1 = put(m0, "one", 1)
+    val m2 = put(m1, "two", 2)
+    val m3 = put(m2, "one", 11)
+
+    print(get(m1, "one"), get(m1, "two"), get(m2, "two"), get(m3, "one"), get(m2, "one"))
