@@ -4474,6 +4474,54 @@ first(p: Pair[int]) -> int = p.0
 alias 'Pair' takes 2 type arguments, but 1 type argument was given
 ```
 
+Because an alias is only a second spelling, it has to have a first one. An alias whose right-hand
+side comes round to its own name has none, and is refused where it is declared — whether the name
+stands bare, behind a pointer or a reference, inside a tuple, an `Option` or a callable, as an
+argument of a struct or an enum, or at the far end of a chain of other aliases. The message names
+every alias on the way round:
+
+```sysl
+struct Node[T, P]
+    item: T
+    kids: [2]Option[P]
+
+type Plain = Node[int, &Plain]
+```
+
+```error
+'Plain' is defined in terms of itself: Plain → Plain — an alias is a second spelling of the type it names, and this one would never finish being spelled; a type that refers to itself is a 'struct' or an 'enum'
+```
+
+```sysl
+type Row = [4]Cell
+type Cell = Option[&Row]
+```
+
+```error
+'Row' is defined in terms of itself: Row → Cell → Row
+```
+
+What may refer to itself is a type with a declaration of its own: the fields of a struct and the
+variants of an enum are not part of how its name is spelled, so a struct may hold a reference to
+itself, under its own name or under an alias of it:
+
+```sysl
+struct Step
+    n: int
+    next: Option[&Next]
+
+type Next = Step
+
+val last: &Next = Step(2, None)
+val first: &Step = Step(1, Some(last))
+
+print(first.n + first.next.unwrap().n)
+```
+
+```output
+3
+```
+
 Adding `new` makes it a genuinely distinct type, and `within` and `where` add checked bounds:
 
 ```sysl

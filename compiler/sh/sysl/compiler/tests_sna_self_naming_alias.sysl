@@ -1,0 +1,406 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// An alias that names itself: `type A = &A`, `type Plain = Node[int, &Plain]`.
+//
+// An alias is a second spelling of the type it names (`reference/declarations.md § Type
+// declarations`), so it has to have one. A right-hand side that comes round to the alias's own name
+// -- bare, behind a pointer or a reference, inside a tuple or a callable, or as an ARGUMENT of a
+// struct, an enum or another alias -- has none, and is refused where it is declared, with the names
+// the walk went through. What ends a chain is a nominal type's own declaration: a struct's fields and
+// an enum's variants are not part of how it is spelled, so a type that holds itself through one is
+// untouched. A mention of a refused alias says nothing more.
+
+private sna_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end sna_skip
+
+private sna_skip_run() -> bool
+    if sna_skip() then return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end sna_skip_run
+
+// A project holding `main.sysl` and, where one is given, a module `geo` in `geo/geo.sysl`.
+private sna_write(main: string, geo: string) -> string
+    val root = make_temp_dir("sysl-sna").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    if geo != ""
+        make_dir_all(root + "/geo").unwrap()
+        write_text(root + "/geo/geo.sysl", geo).unwrap()
+    end if
+
+    root
+end sna_write
+
+// What the program PRINTS, or what the build had to say about it.
+private sna_ran(main: string) -> string
+    val root = sna_write(main, "")
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sna_ran
+
+private sna_prints(main: string, expected: string)
+    if sna_skip_run() then return
+
+    val out = sna_ran(main)
+
+    assert(out == expected, s"expected '$expected', got: $out")
+
+// Everything the analysis had to say about the program, or `accepted`.
+private sna_report(main: string, geo: string) -> string
+    val root = sna_write(main, geo)
+
+    val out = emit_llvm_text(root, None) match
+        Err(why) -> failure_text(why)
+        Ok(made) -> if made.report.is_empty() then "accepted" else analysis_report(made.report)
+
+    remove_dir_all(root).unwrap_or(())
+    out
+end sna_report
+
+// How many diagnostics a report holds.
+private sna_errors(out: string) -> usize
+    var n: usize = 0
+
+    for line in lines_of(out)
+        if line.starts_with("error: ") then n += 1
+
+    n
+end sna_errors
+
+private sna_why() -> string =
+    " — an alias is a second spelling of the type it names, and this one would never finish " +
+    "being spelled; a type that refers to itself is a 'struct' or an 'enum'"
+
+// The alias `name` is refused over `chain`, at this line and column of `file`.
+private sna_says(out: string, name: string, chain: string, file: string, at: string)
+    val wanted = s"error: '$name' is defined in terms of itself: $chain${sna_why()}\n --> "
+
+    assert(out.index_of(wanted).is_some(), s"expected '$name' refused over $chain, got: $out")
+
+    val rest = out[out.index_of(wanted).unwrap() + wanted.len..<out.len]
+
+    assert(rest.index_of(s"/$file:$at\n").is_some() &&
+           rest.index_of(s"/$file:$at\n").unwrap() < rest.index_of("\n").unwrap() + 1,
+           s"expected it at $file:$at, got: $out")
+end sna_says
+
+// The program is refused once, over this alias and this chain, at line 1 -- and for nothing else, so
+// nothing the alias half-resolved to reaches a second diagnostic.
+private sna_refused(main: string, name: string, chain: string)
+    if sna_skip() then return
+
+    val out = sna_report(main, "")
+
+    sna_says(out, name, chain, "main.sysl", "1:1")
+    assert(sna_errors(out) == 1, s"expected one diagnostic, got: $out")
+    assert(out.index_of("?").is_none(), s"an unsettled type was shown: $out")
+end sna_refused
+
+@test("an alias for itself is refused, and the chain is the one name")
+sna_itself() = sna_refused("type A = A\n", "A", "A \u{2192} A")
+
+@test("an alias for a reference to itself is refused")
+sna_behind_a_reference() = sna_refused("type A = &A\n", "A", "A \u{2192} A")
+
+@test("and for a shared reference, a raw pointer and a weak one")
+sna_behind_the_other_pointers()
+    sna_refused("type A = &sync A\n", "A", "A \u{2192} A")
+    sna_refused("type A = *A\n", "A", "A \u{2192} A")
+    sna_refused("type A = *const A\n", "A", "A \u{2192} A")
+    sna_refused("type A = weak A\n", "A", "A \u{2192} A")
+end sna_behind_the_other_pointers
+
+@test("an alias for an Option of itself is refused")
+sna_inside_an_option()
+    sna_refused("type A = Option[A]\n", "A", "A \u{2192} A")
+    sna_refused("type A = Option[&A]\n", "A", "A \u{2192} A")
+    sna_refused("type A = Result[int, A]\n", "A", "A \u{2192} A")
+end sna_inside_an_option
+
+@test("an array, a view and a tuple of itself are refused")
+sna_inside_an_aggregate()
+    sna_refused("type A = [2]A\n", "A", "A \u{2192} A")
+    sna_refused("type A = []A\n", "A", "A \u{2192} A")
+    sna_refused("type A = (int, A)\n", "A", "A \u{2192} A")
+    sna_refused("type A = (int, []A)\n", "A", "A \u{2192} A")
+end sna_inside_an_aggregate
+
+@test("a callable taking or answering itself is refused")
+sna_inside_a_callable()
+    sna_refused("type F = &Fn(F) -> int\n", "F", "F \u{2192} F")
+    sna_refused("type F = &Fn(int) -> F\n", "F", "F \u{2192} F")
+    sna_refused("type F = *extern(x: F) -> i32\n", "F", "F \u{2192} F")
+end sna_inside_a_callable
+
+@test("an argument of a struct is part of its spelling, so the alias that fills one with itself is refused")
+sna_a_structs_argument()
+    if sna_skip() then return
+
+    // The shape that was accepted and half-resolved: `&Plain` read as `&Node[int, &?]`.
+    val out = sna_report(raw"""
+        struct Node[T, P]
+            item: T
+            kids: [2]Option[P]
+
+        type Plain = Node[int, &Plain]
+        type Shared = Node[int, &sync Shared]
+
+        main()
+            val leaf: &Plain = Node(1, [None, None])
+            val root: &Plain = Node(2, [Some(leaf), None])
+
+            print(root.item + leaf.item)
+        """, "")
+
+    sna_says(out, "Plain", "Plain \u{2192} Plain", "main.sysl", "5:1")
+    sna_says(out, "Shared", "Shared \u{2192} Shared", "main.sysl", "6:1")
+    assert(out.index_of("&?").is_none(), s"an unsettled type was shown: $out")
+    assert(out.index_of("aka").is_none(), s"the alias was spelled out: $out")
+end sna_a_structs_argument
+
+@test("two aliases naming each other through a wrapper are each refused, each over its own chain")
+sna_a_cycle_of_two()
+    if sna_skip() then return
+
+    val bare = sna_report("type A = B\ntype B = A\n", "")
+
+    sna_says(bare, "A", "A \u{2192} B \u{2192} A", "main.sysl", "1:1")
+    sna_says(bare, "B", "B \u{2192} A \u{2192} B", "main.sysl", "2:1")
+    assert(sna_errors(bare) == 2, bare)
+
+    val wrapped = sna_report("type A = *B\ntype B = [2]A\n", "")
+
+    sna_says(wrapped, "A", "A \u{2192} B \u{2192} A", "main.sysl", "1:1")
+    sna_says(wrapped, "B", "B \u{2192} A \u{2192} B", "main.sysl", "2:1")
+    assert(sna_errors(wrapped) == 2, wrapped)
+end sna_a_cycle_of_two
+
+@test("a cycle of three is told with every name on the way")
+sna_a_cycle_of_three()
+    if sna_skip() then return
+
+    val out = sna_report("type A = &B\ntype B = Option[C]\ntype C = (A, int)\n", "")
+
+    sna_says(out, "A", "A \u{2192} B \u{2192} C \u{2192} A", "main.sysl", "1:1")
+    sna_says(out, "B", "B \u{2192} C \u{2192} A \u{2192} B", "main.sysl", "2:1")
+    sna_says(out, "C", "C \u{2192} A \u{2192} B \u{2192} C", "main.sysl", "3:1")
+    assert(sna_errors(out) == 3, out)
+end sna_a_cycle_of_three
+
+@test("a generic alias that names itself is refused though nothing applies it")
+sna_a_generic_alias()
+    sna_refused("type L[T] = (T, Option[&L[T]])\n", "L", "L \u{2192} L")
+    sna_refused("type L[T] = Option[L[T]]\n", "L", "L \u{2192} L")
+    sna_refused("type L[T] = &L[(T, T)]\n", "L", "L \u{2192} L")
+end sna_a_generic_alias
+
+@test("two generic aliases naming each other through a reference are a cycle")
+sna_a_generic_cycle()
+    if sna_skip() then return
+
+    val out = sna_report("type G[T] = &H[T]\ntype H[T] = G[T]\n", "")
+
+    sna_says(out, "G", "G \u{2192} H \u{2192} G", "main.sysl", "1:1")
+    sna_says(out, "H", "H \u{2192} G \u{2192} H", "main.sysl", "2:1")
+    assert(sna_errors(out) == 2, out)
+end sna_a_generic_cycle
+
+@test("an alias handed itself as an argument another alias uses is refused, through that alias")
+sna_through_a_used_parameter()
+    if sna_skip() then return
+
+    val out = sna_report("type W[T] = &T\ntype A = W[A]\n", "")
+
+    sna_says(out, "A", "A \u{2192} W \u{2192} A", "main.sysl", "2:1")
+    assert(sna_errors(out) == 1, out)
+
+    val twice = sna_report("type W[T] = V[T]\ntype V[T] = (T, int)\ntype A = W[A]\n", "")
+
+    sna_says(twice, "A", "A \u{2192} W \u{2192} A", "main.sysl", "3:1")
+    assert(sna_errors(twice) == 1, twice)
+end sna_through_a_used_parameter
+
+@test("but an argument the other alias never uses is not part of the spelling")
+sna_an_unused_parameter_is_no_cycle()
+    sna_prints("type K[T] = int\ntype A = K[A]\n\nval a: A = 3\nprint(a)\n", "3\n")
+    sna_prints("type K[T] = K2[T]\ntype K2[T] = int\ntype C = K[C]\n\nval c: C = 4\nprint(c)\n", "4\n")
+end sna_an_unused_parameter_is_no_cycle
+
+@test("a 'new' type's argument is part of which type it is, so one filled with itself is refused")
+sna_a_phantom_argument()
+    if sna_skip() then return
+
+    val out = sna_report("type U[T] = new u64\ntype B = U[B]\n", "")
+
+    sna_says(out, "B", "B \u{2192} B", "main.sysl", "2:1")
+    assert(sna_errors(out) == 1, out)
+end sna_a_phantom_argument
+
+@test("a 'new' type of itself is refused in the same words, less what is said of an alias")
+sna_a_new_type_of_itself()
+    if sna_skip() then return
+
+    val out = sna_report("type D = new D\n", "")
+
+    assert(out.starts_with("error: 'D' is defined in terms of itself: D \u{2192} D\n --> "), out)
+    assert(sna_errors(out) == 1, out)
+end sna_a_new_type_of_itself
+
+@test("an alias that only mentions a refused one is not refused for it, and says nothing")
+sna_a_bystander()
+    if sna_skip() then return
+
+    val out = sna_report("type A = &A\ntype E = Option[A]\ntype P[T] = (T, T)\ntype Q = P[P[int]]\n", "")
+
+    sna_says(out, "A", "A \u{2192} A", "main.sysl", "1:1")
+    assert(sna_errors(out) == 1, out)
+end sna_a_bystander
+
+@test("a mention of a refused alias says nothing more, wherever it stands")
+sna_a_mention_is_quiet()
+    if sna_skip() then return
+
+    val out = sna_report(raw"""
+        type A = &A
+
+        struct Holder
+            one: A
+            many: [2]Option[A]
+
+        struct Box[T]
+            v: T
+
+        take(a: A, b: Box[A]) -> int = 1
+        give() -> Option[A] = None
+
+        main()
+            val a: Option[A] = None
+            val b: Box[Option[A]] = Box(None)
+            var c: *A = null
+
+            print(a.is_none())
+        """, "")
+
+    sna_says(out, "A", "A \u{2192} A", "main.sysl", "1:1")
+    assert(sna_errors(out) == 1, s"expected one diagnostic, got: $out")
+    assert(out.index_of("?").is_none(), s"an unsettled type was shown: $out")
+end sna_a_mention_is_quiet
+
+@test("an alias refused in one module is refused there, and a module that names it says nothing")
+sna_across_modules()
+    if sna_skip() then return
+
+    val out = sna_report("import geo.*\n\nmain()\n    val p: Option[Path] = None\n\n    print(p.is_none())\n",
+                         "module geo\n\ntype Path = (int, Option[&Path])\n")
+
+    sna_says(out, "Path", "Path \u{2192} Path", "geo.sysl", "3:1")
+    assert(sna_errors(out) == 1, s"expected one diagnostic, got: $out")
+end sna_across_modules
+
+@test("a struct that holds itself through an alias of itself is untouched")
+sna_a_struct_through_its_alias() =
+    sna_prints(raw"""
+        struct N
+            v: int
+            next: Option[&NA]
+
+        type NA = N
+        type Link = Option[&N]
+
+        main()
+            val last: &NA = N(2, None)
+            val first: &N = N(1, Some(last))
+            val l: Link = first.next
+
+            print(first.v + l.unwrap().v, last.next.is_none())
+        """, "3 true\n")
+
+@test("an enum that holds itself through an alias of itself is untouched")
+sna_an_enum_through_its_alias() =
+    sna_prints(raw"""
+        enum Tree
+            Leaf(n: int)
+            Fork(l: &Kid, r: &Kid)
+
+        type Kid = Tree
+
+        sum(t: &Tree) -> int = *t match
+            Leaf(n) -> n
+            Fork(l, r) -> sum(l) + sum(r)
+
+        main()
+            val t: &Kid = Fork(Leaf(1), Fork(Leaf(2), Leaf(3)))
+
+            print(sum(t))
+        """, "6\n")
+
+@test("an alias of a callable over a struct whose field names the alias is untouched")
+sna_an_alias_a_field_names_back()
+    sna_prints(raw"""
+        struct Loop
+            n: int
+            idle: Option[Callback]
+
+        type Callback = &Fn(*Loop) -> unit
+
+        main()
+            val l = Loop(4, None)
+
+            print(l.n, l.idle.is_none())
+        """, "4 true\n")
+
+    // The same through a generic struct and a generic alias, each naming the other.
+    sna_prints(raw"""
+        struct Cell[T]
+            v: T
+            next: Option[Next[T]]
+
+        type Next[T] = &Cell[T]
+
+        main()
+            val b: Next[int] = Cell(2, None)
+            val a: Next[int] = Cell(1, Some(b))
+
+            print(a.v + a.next.unwrap().v)
+        """, "3\n")
+end sna_an_alias_a_field_names_back
+
+@test("an alias applied to itself at another argument is one application inside another, not a cycle")
+sna_an_alias_applied_twice() =
+    sna_prints("type P[T] = (T, T)\ntype Q = P[P[int]]\n\nval q: Q = ((1, 2), (3, 4))\nprint((q.1).0)\n",
+               "3\n")
