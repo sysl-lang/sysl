@@ -124,6 +124,11 @@ read_decls(a: &Analysis, written: Buf[Program], has_entry_point: bool = true) ->
     for i in 0..<units.len()
         check_imports(a, scopes[i], units[i].body)
 
+    // **An alias that names itself is refused before anything reads a type**, so that no reading
+    // meets one half-followed: a struct's field, an assert or a signature that mentions it finds it
+    // already set aside.
+    refuse_alias_cycles(a)
+
     // A generic enum's pinned underlying type is refused before any of that, because it is the one
     // mistake in an enum declaration no instantiation would find: a generic enum nothing names is
     // never made real.
@@ -782,9 +787,8 @@ private resolve_named_subtypes(a: &Analysis)
 
         decl.kind match
             TypeOf(d) ->
-                if alias_cycle(a, decl.scope, key, d) then
-                    a.fault(decl.scope, decl.span,
-                            s"'${d.name}' is an alias for itself, through a chain of aliases")
+                if holds_string(a.tables.cyclic_aliases, key) then
+                    ()
                 elif !d.tp.names.is_empty() then
                     read_generic_alias(a, decl.scope, decl.span, d)
                 else
@@ -846,51 +850,201 @@ private read_generic_alias(a: &Analysis, scope: Scope, span: Span, d: TypeDecl)
                 s"not ${type_show(base)}")
 end read_generic_alias
 
-// Whether following a named subtype's base leads back to the name itself.
+// Every named subtype whose right-hand side leads back to its own name, refused where it is declared.
+//
+// **An alias is a second spelling of the type it names, so it has to have one.** `type A = B` over
+// `type B = A` has none, and neither has `type A = &A`, `type A = Option[A]` or
+// `type Plain = Node[int, &Plain]`: a pointer, a reference, a tuple, a callable and the ARGUMENTS of
+// a struct or an enum are all part of how a type is spelled, so a name met again inside any of them
+// is met again for ever. What ends a chain is a nominal type's own declaration -- the FIELDS of a
+// struct and the variants of an enum are not part of its spelling, which is why
+// `type Callback = &Fn(*Loop) -> unit` may be named by a field of `Loop`.
 //
 // The walk is what catches it rather than the resolve, which would otherwise recurse until the stack
-// ran out.
-private alias_cycle(a: &Analysis, scope: Scope, key: string, d: TypeDecl) -> bool
-    var seen: Buf[string] = buf()
-    var here = key
-    var base = d.base
-    var params = d.tp.names
-
-    for _step in 0..<64
-        val name = plain_alias_target(base)
-
-        if name.is_none() then return false
-
-        // A generic alias's own parameter is whatever it is applied to, never a declaration.
-        if holds_string(params, name.unwrap()) then return false
-
-        val next = lookup_type_key(a, scope, name.unwrap())
-
-        if next.is_none() then return false
-        if next.unwrap() == key then return true
-
-        val decl = a.tables.types.get(next.unwrap()).unwrap()
+// ran out, or -- one reading let back in -- hand out a type with a hole in it.
+private refuse_alias_cycles(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
 
         decl.kind match
-            TypeOf(inner) ->
-                if !is_plain_alias(inner) then return false
+            TypeOf(d) ->
+                var open: Buf[string] = buf()
+                var trail: Buf[string] = buf()
 
-                base = inner.base
-                params = inner.tp.names
-            _ -> return false
+                trail.push(d.name)
+
+                if leads_back(a, decl.scope, d.base, d.tp.names, key, open, trail)
+                    var chain = ""
+
+                    for name in trail
+                        chain = chain + name + " \u{2192} "
+
+                    val why = if d.derived then "" else " — an alias is a second spelling of " +
+                        "the type it names, and this one would never finish being spelled; a type " +
+                        "that refers to itself is a 'struct' or an 'enum'"
+
+                    a.fault(decl.scope, decl.span,
+                            s"'${d.name}' is defined in terms of itself: $chain${d.name}$why")
+                    a.tables.cyclic_aliases.push(key)
+                end if
+            _ -> ()
+end refuse_alias_cycles
+
+// Whether a written type, read inside the declaration `root`, comes round to `root` again.
+//
+// `params` are the parameters of the alias whose right-hand side `t` was written in: each is
+// whatever the alias is applied to, never a declaration. `open` holds the aliases whose right-hand
+// sides are being read, so that a loop among OTHER aliases is left where it closes -- it is theirs to
+// be refused for -- and `trail` holds the names followed, for the diagnostic to quote; a walk that
+// answers yes leaves the road it took there.
+private leads_back(a: &Analysis, scope: Scope, t: TypeRef, params: Buf[string], root: string,
+                   open: Buf[string], trail: Buf[string]) -> bool
+    *t.kind match
+        NamedType(name, args) -> return name_leads_back(a, scope, name, args, params, root, open, trail)
+        _ -> ()
+
+    for part in spelled_parts(t)
+        if leads_back(a, scope, part, params, root, open, trail) then return true
 
     false
-end alias_cycle
+end leads_back
 
-// The bare name a written type is, where it is one -- an alias chain is followed through names and
-// through nothing else.
-//
-// **A name applied to arguments is followed too**, so `type A[T] = B[T]` over `type B[T] = A[T]` is
-// the same chain written through parameters. Where the name is a struct or an enum the walk stops,
-// as it does for a bare one: a nominal type is where an alias chain ends.
-private plain_alias_target(t: TypeRef) -> Option[string] = *t.kind match
-    NamedType(name, _) -> Some(name)
-    _ -> None
+private name_leads_back(a: &Analysis, scope: Scope, name: string, args: Buf[TypeRef],
+                        params: Buf[string], root: string, open: Buf[string],
+                        trail: Buf[string]) -> bool
+    if holds_string(params, name) then return false
+
+    val found = lookup_type_key(a, scope, name)
+
+    if found.is_some()
+        val key = found.unwrap()
+
+        if key == root then return true
+
+        val decl = a.tables.types.get(key).unwrap()
+
+        decl.kind match
+            // A `new` type is a type of its own, so the chain ends at it as it does at a struct; what
+            // is left of its spelling is its arguments, read below.
+            TypeOf(inner) ->
+                if !inner.derived then
+                    return alias_leads_back(a, scope, key, decl.scope, inner, args, params, root, open,
+                                            trail)
+            _ -> ()
+    end if
+
+    for arg in args
+        if leads_back(a, scope, arg, params, root, open, trail) then return true
+
+    false
+end name_leads_back
+
+// A transparent alias met on the way: its right-hand side is read in its place, and then each
+// argument it was given -- but only an argument the right-hand side USES. `type K[T] = int` makes
+// `K[A]` the type `int` whatever `A` is, so `type A = K[A]` is spelled `int` and is no loop.
+private alias_leads_back(a: &Analysis, scope: Scope, key: string, home: Scope, inner: TypeDecl,
+                         args: Buf[TypeRef], params: Buf[string], root: string, open: Buf[string],
+                         trail: Buf[string]) -> bool
+    if holds_string(open, key) then return false
+
+    open.push(key)
+    trail.push(inner.name)
+
+    if leads_back(a, home, inner.base, inner.tp.names, root, open, trail) then return true
+
+    val _ = open.pop()
+
+    for i in 0..<args.len()
+        if i < inner.tp.names.len() && !uses_parameter(a, home, inner, i, 16) then continue
+
+        if leads_back(a, scope, args[i], params, root, open, trail) then return true
+
+    val _ = trail.pop()
+
+    false
+end alias_leads_back
+
+// Whether a generic alias's right-hand side mentions its `i`th parameter anywhere that reaches the
+// type it spells: written bare, inside a pointer or a tuple, as an argument of a nominal type, or as
+// an argument another alias uses in its turn. `fuel` bounds the turns through other aliases; out of
+// it the answer is yes, which only ever reads an argument that might have been skipped.
+private uses_parameter(a: &Analysis, scope: Scope, d: TypeDecl, i: usize, fuel: int) -> bool =
+    mentions_parameter(a, scope, d.base, d.tp.names, d.tp.names[i], fuel)
+
+private mentions_parameter(a: &Analysis, scope: Scope, t: TypeRef, params: Buf[string], p: string,
+                           fuel: int) -> bool
+    *t.kind match
+        NamedType(name, args) ->
+            if name == p then return true
+            if args.is_empty() then return false
+            if fuel == 0 then return true
+
+            val found = if holds_string(params, name) then None else lookup_type_key(a, scope, name)
+
+            if found.is_some()
+                val decl = a.tables.types.get(found.unwrap()).unwrap()
+
+                decl.kind match
+                    TypeOf(inner) ->
+                        if !inner.derived
+                            for j in 0..<args.len()
+                                if !mentions_parameter(a, scope, args[j], params, p, fuel) then continue
+
+                                if j >= inner.tp.names.len() ||
+                                        uses_parameter(a, decl.scope, inner, j, fuel - 1) then
+                                    return true
+                            end for
+
+                            return false
+                        end if
+                    _ -> ()
+            end if
+
+            for arg in args
+                if mentions_parameter(a, scope, arg, params, p, fuel) then return true
+
+            return false
+        _ -> ()
+
+    for part in spelled_parts(t)
+        if mentions_parameter(a, scope, part, params, p, fuel) then return true
+
+    false
+end mentions_parameter
+
+// The types a written type is spelled out of, other than a name's own arguments: what a pointer
+// points at, a tuple's parts, a callable's parameters and result.
+private spelled_parts(t: TypeRef) -> Buf[TypeRef]
+    var parts: Buf[TypeRef] = buf()
+
+    *t.kind match
+        PtrType(inner, _, _) -> parts.push(inner)
+        RefType(inner, _) -> parts.push(inner)
+        WeakType(inner) -> parts.push(inner)
+        ArrayType(_, elem, _) -> parts.push(elem)
+        VectorType(_, elem) -> parts.push(elem)
+        VolatileType(inner) -> parts.push(inner)
+        TupleType(inner, _) ->
+            for part in inner
+                parts.push(part)
+        FnType(ps, ret, _) ->
+            for part in ps
+                parts.push(part)
+
+            parts.push(ret)
+        CFnType(ps, ret, _, _) ->
+            for part in ps
+                parts.push(part)
+
+            parts.push(ret)
+        AssocType(base, _) -> parts.push(base)
+        AssocArgType(_, typ) -> parts.push(typ)
+        KeptParamType(typ, _) -> parts.push(typ)
+        _ -> ()
+
+    parts
+end spelled_parts
 
 // Every signature, resolved: the functions, the externs, the storage, and the members of every type.
 private resolve_signatures(a: &Analysis)

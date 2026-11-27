@@ -1176,7 +1176,11 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
             // wide)` is an `Option[u64]` call, where reading the literal alone refuses it at `int`
             // -- and the second pass reads it against that. Taken as a hard `?` it would have
             // settled the parameter at nothing, ahead of an argument that knew.
-            sandboxed_attempt(inner, e.unwrap()) match
+            val read = settling_attempt(inner, e.unwrap())
+
+            if read.1 then kept[i] = read.0
+
+            read.0 match
                 Some(t) ->
                     tys.push(texpr_type(t))
                     soft.push(adaptable(cx, e.unwrap(), t) || literal_valued(cx, e.unwrap()) ||
@@ -1185,7 +1189,8 @@ provisional_of(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string], pa
                     tys.push(Unknown)
                     soft.push(true)
 
-    seeded_readings(cx, span, scope, tparams, params, slots, written, held, known, needs, &tys, &soft)
+    seeded_readings(cx, span, scope, tparams, params, slots, written, held, known, needs, &tys, &soft,
+                    &kept)
 
     // With no callable to consult, a bare result standing in a `&T` is that `&T` (`box_wanted`).
     if held.is_empty()
@@ -1654,13 +1659,35 @@ sandboxed_arg(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     t
 end sandboxed_arg
 
-// A bare reading of an argument, with everything it said put back -- and nothing where it said
-// anything, the reference's `attempt`: a reading that was refused is no evidence about the type.
-private sandboxed_attempt(cx: &Analyzer, e: Expr) -> Option[TExpr]
-    val read = sandboxed_reading(cx, e)
+// The bare reading of an argument a solve unifies, and whether it was KEPT: nothing where it was
+// refused, the reference's `attempt` -- a reading that was refused is no evidence about the type.
+//
+// **A reading whose type names a closure it lowered is the one the program gets.** Every closure
+// literal is a type of its own, named by the counter, so `wrap(x -> x * 10)` read here is a
+// `W[closure 0]` and the solve settles a type parameter at exactly that. Thrown away, the counter
+// goes back and the name with it -- and the next closure the call lowers, a callable argument read
+// before this one is read again, takes it: the parameter was then settled at a `W` of the OTHER
+// closure, and the second reading of this argument, a closure of its own again, was refused as *"a
+// closure, but a closure was given"*. What settled the parameter has to be the node the call is
+// handed, as a callable's reading already is (`Provisional.kept`).
+//
+// Any other reading is put back whole, and the argument is read again at the parameter the solve
+// arrived at.
+private settling_attempt(cx: &Analyzer, e: Expr) -> (Option[TExpr], bool)
+    val tried = begin_trial(cx)
+    val t = type_expr(cx, e, None)
 
-    if read.1 then None else Some(read.0)
-end sandboxed_attempt
+    if refused_since(cx, tried)
+        discard_trial(cx, tried)
+        return (None, false)
+
+    if names_closure_between(texpr_type(t), tried.lowered, cx.an.closure_count)
+        keep_trial(cx)
+        return (Some(t), true)
+
+    discard_trial(cx, tried)
+    (Some(t), false)
+end settling_attempt
 
 // The same bare reading, answering what it produced and whether it was refused on the way.
 sandboxed_reading(cx: &Analyzer, e: Expr) -> (TExpr, bool)
@@ -1740,7 +1767,7 @@ end any_ref_mentions
 private seeded_readings(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string],
                         params: Buf[Param], slots: Buf[Option[Expr]], written: Buf[Option[Expr]],
                         held: Buf[usize], known: Buf[Binding], needs: Buf[string], tys: *Buf[Type],
-                        soft: *Buf[bool])
+                        soft: *Buf[bool], kept: *Buf[Option[TExpr]])
     var sub: Buf[Binding] = buf()
 
     for item in known
@@ -1764,8 +1791,11 @@ private seeded_readings(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[st
                 val outer = inner.variant_seed
 
                 inner.variant_seed = seed
-                val read = sandboxed_attempt(inner, e.unwrap())
+                val attempt = settling_attempt(inner, e.unwrap())
+                val read = attempt.0
                 inner.variant_seed = outer
+
+                if attempt.1 then kept[i] = read
 
                 if read.is_some()
                     tys[i] = texpr_type(read.unwrap())

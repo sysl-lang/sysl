@@ -1,0 +1,189 @@
+module sh.sysl.compiler
+
+import sysl.buf.{Buf, buf}
+
+// **A trait's default keeps its own type parameters apart from the implementing type's.**
+//
+// A member lowers to one function whose parameters are the type's followed by the member's own
+// (`hoist_members.sysl`'s `synthesize`), and everything downstream tells the two lists apart by name
+// alone. For a member written in the type that is a rule its author can keep, both lists being in
+// front of them. A default is written in the trait, by someone who cannot know what an implementing
+// type will call its parameters -- and `impl[U] Pick for Box[U]` inheriting `pick[U](self, u: U)`
+// would otherwise hand the default's `U` to `Box`'s.
+//
+// So the copy is lowered under a home whose clashing parameters carry a name no source can spell.
+// The default's body and signature are the trait's text and are left alone: nothing in them names the
+// block's parameters, which reach the copy only through what the block itself wrote -- its subject,
+// its bounds, its value parameters' types, and the arguments it handed the trait. Those are what is
+// rewritten here, so the copy's two lists never share a name and nothing reading it needs to know.
+
+// The name a block's parameter goes by inside a copied default that declares one of the same name.
+private apart_spelling(name: string) -> string = s"${ModuleSep}own_$name"
+
+// The home a default of `m`'s parameters is copied under: `home` itself where no name is shared.
+default_home_apart(a: &Analysis, home: MemberHome, m: MethodDecl) -> MemberHome
+    var from: Buf[string] = buf()
+    var to: Buf[string] = buf()
+
+    for tparam in home.tparams
+        if holds_string(m.tparams, tparam)
+            from.push(tparam)
+            to.push(apart_spelling(tparam))
+
+    if from.is_empty() then return home
+
+    var at = home
+    var bounds: Buf[NamedBounds] = buf()
+    var tvalues: Buf[TypeBinding] = buf()
+
+    for item in home.bounds
+        bounds.push(NamedBounds(apart_name(item.name, from, to), apart_bounds(item.bounds, from, to)))
+
+    for item in home.tvalues
+        tvalues.push(TypeBinding(apart_name(item.name, from, to), apart_ref(item.typ, from, to)))
+
+    at.tparams = apart_names(home.tparams, from, to)
+    at.tpacks = apart_names(home.tpacks, from, to)
+    at.bounds = bounds
+    at.tvalues = tvalues
+    at.self_ref = apart_ref(home.self_ref, from, to)
+
+    // What the block handed the trait was resolved with each of its parameters standing in for
+    // itself, so the stand-ins are what carry the old names there. The renamed ones are made the way
+    // the block's own were, which keeps every promise the block's bounds made; whatever that reading
+    // has to say was said when the block's own header was read.
+    val said = a.complaints()
+    val stand = abstract_subst(a, home.scope, at.tparams, at.bounds, at.tvalues, at.tpacks, buf())
+
+    a.restore_complaints(said)
+
+    var renamed: Buf[Binding] = buf()
+
+    for i in 0..<from.len()
+        val t = bound_type(stand, to[i])
+
+        if t.is_some() then renamed.push(Binding(from[i], t.unwrap()))
+
+    var outer: Buf[Binding] = buf()
+
+    for item in home.outer
+        outer.push(Binding(item.name, subst_params(a, item.ty, renamed)))
+
+    // A trait's value parameter the block fixed to one of its own names that parameter and nothing
+    // else (`hoist_impl.sysl`'s `trait_opened`).
+    var opened: Buf[Binding] = buf()
+
+    for item in home.opened
+        item.ty match
+            Abstract(n, bs) -> opened.push(Binding(item.name, Abstract(apart_name(n, from, to), bs)))
+            _ -> opened.push(item)
+
+    at.outer = outer
+    at.opened = opened
+    at
+end default_home_apart
+
+private apart_name(name: string, from: Buf[string], to: Buf[string]) -> string
+    for i in 0..<from.len()
+        if from[i] == name then return to[i]
+
+    name
+end apart_name
+
+private apart_names(names: Buf[string], from: Buf[string], to: Buf[string]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for name in names
+        out.push(apart_name(name, from, to))
+
+    out
+end apart_names
+
+private apart_bounds(bounds: Buf[BoundRef], from: Buf[string], to: Buf[string]) -> Buf[BoundRef]
+    var out: Buf[BoundRef] = buf()
+
+    for item in bounds
+        out.push(BoundRef(item.span, item.name, apart_refs(item.args, from, to)))
+
+    out
+end apart_bounds
+
+private apart_refs(ts: Buf[TypeRef], from: Buf[string], to: Buf[string]) -> Buf[TypeRef]
+    var out: Buf[TypeRef] = buf()
+
+    for t in ts
+        out.push(apart_ref(t, from, to))
+
+    out
+end apart_refs
+
+// A written type with each renamed parameter under its new name, wherever a type may name one: bare,
+// as an argument, as a pack, or inside a length, a lane count or a value argument.
+private apart_ref(t: TypeRef, from: Buf[string], to: Buf[string]) -> TypeRef = *t.kind match
+    NamedType(n, args) ->
+        if args.is_empty() then type_ref(t.span, NamedType(apart_name(n, from, to), args))
+        else type_ref(t.span, NamedType(n, apart_refs(args, from, to)))
+    ValueArgType(value) -> type_ref(t.span, ValueArgType(apart_expr(value, from, to)))
+    PtrType(inner, read_only, non_null) ->
+        type_ref(t.span, PtrType(apart_ref(inner, from, to), read_only, non_null))
+    RefType(inner, sync) -> type_ref(t.span, RefType(apart_ref(inner, from, to), sync))
+    WeakType(inner) -> type_ref(t.span, WeakType(apart_ref(inner, from, to)))
+    ArrayType(length, elem, read_only) ->
+        val count = if length.is_some() then Some(apart_expr(length.unwrap(), from, to)) else length
+
+        type_ref(t.span, ArrayType(count, apart_ref(elem, from, to), read_only))
+    VectorType(lanes, elem) ->
+        type_ref(t.span, VectorType(apart_expr(lanes, from, to), apart_ref(elem, from, to)))
+    VolatileType(inner) -> type_ref(t.span, VolatileType(apart_ref(inner, from, to)))
+    TupleType(parts, results) -> type_ref(t.span, TupleType(apart_refs(parts, from, to), results))
+    PackType(name) -> type_ref(t.span, PackType(apart_name(name, from, to)))
+    FnType(params, ret, bare) ->
+        type_ref(t.span, FnType(apart_refs(params, from, to), apart_ref(ret, from, to), bare))
+    CFnType(params, ret, abandons, non_null) ->
+        type_ref(t.span, CFnType(apart_refs(params, from, to), apart_ref(ret, from, to), abandons,
+                                 non_null))
+    AssocType(base, member) -> type_ref(t.span, AssocType(apart_ref(base, from, to), member))
+    AssocArgType(name, typ) -> type_ref(t.span, AssocArgType(name, apart_ref(typ, from, to)))
+    AssocBoundArgType(name, bounds) ->
+        type_ref(t.span, AssocBoundArgType(name, apart_bounds(bounds, from, to)))
+    KeptParamType(typ, lets_out) -> type_ref(t.span, KeptParamType(apart_ref(typ, from, to), lets_out))
+    SomeType(bounds) -> type_ref(t.span, SomeType(apart_bounds(bounds, from, to)))
+    InferredResult(_) -> t
+
+// A written count or value argument, looked into exactly as far as its form is read
+// (`resolve_type.sysl`'s `names_stand_in`): an operator's operands, a comparison's, a call's arguments
+// and an `if`'s condition and branches.
+private apart_expr(e: Expr, from: Buf[string], to: Buf[string]) -> Expr = *e.kind match
+    Ident(n) -> expr(e.span, Ident(apart_name(n, from, to)))
+    Unary(op, operand) -> expr(e.span, Unary(op, apart_expr(operand, from, to)))
+    Binary(op, l, r) -> expr(e.span, Binary(op, apart_expr(l, from, to), apart_expr(r, from, to)))
+    Compare(operands, ops) -> expr(e.span, Compare(apart_exprs(operands, from, to), ops))
+    Call(callee, args) -> expr(e.span, Call(callee, apart_exprs(args, from, to)))
+    NamedArg(name, value) -> expr(e.span, NamedArg(name, apart_expr(value, from, to)))
+    IfExpr(cond, then_body, else_body, from_elif) ->
+        val other = if else_body.is_some() then Some(apart_branch(else_body.unwrap(), from, to))
+                    else else_body
+
+        expr(e.span, IfExpr(apart_expr(cond, from, to), apart_branch(then_body, from, to), other,
+                            from_elif))
+    _ -> e
+
+private apart_exprs(es: Buf[Expr], from: Buf[string], to: Buf[string]) -> Buf[Expr]
+    var out: Buf[Expr] = buf()
+
+    for e in es
+        out.push(apart_expr(e, from, to))
+
+    out
+end apart_exprs
+
+private apart_branch(body: Buf[Stmt], from: Buf[string], to: Buf[string]) -> Buf[Stmt]
+    var out: Buf[Stmt] = buf()
+
+    for s in body
+        *s.kind match
+            ExprStmt(inner) -> out.push(stmt(s.span, ExprStmt(apart_expr(inner, from, to))))
+            _ -> out.push(s)
+
+    out
+end apart_branch

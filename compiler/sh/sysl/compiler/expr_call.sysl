@@ -2146,25 +2146,38 @@ private struct_targs(cx: &Analyzer, span: Span, key: string, home: Scope, sd: St
     var prov: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
 
-    for item in placed
-        if item.0 < 0 then continue
+    // **The values are read in the order the construction reads them, field by field, each from
+    // the closure count the one before it reached** (`sandboxed_read_in_turn`): the type a closure
+    // settles a parameter at is the closure's name, so it has to be the name the construction's own
+    // reading will arrive at.
+    var read: Buf[Option[TExpr]] = buf()
 
-        val value = item.1
-        val typ = sd.fields[usize(item.0)].typ
+    for item in placed
+        read.push(None)
+
+    val counted = cx.an.closure_count
+
+    for f in 0..<sd.fields.len()
+        for k in 0..<placed.len()
+            if placed[k].0 == int(f) && read[k].is_none()
+                val typ = sd.fields[f].typ
+                val want: Option[Type] = if ref_mentions(typ, sd.tparams) then None
+                                         else Some(resolve_qualified(cx.an, home, typ, no_bindings()))
+
+                read[k] = Some(sandboxed_read_in_turn(cx, placed[k].1, want))
+            end if
+
+    cx.an.closure_count = closure_rewind(cx.an, counted)
+
+    for k in 0..<placed.len()
+        if placed[k].0 < 0 then continue
+
+        val typ = sd.fields[usize(placed[k].0)].typ
+        val t = read[k].unwrap()
 
         field_refs.push(typ)
-
-        if !ref_mentions(typ, sd.tparams)
-            val want = resolve_qualified(cx.an, home, typ, no_bindings())
-            val t = sandboxed_read(cx, value, Some(want))
-
-            prov.push(texpr_type(t))
-            soft.push(false)
-        else
-            val t = sandboxed_read(cx, value, None)
-
-            prov.push(texpr_type(t))
-            soft.push(adaptable(cx, value, t))
+        prov.push(texpr_type(t))
+        soft.push(ref_mentions(typ, sd.tparams) && adaptable(cx, placed[k].1, t))
 
     solve(cx.an, home, cx.scope, span, key, sd.tparams, field_refs, prov, None, expected, soft, sd.bounds,
           buf())
@@ -3005,11 +3018,17 @@ private variant_instance(cx: &Analyzer, span: Span, named_at: Span, key: string,
     var prov: Buf[Type] = buf()
     var soft: Buf[bool] = buf()
 
+    // Each value from the closure count the one before it reached, as the variant's own reading
+    // will lower them (`sandboxed_read_in_turn`).
+    val counted = cx.an.closure_count
+
     for i in 0..<args.len()
-        val t = sandboxed_read(cx, args[i], None)
+        val t = sandboxed_read_in_turn(cx, args[i], None)
 
         prov.push(texpr_type(t))
         soft.push(adaptable(cx, args[i], t))
+
+    cx.an.closure_count = closure_rewind(cx.an, counted)
 
     val mark = cx.an.complaints()
     val targs = solve(cx.an, home, cx.scope, span, key, ed.tparams, field_refs, prov, None, None, soft,

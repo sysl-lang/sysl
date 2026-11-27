@@ -3064,6 +3064,24 @@ sandboxed_read(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
     t
 end sandboxed_read
 
+// One of several values read in a row to settle a type they share -- the fields of a construction,
+// the values of a variant -- with everything it said put back BUT the closure counter, which is left
+// where the reading took it and is the caller's to put back after the last.
+//
+// **Every closure literal is a type of its own, named by the counter**, so two values each read from
+// the same count are two closures of one name: `P((x: int) -> x, (a: int, b: int) -> a + b)` settled
+// both of its parameters at "closure 0", and the second value was refused for not being the first.
+// Read in turn, each is numbered as the reading the program gets will number it.
+sandboxed_read_in_turn(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
+    val tried = begin_trial(cx)
+    val t = analyze_expected(cx, e, expected)
+    val reached = cx.an.closure_count
+
+    discard_trial(cx, tried)
+    cx.an.closure_count = reached
+    t
+end sandboxed_read_in_turn
+
 // Whether an operand is a bracket list written where it stands, `[a, b]` or `[x; 4]`.
 private written_list(e: Expr) -> bool = *e.kind match
     ArrayLit(_) -> true
