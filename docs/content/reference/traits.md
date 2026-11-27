@@ -216,6 +216,29 @@ A default returning `Buf[int]`, or taking a struct the trait's module declares, 
 in the implementing module never substitutes for one the trait's module cannot see; that is
 reported once, at the trait. `Self` is the one name a copy takes from the `impl`.
 
+**That holds for a default's own type parameters too.** A trait's author cannot know what an
+implementing type calls its parameters, so a default declaring `[U]` and a type declaring `[U]` are
+two parameters that never meet: the receiver fixes the type's, and the call solves the default's.
+
+```sysl
+trait Pick
+    pick[U](self, u: U) -> U = u
+
+struct Box[U]
+    v: U
+
+impl[U] Pick for Box[U]
+
+print(Box(1).pick("x"))
+```
+
+```output
+x
+```
+
+A member written in the type's own block has both lists in front of its author, and there a shared
+name is refused.
+
 Beyond convenience, defaults let **a trait grow**: adding a member with a default does not break
 existing implementations, so a library can extend a trait after its first release.
 
