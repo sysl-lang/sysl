@@ -487,10 +487,18 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
         // A member's parameters and its type's are two lists that end up in one signature, so a name
         // used by both would leave the lowered function with two parameters of that name and nothing
         // to say which one a `T` in the body meant.
-        for j in 0..<m.tparams.len()
-            if holds_string(home.tparams, m.tparams[j]) then
-                a.fault(home.scope, m.span, s"'${home.label}' already declares a type parameter " +
-                        s"'${m.tparams[j]}', so member '${m.name}' cannot declare one of that name")
+        //
+        // **That is asked of a member written here, whose author has both lists in front of them.**
+        // An inherited default was written in the trait, by someone who cannot know what this type
+        // calls its parameters, so its copy keeps the two lists apart instead (`params_apart.sysl`).
+        if a.tables.members.default_origin.has(s"${home.symbol}.${m.name}${home.alt}") then
+            at = default_home_apart(a, home, m)
+        else
+            for j in 0..<m.tparams.len()
+                if holds_string(home.tparams, m.tparams[j]) then
+                    a.fault(home.scope, m.span, s"'${home.label}' already declares a type " +
+                            s"parameter '${m.tparams[j]}', so member '${m.name}' cannot declare " +
+                            "one of that name")
 
         // An associated function is reached by naming its type -- so the type needs a name a call
         // can be written through. A composed type has none: `[]int` is a type an `impl` may be
@@ -625,11 +633,14 @@ hoist_member_list(a: &Analysis, home: MemberHome, members: Buf[MethodDecl],
             // here would leave the binding to resolve a name nothing had bound yet — the parameters
             // arrive from the receiver's instantiation and `Self` is what ties them to it. The
             // signature's own `Self` stays as the trait wrote it and reads through this binding.
-            a.tables.members.generic_self.put(fd.name, home.self_ref)
+            //
+            // All three are read off the home the member was lowered under, which for a default
+            // sharing a parameter's name with the block is the one that keeps the two apart.
+            a.tables.members.generic_self.put(fd.name, at.self_ref)
             a.tables.members.generic_scope.put(fd.name, home.scope)
 
-            if !home.outer.is_empty() then a.tables.members.selves.put(fd.name, home.outer)
-            if !home.opened.is_empty() then a.tables.members.opened.put(fd.name, home.opened)
+            if !at.outer.is_empty() then a.tables.members.selves.put(fd.name, at.outer)
+            if !at.opened.is_empty() then a.tables.members.opened.put(fd.name, at.opened)
         else
             // The signature is resolved *before* the member joins the list of bodies to type, so a
             // type in it that does not resolve leaves the member out rather than half in.
