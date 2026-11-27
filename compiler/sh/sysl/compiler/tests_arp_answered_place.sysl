@@ -319,6 +319,130 @@ arp_storage_of_the_call_refused()
     arp_refused("struct Pair\n    a: int\n\n    get(*self) -> ref int\n        var x = self.a\n\n" +
                 "        x\n", arp_storage_msg("Pair.get"))
 
+// A place whose storage outlives the call but whose path does not start at a parameter: the refusal
+// names the place and the step no caller can follow, and never calls the storage the call's own.
+private arp_leaf() -> string = raw"""
+    struct Leaf
+        vals: [4]int
+        v: int
+
+    """
+
+private arp_unfollowed(text: string, member: string, place: string, step: string, advice: string)
+    val out = arp_said(arp_leaf() + text)
+    val want = s"'$member' answers '$place', a place reached through $step — and a '-> ref' member " +
+               "answers a field chain, an element or a dereference written from a parameter or " +
+               "module storage and nothing else. The caller keeps hold of the place by that path, " +
+               s"with its own arguments put in for the parameters, and $step is a step it cannot " +
+               s"follow, wherever the storage lies. $advice"
+
+    assert(out.contains(want), s"expected '$want' in: $out")
+    assert(!out.contains("storage of its own call"), s"the storage is not the call's own: $out")
+end arp_unfollowed
+
+private arp_call_advice() -> string =
+    "Reach the place by fields, elements and dereferences alone, or write a member that makes the " +
+    "write itself"
+
+@test("a '-> ref' place inside a node a call answered is refused by the path, not the storage")
+arp_through_a_calls_node_refused()
+    if !arp_ready() then return
+
+    arp_unfollowed(raw"""
+        struct Tree
+            root: &Leaf
+
+            leaf(*self) -> &Leaf = self.root
+            at(*self, i: usize) -> ref int = self.leaf().vals[i]
+        """, "Tree.at", "Tree.leaf(…).vals[…]", "what the call of 'Tree.leaf' answers",
+        arp_call_advice())
+
+@test("a '-> ref' place behind a raw pointer a call answered is refused by the path")
+arp_through_a_calls_pointer_refused()
+    if !arp_ready() then return
+
+    arp_unfollowed(raw"""
+        struct Tree
+            root: &Leaf
+
+            find(*self) -> *int = &self.root.v
+            at(*self) -> ref int = *self.find()
+        """, "Tree.at", "*Tree.find(…)", "what the call of 'Tree.find' answers", arp_call_advice())
+
+@test("a '-> ref' place through an unwrapped 'Option[&T]' names the instance that was called")
+arp_through_an_unwrapped_option_refused()
+    if !arp_ready() then return
+
+    arp_unfollowed(raw"""
+        struct Tree
+            next: Option[&Leaf]
+
+            at(*self) -> ref int = self.next.unwrap().v
+        """, "Tree.at", "sysl.Option.unwrap[&Leaf](…).v",
+        "what the call of 'sysl.Option.unwrap[&Leaf]' answers", arp_call_advice())
+
+@test("a '-> ref' place through a local that copies a reference or a pointer names the local")
+arp_through_a_copying_local_refused()
+    if !arp_ready() then return
+
+    arp_unfollowed(raw"""
+        struct Tree
+            root: &Leaf
+
+            at(*self, i: usize) -> ref int
+                val l = self.root
+
+                l.vals[i]
+        """, "Tree.at", "l.vals[…]", "the local 'l'", "Write the path from the parameter itself")
+    arp_unfollowed(raw"""
+        struct Tree
+            p: *int
+
+            at(*self) -> ref int
+                val q = self.p
+
+                *q
+        """, "Tree.at", "*q", "the local 'q'", "Write the path from the parameter itself")
+
+@test("a generic '-> ref' member over a pointer its own search answered is refused by the path")
+arp_generic_search_refused()
+    if !arp_ready() then return
+
+    arp_unfollowed(raw"""
+        struct Sorted[V]
+            vals: []V
+
+            place_of(*self, i: usize) -> *V = &self.vals[i]
+            entry(*self, i: usize) -> ref V = *self.place_of(i)
+
+        var m: Sorted[int] = Sorted(slot_storage(4))
+
+        slot_place(m.vals, 0, 1)
+        m.entry(0) += 1
+        """, "Sorted.entry.int", "*Sorted.place_of[int](…)",
+        "what the call of 'Sorted.place_of[int]' answers", arp_call_advice())
+
+@test("a '-> ref' place written from the parameter is answered: a node field, an index a call found")
+arp_paths_from_the_parameter_answered()
+    if !arp_ready() then return
+
+    arp_runs(arp_leaf() + raw"""
+        struct Tree
+            root: &Leaf
+            flat: [4]int
+
+            slot(*self, k: int) -> usize = usize(k) % 4
+            at(*self, i: usize) -> ref int = self.root.vals[i]
+            entry(*self, k: int) -> ref int = self.flat[self.slot(k)]
+
+        var t = Tree(Leaf([0; 4], 0), [0; 4])
+
+        t.at(1) += 5
+        t.entry(6) += 2
+        t.entry(2) += 1
+        print(t.root.vals[1], t.flat[2])
+        """, "5 3\n")
+
 @test("a '-> ref' body that is a value, or a place chosen by an 'if', has no address to answer")
 arp_not_a_place_refused()
     if !arp_ready() then return

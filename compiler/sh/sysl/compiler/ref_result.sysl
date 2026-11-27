@@ -85,7 +85,14 @@ answer_place(cx: &Analyzer, at: Span, name: string, params: Buf[(string, Type)],
         return body
     end if
 
-    if !rooted_in(place_root(cx, place), params) || !leaves_frame(cx, place)
+    val root = place_root(cx, place)
+
+    if !rooted_in(root, params) && !in_frame(cx, place, root)
+        cx.fault(place.span, unfollowed_msg(cx, shown, place, root))
+        return body
+    end if
+
+    if !rooted_in(root, params) || !leaves_frame(cx, place)
         cx.fault(place.span, s"'$shown' would answer a place in storage of its own call — a " +
                  "by-value parameter or a local — which is gone when it returns. A '-> ref' member " +
                  "answers a place its caller still holds: reached through a '*self' receiver, a " +
@@ -125,6 +132,65 @@ private is_return(s: TStmt) -> bool = s match
 private is_try(e: TExpr) -> bool = *e.kind match
     TTry(_, _, _, _, _, _, _) -> true
     _ -> false
+
+// Whether a place is part of a parameter's or a local's own bytes: its walk ends at a name and never
+// leaves that name's storage on the way.
+private in_frame(cx: &Analyzer, place: TExpr, root: TExpr) -> bool = *root.kind match
+    TLoad(_, _) -> !leaves_frame(cx, place)
+    _ -> false
+
+// The refusal of a place whose walk does not end at a parameter or module storage, though the
+// storage it lies in may well outlive the call -- an element of a node a search answered, a field
+// reached through a local that copies a reference. What is missing is not the storage but the path:
+// the template a caller's walks follow is written over the parameters, and a call's answer or a
+// local is a step no caller can put its own arguments into.
+private unfollowed_msg(cx: &Analyzer, shown: string, place: TExpr, root: TExpr) -> string
+    val step = *root.kind match
+        TLoad(n, _) -> s"the local '${written_local(n)}'"
+        TCall(name, _, _, _) -> s"what the call of '${shown_callee(cx, name)}' answers"
+        _ -> "a value the body made"
+
+    val advice = *root.kind match
+        TLoad(_, _) -> "Write the path from the parameter itself"
+        _ -> "Reach the place by fields, elements and dereferences alone, or write a member that " +
+             "makes the write itself"
+
+    s"'$shown' answers '${shown_place(cx, place)}', a place reached through $step — and a '-> ref' " +
+    "member answers a field chain, an element or a dereference written from a parameter or module " +
+    "storage and nothing else. The caller keeps hold of the place by that path, with its own " +
+    s"arguments put in for the parameters, and $step is a step it cannot follow, wherever the " +
+    s"storage lies. $advice"
+end unfollowed_msg
+
+// A place as it was written, near enough to name it: an index is `[…]`, a call its member's name.
+private shown_place(cx: &Analyzer, t: TExpr) -> string = *t.kind match
+    TLoad(n, _) -> written_local(n)
+    TGlobal(symbol, _, _) -> module_bare(symbol)
+    TAddrOf(p, _) -> shown_place(cx, p)
+    TIndex(recv, _, _) -> s"${shown_place(cx, recv)}[…]"
+    TDeref(op, _) -> placed_by(cx, op) match
+        Some(recv) -> s"${shown_place(cx, recv)}[…]"
+        None -> s"*${shown_place(cx, op)}"
+    TField(recv, index, _) ->
+        val head = *recv.kind match
+            TDeref(op, _) -> if placed_by(cx, op).is_some() then recv else op
+            _ -> recv
+
+        s"${shown_place(cx, head)}.${shown_field(texpr_type(recv), index)}"
+    TCall(name, _, _, _) -> s"${shown_callee(cx, name)}(…)"
+    _ -> "…"
+
+// A called function as a reader writes it: an instance is its declaration's name with the types it
+// was made at.
+private shown_callee(cx: &Analyzer, name: string) -> string =
+    instance_shown(cx.an, name, cx.an.tables.members.func_substs.get(name).unwrap_or(buf()))
+
+private shown_field(t: Type, index: int) -> string = repr(t) match
+    Struct(d) -> if index >= 0 && usize(index) < d.fields.len() then d.fields[usize(index)].0 else "?"
+    Ptr(inner, _, _) -> shown_field(*inner, index)
+    Ref(inner, _) -> shown_field(*inner, index)
+    Weak(inner) -> shown_field(*inner, index)
+    _ -> "?"
 
 // A member's lowered name as its declaration reads: `Kernel.task`, without the module.
 private shown_member(name: string) -> string
