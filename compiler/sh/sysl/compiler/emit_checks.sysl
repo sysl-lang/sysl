@@ -329,17 +329,22 @@ end check_exports_emitted
 // **Every export is asked, reached or not**: an export is a root, and a supplier whose module nothing
 // imports is exactly the one a seam keeps. What counts as the same type is what counts everywhere
 // else -- a name-only subtype (a measured `c type`, an exported alias) is its base, at any depth.
+//
+// **Every `extern` of the symbol is asked**, since each is a way callers reach the definition: two
+// modules declaring one symbol are two declarations the export has to answer, and the first
+// disagreement found is the one reported.
+//
+// **Whether a pointer may be null is the one thing the two sides need not say alike**
+// (`reference/ffi.md § The supplier is held to the declaration's signature`): a declaration may be
+// looser than the definition about what it passes and may promise less about what it gets back, never
+// more (`nullness_apart`).
 private exports_answer_externs(a: &Analysis, p: TProgram)
     var symbols: Buf[string] = buf()
     var keys: Buf[string] = buf()
 
     for i in 0..<a.tables.externs.len()
-        val key = a.tables.externs.key_at(i)
-        val symbol = extern_symbol(a.tables.externs.at(i))
-
-        if !holds_string(symbols, symbol)
-            symbols.push(symbol)
-            keys.push(key)
+        symbols.push(extern_symbol(a.tables.externs.at(i)))
+        keys.push(a.tables.externs.key_at(i))
 
     if symbols.is_empty() then return
 
@@ -347,16 +352,29 @@ private exports_answer_externs(a: &Analysis, p: TProgram)
         if f.exported.is_none() then continue
 
         for i in 0..<symbols.len()
-            if symbols[i] == f.exported.unwrap() then
-                export_against_extern(a, f, keys[i])
+            if symbols[i] == f.exported.unwrap() && !export_against_extern(a, f, keys[i]) then break
 end exports_answer_externs
 
-// One export against the `extern` its symbol names, reporting the first difference.
-private export_against_extern(a: &Analysis, f: TFunc, key: string)
+// Whether two types differ in nothing but whether a pointer may be null: `*T` beside `*nonnull T`,
+// `*const T` beside `*const nonnull T`, a `*extern(…)` beside its `*nonnull` form. Only the pointer
+// handed over counts -- what it points at, a field of a struct behind it included, is compared
+// exactly, because both sides read that storage and neither checks it.
+private nullness_apart(mine: Type, theirs: Type) -> bool =
+    never_null_pointer(mine) != never_null_pointer(theirs) &&
+        type_eq(may_be_null(repr(mine)), may_be_null(repr(theirs)))
+
+// A pointer type with its `nonnull` taken off; any other type as it is.
+private may_be_null(t: Type) -> Type = t match
+    Ptr(inner, ro, _) -> Ptr(inner, ro, false)
+    CFn(ps, r, marks) -> CFn(ps, r, with_nonnull(marks, false))
+    other -> other
+
+// One export against one `extern` its symbol names, reporting the first difference; whether they agree.
+private export_against_extern(a: &Analysis, f: TFunc, key: string) -> bool
     val d = a.tables.externs.get(key).unwrap()
     val home = a.tables.extern_scopes.get(key)
 
-    if home.is_none() then return
+    if home.is_none() then return true
 
     val scope = home.unwrap().scope
     var wants: Buf[(string, Type)] = buf()
@@ -381,7 +399,7 @@ private export_against_extern(a: &Analysis, f: TFunc, key: string)
     if has < want
         a.fault(at, f.span, lead + s"this one takes $has parameter${plural_s(has)}, but '$ext' " +
                 s"declares $want — the declaration also has ${shown_params(wants, has)}")
-        return
+        return false
     end if
 
     if has > want
@@ -390,24 +408,41 @@ private export_against_extern(a: &Analysis, f: TFunc, key: string)
         a.fault(at, f.span, lead + s"this one takes $has parameter${plural_s(has)}, but '$ext' " +
                 s"declares $want — ${shown_params(written_params(a, f), want)} $verb not in the " +
                 "declaration")
-        return
+        return false
     end if
 
     val names = written_params(a, f)
 
+    // A parameter's nullness may differ either way: a declaration saying `*T` where this one says
+    // `*nonnull T` lets a null through to the entry check, which every caller of the symbol meets,
+    // and one saying `*nonnull T` where this one says `*T` passes less than this one accepts.
     for i in 0..<has
         val mine = f.params[i].1
         val theirs = wants[i].1
 
-        if !type_eq(repr(mine), repr(theirs))
+        if !type_eq(repr(mine), repr(theirs)) && !nullness_apart(mine, theirs)
             a.fault(at, f.span, lead + s"its parameter ${i + 1}, '${names[i].0}', is " +
                     s"${type_show(mine)}, where '$ext' declares '${wants[i].0}: ${type_show(theirs)}'")
-            return
+            return false
 
-    if !(no_value(f.ret_ty) && no_value(answer)) && !type_eq(repr(f.ret_ty), repr(answer))
+    // A result's may differ one way only: the declaration may expect a null this one never gives,
+    // and may not be promised a pointer this one does not promise.
+    val results_differ = !(no_value(f.ret_ty) && no_value(answer)) && !type_eq(repr(f.ret_ty), repr(answer))
+    val only_nullness = results_differ && nullness_apart(f.ret_ty, answer)
+
+    if only_nullness && !never_null_pointer(f.ret_ty)
+        a.fault(at, f.span, lead + s"this one returns ${type_show(f.ret_ty)}, which may be null, " +
+                s"where '$ext' returns ${type_show(answer)}, which never is — the declaration " +
+                "promises its callers more than this definition gives. A declaration may promise " +
+                s"less than its definition, never more: return ${type_show(answer)} here, or " +
+                s"declare '$ext' as returning ${type_show(f.ret_ty)}")
+        return false
+    end if
+
+    if results_differ && !only_nullness
         a.fault(at, f.span, lead + s"this one returns ${shown_result(f.ret_ty)}, where '$ext' " +
                 s"returns ${shown_result(answer)}")
-        return
+        return false
 
     if f.variadic != d.variadic
         var which = s"this one is variadic and '$ext' is not"
@@ -415,6 +450,10 @@ private export_against_extern(a: &Analysis, f: TFunc, key: string)
         if d.variadic then which = s"'$ext' is variadic and this one is not"
 
         a.fault(at, f.span, lead + which)
+        return false
+    end if
+
+    true
 end export_against_extern
 
 // An exported function's parameters under the names its declaration wrote, which the typed tree has

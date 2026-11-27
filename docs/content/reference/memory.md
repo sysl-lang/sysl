@@ -3736,6 +3736,9 @@ print(*q, usize(bytes) == usize(q), usize(device))
 **A function pointer takes it too**: `*nonnull extern(int) -> int` is a callback that is never null,
 made by `&f`, with the same niche and the same refusals. At the C boundary `Option[*nonnull T]` is C's
 nullable `T *`, matched rather than compared ([`ffi.md`](/reference/ffi/#a-pointer-c-never-makes-null)).
+An `extern` and the `@export` defining its symbol may differ in a pointer's `nonnull`, one way for a
+result and either way for a parameter
+([the table](/reference/ffi/#the-supplier-is-held-to-the-declarations-signature)).
 
 ### Arithmetic: two directions, one spelling each
 
