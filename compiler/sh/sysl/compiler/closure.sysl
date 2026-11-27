@@ -322,6 +322,36 @@ closure_mismatch_hint(a: &Analysis, got: Type, wanted: Type) -> string
     s"from; to hold either, write the type as '&Fn$asked'"
 end closure_mismatch_hint
 
+// Whether a type names a closure literal lowered while the counter stood in `from..<upto`, anywhere
+// inside it: the closure itself, or one a generic type is applied to or a pointer, array or slice
+// reaches. That is what says a reading made its own type, one no second reading can arrive at.
+names_closure_between(t: Type, from: usize, upto: usize) -> bool = t match
+    Struct(d) -> (is_closure_literal(t) && numbered_between(d.base, from, upto)) ||
+                 any_names_closure_between(d.targs, from, upto)
+    Enum(d) -> any_names_closure_between(d.targs, from, upto)
+    Results(parts) -> any_names_closure_between(parts.targs, from, upto)
+    Ptr(inner, _, _) -> names_closure_between(*inner, from, upto)
+    Ref(inner, _) -> names_closure_between(*inner, from, upto)
+    Weak(inner) -> names_closure_between(*inner, from, upto)
+    Array(_, elem, _) -> names_closure_between(*elem, from, upto)
+    Slice(elem, _) -> names_closure_between(*elem, from, upto)
+    _ -> false
+
+private any_names_closure_between(ts: Buf[Type], from: usize, upto: usize) -> bool
+    for item in ts
+        if names_closure_between(item, from, upto) then return true
+
+    false
+end any_names_closure_between
+
+// Whether a closure's name is one the counter gave out in `from..<upto`, in either of its two forms.
+private numbered_between(base: string, from: usize, upto: usize) -> bool
+    for n in from..<upto
+        if base == closure_base(n) || base == lending_closure_base(n) then return true
+
+    false
+end numbered_between
+
 // The first two closures standing at the same place in two types and not the same closure: the types
 // themselves, or a pair inside what both apply or point at.
 private closures_apart(got: Type, wanted: Type) -> Option[(Type, Type)]

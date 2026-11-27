@@ -1,0 +1,535 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A trait default's own type parameters are kept apart from the implementing type's**
+// (`params_apart.sysl`). A trait's author cannot know what an implementing type calls its parameters,
+// so `impl[U] Pick for Box[U]` inherits `pick[U](self, u: U)` with two `U`s that never meet: the
+// default's is what the call solves, the type's is what the receiver brought.
+//
+// The cells: one shared name and two; a type parameter and a value parameter of the shared name; a
+// trait in the program and in a `--lib` root; a member, a property, an associated function and a
+// `derive` member; a block over a struct, a slice and an array; the trait's own argument fixed to the
+// shared parameter; a bound on either list; a call written directly, with its list written out,
+// through a bound, and beside a trait object's call. A name one author wrote into both lists is
+// still refused.
+
+// What a one-file program prints, or what stopped it.
+private tda_ran(text: string) -> string
+    val root = azd_temp("sysl-tda")
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tda_ran
+
+// What `program` prints, built with a `--lib` root holding the module `pk` -- or what the build said.
+private tda_lib_ran(pk: string, program: string) -> string
+    val lib = azd_temp("sysl-tda-lib")
+    val prog = azd_temp("sysl-tda-prog")
+
+    make_dir_all(s"$lib/pk").unwrap()
+    write_text(s"$lib/pk/pk.sysl", pk).unwrap()
+    write_text(s"$prog/main.sysl", program).unwrap()
+
+    val (code, said) = azd_cli(["sysl", "build", s"$prog/main.sysl", "--lib", lib, "-o", s"$prog/built"])
+
+    if code != 0
+        remove_dir_all(lib).unwrap_or(())
+        remove_dir_all(prog).unwrap_or(())
+        return said
+    end if
+
+    val ran = capture(s"$prog/built", [], "", [], true)
+
+    remove_dir_all(lib).unwrap_or(())
+    remove_dir_all(prog).unwrap_or(())
+
+    ran match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end tda_lib_ran
+
+@test("a default and the implementing type share a parameter name")
+tda_one_shared_name()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Pick
+            pick[U](self, u: U) -> U = u
+
+        struct Box[U]
+            v: U
+
+        impl[U] Pick for Box[U]
+
+        print(Box(1).pick("x"))
+        print(Box("s").pick(2.5))
+        """), "x\n2.5\n")
+end tda_one_shared_name
+
+@test("two shared names, solved and written out, beside a member the block wrote over its own")
+tda_two_shared_names()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Pair2
+            tag(self) -> string
+
+            pair[A, B](self, a: A, b: B) -> (string, A, B) = (self.tag(), a, b)
+
+        struct Two[A, B]
+            a: A
+            b: B
+
+        impl[A, B] Pair2 for Two[A, B]
+            tag(self) -> string = "two"
+
+        val (t, x, y) = Two(1, 2.5).pair("s", true)
+
+        print(t)
+        print(x)
+        print(y)
+        print(Two("p", 'c').pair[int, real](4, 0.5).2)
+        """), "two\ns\ntrue\n0.5\n")
+end tda_two_shared_names
+
+@test("a property default and member defaults, with Self still the implementing type")
+tda_property_and_member()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Named
+            size -> int
+
+            double -> int = self.size * 2
+
+            pick[U](self, u: U) -> U = u
+
+            me(self) -> Self = self
+
+            both[U](self, u: U) -> (Self, U) = (self, u)
+
+        struct Box[U]
+            v: U
+
+        impl[U] Named for Box[U]
+            size -> int = 4
+
+        val b = Box("in")
+
+        print(b.double)
+        print(b.pick(9))
+
+        val (s, n) = b.both(2.5)
+
+        print(s.v)
+        print(n)
+        print(b.me().v)
+        """), "8\n9\nin\n2.5\nin\n")
+end tda_property_and_member
+
+@test("the implementing type's parameter of that name is a value parameter")
+tda_value_parameter()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Pick
+            count(self) -> usize
+
+            pick[U](self, u: U) -> (usize, U) = (self.count(), u)
+
+        struct Arr[const U: usize]
+            xs: [U]int
+
+        impl[const U: usize] Pick for Arr[U]
+            count(self) -> usize = U
+
+        val (n, s) = Arr([1, 2, 3]).pick("v")
+
+        print(n)
+        print(s)
+        """), "3\nv\n")
+end tda_value_parameter
+
+@test("a value parameter of that name handed to the trait is read per instantiation")
+tda_value_parameter_opened()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Sized[const N: usize]
+            held[M](self, m: M) -> (usize, M) = (N, m)
+
+        struct Bits[const M: usize]
+            xs: [M]u8
+
+        impl[const M: usize] Sized[M] for Bits[M]
+
+        val (k, t) = Bits([1u8, 2u8]).held("h")
+
+        print(k)
+        print(t)
+
+        val (k5, t5) = Bits([1u8, 2u8, 3u8, 4u8, 5u8]).held(1.5)
+
+        print(k5)
+        print(t5)
+        """), "2\nh\n5\n1.5\n")
+end tda_value_parameter_opened
+
+@test("the trait's own argument is the parameter the default shares a name with")
+tda_trait_argument()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Get[T]
+            get(self) -> T
+
+            with[U](self, u: U) -> (T, U) = (self.get(), u)
+
+        struct Cell[U]
+            v: U
+
+        impl[U] Get[U] for Cell[U]
+            get(self) -> U = self.v
+
+        struct Many[U]
+            v: U
+
+        impl[U] Get[[]U] for Many[U]
+            get(self) -> []U = [self.v, self.v]
+
+        val (a, b) = Cell(7).with("w")
+
+        print(a)
+        print(b)
+
+        val (c, d) = Many(2.5).with(true)
+
+        print(c.len)
+        print(c[1])
+        print(d)
+        """), "7\nw\n2\n2.5\ntrue\n")
+end tda_trait_argument
+
+@test("each list keeps the bound written on it")
+tda_bounds_on_both()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Same
+            same(self, o: Self) -> bool
+
+            both[U: Eq](self, a: U, b: U) -> bool = self.same(self) && a == b
+
+        struct Wrap[U]
+            v: U
+
+        impl[U: Eq] Same for Wrap[U]
+            same(self, o: Self) -> bool = self.v == o.v
+
+        print(Wrap(1).both("a", "a"))
+        print(Wrap("s").both(2.0, 3.0))
+        """), "true\nfalse\n")
+end tda_bounds_on_both
+
+@test("the default's bound is asked of the default's parameter, not the type's")
+tda_bound_of_the_default_alone()
+    if !azd_ready() then return
+
+    val out = tda_ran(raw"""
+        trait Mark
+            mark(self) -> int
+
+        impl Mark for int
+            mark(self) -> int = self
+
+        trait Pick
+            pick[U: Mark](self, u: U) -> int = u.mark()
+
+        struct Box[U]
+            v: U
+
+        impl[U] Pick for Box[U]
+
+        print(Box("unmarked").pick(4))
+        print(Box(4).pick("unmarked"))
+        """)
+
+    assert(out.contains("'Box.pick' requires its type parameter 'U' to implement 'Mark', but string " +
+                        "does not"), out)
+    assert(!out.contains("but int does not"), out)
+end tda_bound_of_the_default_alone
+
+@test("called through a bound, and beside a trait object's call")
+tda_bound_and_object()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Pick
+            name(self) -> string = "picked"
+
+            pick[U](self, u: U) -> U = u
+
+        struct Box[U]
+            v: U
+
+        impl[U] Pick for Box[U]
+
+        via[X: Pick, U](x: X, u: U) -> U = x.pick(u)
+
+        print(via(Box(1), "bound"))
+        print(via(Box("s"), 5))
+
+        val o: &Pick = Box(2)
+
+        print(o.name())
+        """), "bound\n5\npicked\n")
+end tda_bound_and_object
+
+@test("a derive member's own parameter, and the deriving type's parameter under either name")
+tda_derive_member()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Sink
+            put(*self, s: string)
+
+        trait Show
+            show[S: Sink](self, s: *S)
+
+            derive[T] show[S: Sink](self: T, s: *S)
+                s.put(T::BaseName)
+
+                for const f in T::Fields
+                    s.put(s" ${f.name}=")
+                    self.(f).show(s)
+
+        impl Show for int
+            show[S: Sink](self, s: *S) = s.put(s"$self")
+
+        struct Plain
+            out: string
+
+        impl Sink for Plain
+            put(*self, s: string) = self.out = self.out + s
+
+        struct Gen[S] derives Show
+            x: S
+
+        struct Other[T] derives Show
+            x: T
+
+        var p = Plain("")
+
+        Gen(1).show(&p)
+        p.put(" ")
+        Other(Gen(2)).show(&p)
+        print(p.out)
+        """), "Gen x=1 Other x=Gen x=2\n")
+end tda_derive_member
+
+@test("a block over a slice and over an array whose length shares the name")
+tda_shapes()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Pick
+            count(self) -> usize
+
+            pick[U](self, u: U) -> (usize, U) = (self.count(), u)
+
+            sized[N](self, n: N) -> (usize, N) = (self.count(), n)
+
+        impl[U] Pick for []U
+            count(self) -> usize = self.len
+
+        impl[U, const N: usize] Pick for [N]U
+            count(self) -> usize = N
+
+        val xs: []int = [1, 2, 3]
+        val (n, s) = xs.pick("slice")
+
+        print(n)
+        print(s)
+
+        val arr = [1.5, 2.5]
+        val (k, t) = arr.sized("array")
+
+        print(k)
+        print(t)
+        print(arr.pick('c').1)
+        """), "3\nslice\n2\narray\nc\n")
+end tda_shapes
+
+@test("the default's body names its parameter in a local, a closure and a call's own list")
+tda_body_names_the_parameter()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        import sysl.buf.{Buf, buf}
+
+        trait Pick
+            pick[U](self, u: U) -> U = u
+
+            kept[U](self, u: U) -> Buf[U]
+                var held: Buf[U] = buf()
+                val again = (x: U) -> x
+
+                held.push(again(u))
+                held.push(self.pick[U](u))
+                held
+
+        trait Make
+            make[U](u: U) -> U = u
+
+        struct Box[U]
+            v: U
+
+        impl[U] Pick for Box[U]
+
+        impl[U] Make for Box[U]
+
+        val b = Box(7).kept("kept")
+
+        print(b.len())
+        print(b[1])
+        print(Box[int].make("made"))
+        """), "2\nkept\nmade\n")
+end tda_body_names_the_parameter
+
+private tda_library() -> string = raw"""
+    module pk
+
+    struct Held[U]
+        v: U
+
+    trait Pick
+        tag(self) -> string
+
+        pick[U](self, u: U) -> Held[U] = Held(u)
+
+        named[U, F](self, u: U, f: F) -> (string, U, F) = (self.tag(), u, f)
+    """
+
+@test("the trait in a library and the impl in a program, its bound a trait the library never saw")
+tda_library_trait()
+    if !azd_ready() then return
+
+    assert_eq(tda_lib_ran(tda_library(), raw"""
+        import pk.Pick
+
+        trait Mine
+            mine(self) -> string
+
+        impl Mine for int
+            mine(self) -> string = s"mine $self"
+
+        struct MapIter[I, F, U]
+            i: I
+            f: F
+            u: U
+
+        impl[I, F: Mine, U] Pick for MapIter[I, F, U]
+            tag(self) -> string = self.f.mine()
+
+        val m = MapIter("i", 3, 2.5)
+
+        print(m.pick("lib").v)
+
+        val (t, u, f) = m.named(true, 'c')
+
+        print(t)
+        print(u)
+        print(f)
+        """), "lib\nmine 3\ntrue\nc\n")
+end tda_library_trait
+
+@test("a member the block supplies may spell its parameter otherwise")
+tda_supplied_under_another_name()
+    if !azd_ready() then return
+
+    assert_eq(tda_ran(raw"""
+        trait Pick
+            pick[U](self, u: U) -> U
+
+        struct Box[U]
+            v: U
+
+        impl[U] Pick for Box[U]
+            pick[V](self, v: V) -> V = v
+
+        print(Box(1).pick("x"))
+        """), "x\n")
+end tda_supplied_under_another_name
+
+@test("a member written in the type's own block may not take the type's name")
+tda_own_member_refused()
+    if !azd_ready() then return
+
+    val out = tda_ran(raw"""
+        struct Box[U]
+            v: U
+
+        impl[U] Box[U]
+            own[U](self, u: U) -> U = u
+
+        print(Box(1).own("x"))
+        """)
+
+    assert(out.contains("'Box' already declares a type parameter 'U', so member 'own' cannot " +
+                        "declare one of that name"), out)
+end tda_own_member_refused
+
+@test("a member the block itself supplies may not take the block's name")
+tda_supplied_member_refused()
+    if !azd_ready() then return
+
+    val out = tda_ran(raw"""
+        trait Pick
+            pick[U](self, u: U) -> U
+
+        struct Box[U]
+            v: U
+
+        impl[U] Pick for Box[U]
+            pick[U](self, u: U) -> U = u
+
+        print(Box(1).pick("x"))
+        """)
+
+    assert(out.contains("'Box' already declares a type parameter 'U', so member 'pick' cannot " +
+                        "declare one of that name"), out)
+end tda_supplied_member_refused
+
+@test("a type declaring one name twice in its own list is refused")
+tda_one_list_twice_refused()
+    if !azd_ready() then return
+
+    val out = tda_ran(raw"""
+        struct Two[A, A]
+            a: A
+
+        print(1)
+        """)
+
+    assert(out.contains("each argument of 'Two[A, A]' takes a type parameter of its own, and this " +
+                        "'impl' names 'A' twice"), out)
+end tda_one_list_twice_refused

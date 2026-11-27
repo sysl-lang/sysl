@@ -1,0 +1,350 @@
+module sh.sysl.compiler
+@tests
+
+// Every closure literal is a struct of its own, named by a counter, and a generic call settles a type
+// parameter from a reading of its argument that it then throws away. Where that argument's type
+// names a closure the reading lowered -- `wrap(x -> x * 10)` is a `W[closure 0]` -- the name went
+// back with the counter and the next closure the call lowered took it: `use2(wrap(x -> x * 10),
+// (a, b) -> a + b)` settled its `T` at a `W` of the two-argument arrow and refused the nest as *"a
+// closure, but a closure was given"*. Every adapter chain written as calls has that shape.
+//
+// Run here at each place the nest can stand (either side of the callable, beside another nest, in a
+// variant, a tuple, a default, a member call, a closure's own body, a generic body), with closures of
+// one signature and of two, capturing and not, two and three deep -- and at a generic construction,
+// whose values were each read from the same count and so were two closures of one name.
+//
+// Beside them: a program that is wrong is still refused, once, and says what differs.
+
+// `text` is refused with exactly one complaint, and that complaint is `message`.
+private ncg_refused(text: string, message: string)
+    if !rng_ready() then return
+
+    val said = rng_ran(text) match
+        Err(why) -> why
+        Ok(_) -> ""
+
+    assert(said.contains(s"error: $message\n"), s"no '$message' in:\n$said")
+
+    val first = said.index_of("error: ").unwrap() + 7
+
+    assert(!said[first..<said.bytes.len].contains("error: "), s"more than one complaint in:\n$said")
+end ncg_refused
+
+private const NcgWrap: string = raw"""
+    struct W[F]
+        f: F
+
+    wrap[G: Fn1[int, int]](g: G) -> W[G] = W(g)
+
+    use2[T](w: T, h: (int, int) -> int) -> int = h(1, 2)
+
+    run[F: Fn1[int, int]](w: W[F], h: (int, int) -> int) -> int = h(w.f(1), 2)
+
+    """
+
+private const NcgIt: string = raw"""
+    trait It
+        type Item
+        next(*self) -> Option[Self::Item]
+
+    struct Count
+        n: int
+        stop: int
+
+    impl It for Count
+        type Item = int
+        next(*self) -> Option[int]
+            if self.n >= self.stop then return None
+            val v = self.n
+            self.n += 1
+            Some(v)
+
+    struct MapIt[I, F, U]
+        src: I
+        f: F
+
+    impl[I: It, F: Fn1[I::Item, U], U] It for MapIt[I, F, U]
+        type Item = U
+        next(*self) -> Option[U]
+            self.src.next() match
+                Some(x) -> Some(self.f(x))
+                None -> None
+
+    struct TakeIt[I]
+        src: I
+        left: int
+
+    impl[I: It] It for TakeIt[I]
+        type Item = I::Item
+        next(*self) -> Option[I::Item]
+            if self.left <= 0 then return None
+            self.left -= 1
+            self.src.next()
+
+    struct FilterIt[I, P]
+        src: I
+        p: P
+
+    impl[I: It, P: Fn1[I::Item, bool]] It for FilterIt[I, P]
+        type Item = I::Item
+        next(*self) -> Option[I::Item]
+            loop
+                self.src.next() match
+                    Some(x) -> if self.p(x) then return Some(x)
+                    None -> return None
+
+    map[I: It, R, G: Fn1[I::Item, R]](it: I, g: G) -> MapIt[I, G, R] = MapIt(it, g)
+
+    take[I: It](it: I, n: int) -> TakeIt[I] = TakeIt(it, n)
+
+    filter[I: It, P: Fn1[I::Item, bool]](it: I, p: P) -> FilterIt[I, P] = FilterIt(it, p)
+
+    fold[I: It, A](it: I, init: A, f: (A, I::Item) -> A) -> A
+        var acc = init
+        var cur = it
+        loop
+            cur.next() match
+                Some(x) -> acc = f(acc, x)
+                None -> break
+        acc
+    end fold
+
+    """
+
+@test("a generic call over a closure, standing before a bare arrow of another shape")
+ncg_nest_then_arrow()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + "main()\n    print(use2(wrap(x -> x * 10), (a, b) -> a + b))\n" +
+               "    print(run(wrap(x -> x * 10), (a, b) -> a + b))\n", "3\n12\n")
+end ncg_nest_then_arrow
+
+@test("and standing after it")
+ncg_arrow_then_nest()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + "use2b[T](h: (int, int) -> int, w: T) -> int = h(1, 2)\n" +
+               "run2b[F: Fn1[int, int]](h: (int, int) -> int, w: W[F]) -> int = h(w.f(1), 2)\n\n" +
+               "main()\n    print(use2b((a, b) -> a + b, wrap(x -> x * 10)))\n" +
+               "    print(run2b((a, b) -> a + b, wrap(x -> x * 10)))\n", "3\n12\n")
+end ncg_arrow_then_nest
+
+@test("two closures of one signature, the outer a bare arrow and then a bounded parameter")
+ncg_same_signature()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + "use1[F: Fn1[int, int]](w: W[F], h: (int) -> int) -> int = h(w.f(1))\n" +
+               "both[F: Fn1[int, int], H: Fn1[int, int]](w: W[F], h: H) -> int = h(w.f(4))\n\n" +
+               "main()\n    print(use1(wrap(x -> x * 10), y -> y + 1))\n" +
+               "    print(both(wrap(x -> x * 10), y -> y + 1))\n", "11\n41\n")
+end ncg_same_signature
+
+@test("either closure capturing, and both")
+ncg_capturing()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + "main()\n    val k = 7\n" +
+               "    print(run(wrap(x -> x * k), (a, b) -> a + b + k))\n" +
+               "    print(run(wrap(x -> x * 3), (a, b) -> a + b + k))\n" +
+               "    print(run(wrap(x -> x * k), (a, b) -> a + b))\n", "16\n12\n9\n")
+end ncg_capturing
+
+@test("two nests beside one callable, before it and around it")
+ncg_two_nests()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + "use3[S, T](v: S, w: T, h: (int, int) -> int) -> int = h(1, 2)\n" +
+               "run3[F: Fn1[int, int], G: Fn1[int, int]](v: W[F], h: (int, int) -> int, w: W[G]) -> int =\n" +
+               "    h(v.f(1), w.f(1))\n\n" +
+               "main()\n    print(use3(wrap(x -> x + 1), wrap(x -> x * 2), (a, b) -> a + b))\n" +
+               "    print(run3(wrap(x -> x + 1), (a, b) -> a * b, wrap(x -> x * 5)))\n", "3\n10\n")
+end ncg_two_nests
+
+@test("a chain two and three deep, a literal closure at every level")
+ncg_three_deep()
+    if !rng_ready() then return
+
+    rng_prints(NcgIt + "main()\n" +
+               "    print(fold(map(Count(0, 4), x -> x * 10), 0, (a, b) -> a + b))\n" +
+               "    print(fold(map(map(Count(0, 4), x -> x * 10), y -> y + 1), 0, (a, b) -> a + b))\n" +
+               "    print(fold(filter(take(map(Count(0, 10), x -> x * 10), 3), v -> v > 5), 0, " +
+               "(a, b) -> a + b))\n", "60\n64\n30\n")
+end ncg_three_deep
+
+@test("the same nest through member calls: as the receiver, as a member's argument, and both")
+ncg_member_calls()
+    if !rng_ready() then return
+
+    rng_prints(NcgIt + raw"""
+        impl Count
+            mapped[R, G: Fn1[int, R]](self, g: G) -> MapIt[Count, G, R] = MapIt(self, g)
+            folded[I: It, A](self, it: I, init: A, f: (A, I::Item) -> A) -> A = fold(it, init, f)
+
+        impl[I: It, F: Fn1[I::Item, U], U] MapIt[I, F, U]
+            summed[A](self, init: A, f: (A, U) -> A) -> A = fold(self, init, f)
+            kept[P: Fn1[U, bool]](self, p: P) -> FilterIt[MapIt[I, F, U], P] = FilterIt(self, p)
+            again[R, G: Fn1[U, R]](self, g: G) -> MapIt[MapIt[I, F, U], G, R] = MapIt(self, g)
+
+        main()
+            print(Count(0, 4).mapped(x -> x * 10).summed(0, (a, b) -> a + b))
+            print(fold(Count(0, 4).mapped(x -> x * 10), 0, (a, b) -> a + b))
+            print(Count(5, 5).folded(map(Count(0, 4), x -> x * 10), 0, (a, b) -> a + b))
+            print(fold(Count(0, 4).mapped(x -> x * 10).kept(v -> v > 5), 0, (a, b) -> a + b))
+            print(Count(0, 4).mapped(x -> x * 10).again(y -> y + 1).summed(1, (a, b) -> a + b))
+        """, "60\n60\n60\n60\n65\n")
+end ncg_member_calls
+
+@test("the nest inside a variant and inside a tuple")
+ncg_in_variant_and_tuple()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + raw"""
+        opt[F: Fn1[int, int]](o: Option[W[F]], h: (int, int) -> int) -> int
+            o match
+                Some(w) -> h(w.f(1), 2)
+                None -> 0
+
+        tup[F: Fn1[int, int]](p: (W[F], int), h: (int, int) -> int) -> int = h(p.0.f(1), p.1)
+
+        two[F: Fn1[int, int], G: Fn1[int, int]](p: (W[F], W[G]), h: (int, int) -> int) -> int =
+            h(p.0.f(1), p.1.f(1))
+
+        main()
+            print(opt(Some(wrap(x -> x * 10)), (a, b) -> a + b))
+            print(use2(Some(wrap(x -> x * 10)), (a, b) -> a + b))
+            print(tup((wrap(x -> x * 10), 2), (a, b) -> a + b))
+            print(two((wrap(x -> x * 10), wrap(y -> y + 1)), (a, b) -> a + b))
+        """, "12\n3\n12\n12\n")
+end ncg_in_variant_and_tuple
+
+@test("the nest as a parameter's default, of a function and of a member")
+ncg_in_a_default()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + raw"""
+        dflt[T](h: (int, int) -> int, w: T = wrap(x -> x)) -> int = h(1, 2)
+
+        struct K
+            n: int
+
+        impl K
+            dflt[T](self, h: (int, int) -> int, w: T = wrap(x -> x)) -> int = h(self.n, 2)
+            two[F: Fn1[int, int]](self, w: W[F], h: (int, int) -> int) -> int = h(w.f(self.n), 2)
+
+        main()
+            print(dflt((a, b) -> a + b))
+            print(K(4).dflt((a, b) -> a + b))
+            print(K(1).two(wrap(x -> x * 10), (a, b) -> a + b))
+        """, "3\n6\n12\n")
+end ncg_in_a_default
+
+@test("the nest inside the outer callable's own body, and inside a generic body made twice")
+ncg_in_bodies()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + raw"""
+        gen[T](t: T) -> int = run(wrap(x -> x * 10), (a, b) -> a + b)
+
+        main()
+            print(run(wrap(x -> x * 10), (a, b) -> run(wrap(y -> y + a), (c, d) -> c * d) + b))
+            print(gen(1))
+            print(gen("s"))
+        """, "24\n12\n12\n")
+end ncg_in_bodies
+
+@test("a generic construction over two closures, over a nest and a closure, and over two nests")
+ncg_construction()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + raw"""
+        struct P[T, H]
+            w: T
+            h: H
+
+        main()
+            val a = P((x: int) -> x * 10, (a: int, b: int) -> a + b)
+            val b = P(wrap(x -> x * 10), (a: int, b: int) -> a + b)
+            val c = P(wrap(x -> x * 10), wrap(y -> y + 1))
+            val d = P(h = (a: int, b: int) -> a + b, w = wrap(x -> x * 10))
+            val e = P(wrap(x -> x * 10), 5)
+
+            print(a.h(a.w(1), 2))
+            print(b.h(b.w.f(1), 2))
+            print(c.w.f(1) + c.h.f(1))
+            print(d.h(d.w.f(1), 2))
+            print(e.w.f(1) + e.h)
+            print(run(W((x: int) -> x * 10), (a, b) -> a + b))
+        """, "12\n12\n12\n12\n15\n12\n")
+end ncg_construction
+
+@test("a generic construction with a boxed callable field between two closures, in either order")
+ncg_construction_with_arrow_field()
+    if !rng_ready() then return
+
+    rng_prints(raw"""
+        struct Q[T, H]
+            w: T
+            mid: &Fn(int) -> int
+            h: H
+
+        main()
+            val q = Q((x: int) -> x * 10, y -> y + 1, (a: int, b: int) -> a + b)
+            val r = Q(h = (a: int, b: int) -> a * b, mid = y -> y + 2, w = (x: int) -> x * 10)
+
+            print(q.h(q.w(1), q.mid(1)))
+            print(r.h(r.w(1), r.mid(1)))
+        """, "12\n30\n")
+end ncg_construction_with_arrow_field
+
+@test("a generic variant over two closures")
+ncg_variant_of_two()
+    if !rng_ready() then return
+
+    rng_prints(NcgWrap + raw"""
+        enum E[A, B]
+            Two(a: A, b: B)
+            Neither
+
+        main()
+            val e = Two((x: int) -> x * 10, (a: int, b: int) -> a + b)
+            val f = Two(wrap(x -> x * 10), wrap(y -> y + 1))
+
+            e match
+                Two(w, h) -> print(h(w(1), 2))
+                Neither -> print(0)
+
+            f match
+                Two(w, h) -> print(w.f(1) + h.f(1))
+                Neither -> print(0)
+        """, "12\n12\n")
+end ncg_variant_of_two
+
+@test("a mistake inside the nested closure is told once, where it is")
+ncg_inner_mistake_refused()
+    ncg_refused(NcgWrap + "main()\n    print(run(wrap(x -> x + true), (a, b) -> a + b))\n",
+                "'+' needs matching types, got int and bool")
+end ncg_inner_mistake_refused
+
+@test("and so is one inside the outer closure")
+ncg_outer_mistake_refused()
+    ncg_refused(NcgWrap + "main()\n    print(run(wrap(x -> x * 10), (a, b) -> a + true))\n",
+                "'+' needs matching types, got int and bool")
+end ncg_outer_mistake_refused
+
+@test("a second closure given where the first one's type stands is still refused, saying what differs")
+ncg_other_closure_refused()
+    ncg_refused(NcgWrap + "main()\n    var w = wrap(x -> x * 10)\n    w = wrap(x -> x * 10)\n" +
+                "    print(run(w, (a, b) -> a + b))\n",
+                "'g' of 'wrap' is a closure, but a closure was given — each closure literal is a type " +
+                "of its own, so this one is not the '(int) -> int' the type was made from; to hold " +
+                "either, write the type as '&Fn(int) -> int'")
+end ncg_other_closure_refused
+
+@test("and two tuples apart only in a closure are refused the same way")
+ncg_other_closure_in_tuple_refused()
+    ncg_refused(NcgWrap + "main()\n    val f = (a: int, b: int) -> a + b\n" +
+                "    var q = (f, f)\n    q = (f, (a: int, b: int) -> a + b)\n",
+                "cannot assign (a closure, a closure) to 'q' of type (a closure, a closure) — each " +
+                "closure literal is a type of its own, so this one is not the '(int, int) -> int' the " +
+                "type was made from; to hold either, write the type as '&Fn(int, int) -> int'")
+end ncg_other_closure_in_tuple_refused

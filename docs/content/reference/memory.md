@@ -3507,7 +3507,9 @@ print(k.tasks[2].state, t.prio, k.tasks[0].prio, copy.state)
 parameters, so every hazard of the one rule is refused through a method too. The body's last
 expression and nothing else is the answer — a field chain, an element or a dereference from a parameter
 or module storage, leaving the parameter's own bytes through a `*self`, a reference, a view, an element
-or a `*T`. Refused: a field of a by-value `self` or a local; a value or a place chosen by an `if`; a
+or a `*T`. Refused: a field of a by-value `self` or a local; a place reached through a call's answer or
+through a local that copies a reference or a pointer, wherever its storage lies, since the caller
+follows the path and neither is a step it can; a value or a place chosen by an `if`; a
 `return` or `?` in the body; a place inside a struct with an `invariant`. It is written on a type's own
 member, inherent or generic, and not on a free function, in a trait, or on an `impl` member a trait
 declares. **The address is never a value**: `&k.task(0)` and `&Kernel.task` are refused.

@@ -1723,13 +1723,21 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
                 else t = argument_told(cx, e, m.params[i], m.tparams, want)
 
                 given.push(t)
+            // A default that was read while the solve was settling is the node the program gets:
+            // reading it again would lower a second closure for the one the declaration wrote.
             None ->
-                val inner = default_reader(cx, span, member_default_scope(cx, name), name, m.bounds)
-                val read = default_at(inner, m.params[i].default.unwrap(), want)
+                if i < prov.kept.len() && prov.kept[i].is_some()
+                    val kept = prov.kept[i].unwrap()
 
-                if read.is_none() then unread.push(i)
+                    if disagree(texpr_type(kept), want) then given.push(coerce(cx, kept, want))
+                    else given.push(kept)
+                else
+                    val inner = default_reader(cx, span, member_default_scope(cx, name), name, m.bounds)
+                    val read = default_at(inner, m.params[i].default.unwrap(), want)
 
-                given.push(read.unwrap_or(bad_expr(span)))
+                    if read.is_none() then unread.push(i)
+
+                    given.push(read.unwrap_or(bad_expr(span)))
 
     val refused = refused_argument(cx, span, subject, m.params, slots.unwrap(), given, wants, before,
                                    true, unread)
