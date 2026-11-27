@@ -3258,7 +3258,7 @@ end handed_closures_kept
 // `&g`, and the whole environment is not asked (`value_reads`), so where the literal is in sight its
 // body is asked capture by capture what it answers of that field, as of where the literal was built
 // (`handed_closures_kept`'s rule). A closure out of sight -- a parameter, an answer of another call --
-// whose environment carries it is asked what it answers of anything it reads through its environment.
+// whose environment carries it is asked what it answers of what its captures hold (`env_answered`).
 private closure_answers(t: &Track, name: string, args: Buf[TExpr]) -> bool
     if !closure_call(name) || args.is_empty() then return false
 
@@ -3267,8 +3267,29 @@ private closure_answers(t: &Track, name: string, args: Buf[TExpr]) -> bool
             *lit.kind match
                 TStructNew(st, captured) -> captures_answered(t, lit, st, captured)
                 _ -> false
-        None -> value_walk(t) && env_carries(t, args[0]) && through_answers_of(t.cx, name, 0)
+        None -> value_walk(t) && env_carries(t, args[0]) && env_answered(t, name, args[0])
 end closure_answers
+
+// **A closure out of sight answers what is followed where its body answers what a capture holds**:
+// the value walk follows the closure itself, and what it holds is its captures, each a field of the
+// environment one step through the pointer its body is handed -- as `captures_answered` asks of a
+// literal in sight, every capture standing in for the one that carries. (The walk runs before a closure
+// held by reference is turned, so its body still reads each capture one step in.) What the body answers
+// of storage a capture points at is no part of the closure: `opt.map(x -> *a)` answers the value `*a`
+// holds, not `a`. An environment whose record is not a closure's is asked what it answers of anything
+// it reads.
+private env_answered(t: &Track, name: string, env: TExpr) -> bool
+    val st = env_type(texpr_type(env)) match
+        Struct(s) -> s
+        _ -> return through_answers_of(t.cx, name, 0)
+
+    if !is_closure_literal(Struct(st)) || t.cx.find(name).is_none() then return through_answers_of(t.cx, name, 0)
+
+    for c in 0..<st.fields.len()
+        if read_answers_path_of(t.cx, name, 0, 1, s".${st.fields[c].0}") then return true
+
+    false
+end env_answered
 
 // Whether the environment a closure call is handed holds what is followed: `&g` for a local that does,
 // or the address of a temporary that does -- `g()()` hands the inner body `&(g())`.

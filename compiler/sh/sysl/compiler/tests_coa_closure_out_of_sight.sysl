@@ -1,0 +1,222 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// What a call of a closure out of sight answers (`keeps.sysl`'s `env_answered`): a generic callee
+// instantiated at a closure literal's type -- `Option.map` -- calls it through its parameter, where no
+// literal is in sight, and answers what the body answers of what a capture holds. What the body answers
+// of storage a capture POINTS AT is no part of the closure: `Some(0).map(x -> *a)` answers the value
+// `*a` holds, not `a`, so a caller's local whose address is `a` is not kept.
+//
+// The axes: what the body answers (the captured pointer itself; a value read through it; a field of a
+// captured struct; one of two captures), how the pointer is captured (a parameter by value, a `var`, a
+// struct, a method's `*self`), and the verdict (kept, not kept). Each closure here is one the compiler
+// holds by reference (nothing it is handed to keeps it), which the walk still sees one step in. Skipped:
+// a closure behind a `&Fn` or a literal in sight is `captures_answered`'s path
+// (`tests_pcr_param_copy_read.sysl`).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private coa_outcome(text: string) -> (string, int)
+    val root = make_temp_dir("sysl-coa").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", coa_prelude + text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("the program that was built could not be run", -1)
+        Ok(out) -> (out.text + out.err.unwrap_or(""), shell_status(out.status))
+end coa_outcome
+
+private coa_prints(text: string, want: string)
+    if xvr_no_library() then return
+
+    val out = coa_outcome(text)
+
+    assert_eq(out.0, want)
+    assert_eq(out.1, 0)
+end coa_prints
+
+private coa_refused(text: string, part: string)
+    if xvr_no_library() then return
+
+    val out = coa_outcome(text)
+
+    assert_eq(out.1, -1, out.0)
+    assert(out.0.index_of(part).is_some(), out.0)
+end coa_refused
+
+// Module storage to keep an address in.
+private const coa_prelude: string = raw"""
+    var spare = 7
+    var held: *int = &spare
+
+    """
+
+private coa_kept(param: string, local: string) -> string =
+    s"'key' keeps its parameter '$param' (it is stored in 'held'), and '&$local' is the address of a local of 'other'"
+
+// -- not kept: the body answers what a captured pointer points at ---------------------------------
+
+@test("a closure handed to Option.map answering what its captured pointer points at keeps nothing")
+coa_read_through_not_kept()
+    coa_prints(raw"""
+        key(a: **int)
+            held = Some(0).map(x -> *a).unwrap()
+
+        other()
+            var q = &spare
+            key(&q)
+
+        main()
+            other()
+            print(*held)
+        """, "7\n")
+
+@test("a method's closure over '*self' handed to Option.map, answering a field of '*self', keeps nothing")
+coa_receiver_read_through_not_kept()
+    coa_prints(raw"""
+        struct I
+            p: *int
+
+        impl I
+            get(*self) -> *int = self.p
+
+            fill(*self)
+                held = Some(0).map(x -> self.get()).unwrap()
+
+        main()
+            var it = I(&spare)
+            it.fill()
+            print(*held)
+        """, "7\n")
+
+@test("a closure over a struct's address handed to Option.map, answering a field read through it, keeps nothing")
+coa_struct_read_through_not_kept()
+    coa_prints(raw"""
+        struct H
+            p: *int
+
+        key(h: *H)
+            held = Some(0).map(x -> h.p).unwrap()
+
+        main()
+            var h = H(&spare)
+            key(&h)
+            print(*held)
+        """, "7\n")
+
+// -- kept: the body answers what a capture holds -------------------------------------------------
+
+@test("a closure handed to Option.map answering the pointer it captured keeps it")
+coa_pointer_kept()
+    coa_refused(raw"""
+        key(a: *int)
+            held = Some(0).map(x -> a).unwrap()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, coa_kept("a", "y"))
+
+@test("a method's closure handed to Option.map answering '*self''s own address keeps it")
+coa_receiver_kept()
+    coa_refused(raw"""
+        struct I
+            n: int
+
+        impl I
+            fill(*self)
+                held = Some(0).map(x -> &self.n).unwrap()
+
+        other()
+            var it = I(5)
+            it.fill()
+
+        main()
+            other()
+            print(*held)
+        """, "'fill' keeps its parameter 'self'")
+
+@test("a closure handed to Option.map answering a field of a struct it captured by value keeps the pointer")
+coa_struct_capture_kept()
+    coa_refused(raw"""
+        struct H
+            p: *int
+
+        key(a: *int)
+            val h = H(a)
+            held = Some(0).map(x -> h.p).unwrap()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, coa_kept("a", "y"))
+
+@test("a closure handed to Option.map answering a 'var' it captured keeps the pointer the var holds")
+coa_var_capture_kept()
+    coa_refused(raw"""
+        key(a: *int)
+            var p = &spare
+            p = a
+            held = Some(0).map(x -> p).unwrap()
+
+        other()
+            var y = 5
+            key(&y)
+
+        main()
+            other()
+            print(*held)
+        """, coa_kept("a", "y"))
+
+@test("of two captures handed to Option.map, the one answered is kept and the one read through is not")
+coa_two_captures()
+    coa_refused(raw"""
+        key(a: *int, b: **int)
+            held = Some(0).map(x -> if *a > 100 then *b else a).unwrap()
+
+        other()
+            var y = 5
+            var q = &spare
+            key(&y, &q)
+
+        main()
+            other()
+            print(*held)
+        """, coa_kept("a", "y"))
+
+@test("of two captures handed to Option.map, one read through only keeps nothing")
+coa_two_captures_read_through()
+    coa_prints(raw"""
+        key(a: *int, b: **int)
+            held = Some(0).map(x -> if *a > 100 then &spare else *b).unwrap()
+
+        main()
+            var y = 5
+            var q = &spare
+            key(&y, &q)
+            print(*held)
+        """, "7\n")
