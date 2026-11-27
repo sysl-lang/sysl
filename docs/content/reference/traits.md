@@ -2569,8 +2569,84 @@ print(sum(N(21)))
 42
 ```
 
-This is how `Self` reads in a bound everywhere; it is stated here because an associated type is the
-one place where two types are in play and either would be a plausible reading.
+That is the reading of a `Self` nobody wrote, wherever a bound stands: an argument a bound leaves to
+its trait's defaults is filled from the type the bound is written on, so a bare `U: Add` on a
+member's own parameter is `Add[U, U]`, as `type W: Add` is `Add[W, W]`.
+
+**A `Self` written out in the bound of a member's own type parameter is the type the member belongs
+to**: the implementing type in a trait's member and in an `impl`'s, the type itself in a type's own
+member. It is the same `Self` the member's parameter list and result name, in the list's brackets
+and in the member's `where` clause alike, and `Self::Item` there is the implementing type's `Item`.
+That is what lets a member relate a parameter of its own to the type it is called on: a callable
+taking what the implementing type yields, or a second value whose associated type must be the same
+one.
+
+```sysl
+trait Source
+    type Item
+    next(self) -> Self::Item
+
+    apply[U, F: Fn1[Self::Item, U]](self, f: F) -> U = f(self.next())
+    other[J: Source[Item = Self::Item]](self, j: J) -> Self::Item = j.next()
+
+struct Count
+    n: int
+
+impl Source for Count
+    type Item = int
+    next(self) -> int = self.n
+
+struct Word
+    w: string
+
+impl Source for Word
+    type Item = string
+    next(self) -> string = self.w
+
+through[S: Source](s: S) -> S::Item = s.apply(x -> x)
+
+print(Count(4).apply(x -> x * 10))
+print(Word("ab").apply(s -> s.len))
+print(through(Word("cd")))
+print(Count(1).other(Count(2)))
+```
+
+```output
+40
+2
+cd
+2
+```
+
+The bound is held to the implementing type at each call, so a `Word` is no `J` for a `Count`:
+
+```sysl
+trait Source
+    type Item
+    next(self) -> Self::Item
+
+    same[J: Source[Item = Self::Item]](self, other: J) -> bool = true
+
+struct Count
+    n: int
+
+impl Source for Count
+    type Item = int
+    next(self) -> int = self.n
+
+struct Word
+    w: string
+
+impl Source for Word
+    type Item = string
+    next(self) -> string = self.w
+
+print(Count(1).same(Word("a")))
+```
+
+```error
+'Count.same' requires its type parameter 'J' to implement 'Source[Item = int]', which says 'Item' is int, and Word supplies string for it
+```
 
 **The bound is checked once every `impl` in the program is registered**, so the block that makes the
 supplied type implement the bound may be written below the block that chose it. A
