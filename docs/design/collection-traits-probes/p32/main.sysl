@@ -1,0 +1,77 @@
+// p32: capture through an adapter -- a closure that writes an outer var, and one that reads a var
+// changed after the adapter was built.
+trait It
+    type Item
+    next(*self) -> Option[Self::Item]
+
+struct Count
+    n: int
+    stop: int
+
+impl It for Count
+    type Item = int
+    next(*self) -> Option[int]
+        if self.n >= self.stop then return None
+        val v = self.n
+        self.n += 1
+        Some(v)
+
+struct MapIt[I, F, U]
+    src: I
+    f: F
+
+impl[I: It, F: Fn1[I::Item, U], U] It for MapIt[I, F, U]
+    type Item = U
+    next(*self) -> Option[U]
+        self.src.next() match
+            Some(x) -> Some(self.f(x))
+            None -> None
+
+struct FilterIt[I, P]
+    src: I
+    p: P
+
+impl[I: It, P: Fn1[I::Item, bool]] It for FilterIt[I, P]
+    type Item = I::Item
+    next(*self) -> Option[I::Item]
+        loop
+            self.src.next() match
+                Some(x) -> if self.p(x) then return Some(x)
+                None -> return None
+
+struct TakeIt[I]
+    src: I
+    left: int
+
+impl[I: It] It for TakeIt[I]
+    type Item = I::Item
+    next(*self) -> Option[I::Item]
+        if self.left <= 0 then return None
+        self.left -= 1
+        self.src.next()
+
+map[I: It, R, G: Fn1[I::Item, R]](it: I, g: G) -> MapIt[I, G, R] = MapIt(it, g)
+filter[I: It, Q: Fn1[I::Item, bool]](it: I, q: Q) -> FilterIt[I, Q] = FilterIt(it, q)
+take[I: It](it: I, n: int) -> TakeIt[I] = TakeIt(it, n)
+
+fold[I: It, A](it: I, init: A, f: (A, I::Item) -> A) -> A
+    var acc = init
+    var cur = it
+    loop
+        cur.next() match
+            Some(x) -> acc = f(acc, x)
+            None -> break
+    acc
+end fold
+
+main()
+    var seen = 0
+    val m1 = map(Count(0, 5), x ->
+        seen += x
+        x)
+    print(fold(m1, 0, (a, _) -> a + 1), seen)
+
+    var k = 1
+    val m2 = map(Count(0, 3), x -> x + k)
+    k = 100
+    print(fold(m2, 0, (a, b) -> a + b))

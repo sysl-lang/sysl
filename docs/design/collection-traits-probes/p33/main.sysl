@@ -1,0 +1,146 @@
+// p33: the other adapter shapes as free functions -- a slice as its own cursor, peekable (state naming
+// the source's associated type), zip, chain (a second source of the same Item), flat_map (an inner
+// cursor made by the closure) -- and an erased cursor chosen at run time, handed to a generic consumer.
+trait It
+    type Item
+    next(*self) -> Option[Self::Item]
+
+impl[T] It for []const T
+    type Item = T
+    next(*self) -> Option[T]
+        if self.len == 0 then return None
+        val v = (*self)[0]
+        *self = (*self)[1..]
+        Some(v)
+
+struct Count
+    n: int
+    stop: int
+
+impl It for Count
+    type Item = int
+    next(*self) -> Option[int]
+        if self.n >= self.stop then return None
+        val v = self.n
+        self.n += 1
+        Some(v)
+
+struct MapIt[I, F, U]
+    src: I
+    f: F
+
+impl[I: It, F: Fn1[I::Item, U], U] It for MapIt[I, F, U]
+    type Item = U
+    next(*self) -> Option[U]
+        self.src.next() match
+            Some(x) -> Some(self.f(x))
+            None -> None
+
+struct PeekIt[I: It]
+    src: I
+    head: Option[Option[I::Item]]
+
+    peek(*self) -> Option[I::Item]
+        self.head match
+            Some(h) -> h
+            None ->
+                val h = self.src.next()
+                self.head = Some(h)
+                h
+    end peek
+
+impl[I: It] It for PeekIt[I]
+    type Item = I::Item
+    next(*self) -> Option[I::Item]
+        self.head match
+            Some(h) ->
+                self.head = None
+                h
+            None -> self.src.next()
+
+struct ZipIt[A, B]
+    a: A
+    b: B
+
+impl[A: It, B: It] It for ZipIt[A, B]
+    type Item = (A::Item, B::Item)
+    next(*self) -> Option[(A::Item, B::Item)]
+        val x = self.a.next()?
+        val y = self.b.next()?
+        Some((x, y))
+
+struct ChainIt[A, B]
+    a: A
+    b: B
+    second: bool
+
+impl[A: It, B: It[Item = A::Item]] It for ChainIt[A, B]
+    type Item = A::Item
+    next(*self) -> Option[A::Item]
+        if !self.second
+            self.a.next() match
+                Some(x) -> return Some(x)
+                None -> self.second = true
+        self.b.next()
+
+struct FlatIt[I, F, J]
+    src: I
+    f: F
+    inner: Option[J]
+
+impl[I: It, J: It, F: Fn1[I::Item, J]] It for FlatIt[I, F, J]
+    type Item = J::Item
+    next(*self) -> Option[J::Item]
+        loop
+            self.inner match
+                Some(j) ->
+                    var cur = j
+                    val got = cur.next()
+                    self.inner = Some(cur)
+                    if got.is_some() then return got
+                None -> ()
+            self.src.next() match
+                Some(x) -> self.inner = Some(self.f(x))
+                None -> return None
+
+map[I: It, R, G: Fn1[I::Item, R]](it: I, g: G) -> MapIt[I, G, R] = MapIt(it, g)
+peekable[I: It](it: I) -> PeekIt[I] = PeekIt(it, None)
+zip[I: It, K: It](a: I, b: K) -> ZipIt[I, K] = ZipIt(a, b)
+chain[I: It, K: It[Item = I::Item]](a: I, b: K) -> ChainIt[I, K] = ChainIt(a, b, false)
+flat_map[I: It, K: It, G: Fn1[I::Item, K]](it: I, g: G) -> FlatIt[I, G, K] = FlatIt(it, g, None)
+
+count_all[I: It](it: I) -> int
+    var n = 0
+    var cur = it
+    loop
+        cur.next() match
+            Some(_) -> n += 1
+            None -> break
+    n
+end count_all
+
+pick(doubled: bool) -> &It[int]
+    if doubled
+        val m = map(Count(0, 3), x -> x * 2)
+        return m
+    Count(0, 3)
+
+main()
+    val xs = [1, 2, 3]
+    val ms = map(xs[..], x -> x * 5)
+    print(count_all(ms), xs.len)
+
+    var p = peekable(Count(0, 3))
+    print(p.peek().unwrap(), p.next().unwrap(), p.next().unwrap())
+
+    var z = zip(Count(0, 5), Count(10, 12))
+    val z1 = z.next().unwrap()
+    print(z1.0, z1.1, count_all(z))
+
+    print(count_all(chain(Count(0, 2), Count(7, 9))))
+
+    val fm = flat_map(Count(1, 4), n -> Count(0, n))
+    print(count_all(fm))
+
+    val o = pick(true)
+    print(count_all(o), count_all(pick(false)))

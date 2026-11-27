@@ -1,0 +1,89 @@
+// p31: five adapters as free functions, each stage a val, against a hand loop, for the IR.
+trait It
+    type Item
+    next(*self) -> Option[Self::Item]
+
+struct Count
+    n: int
+    stop: int
+
+impl It for Count
+    type Item = int
+    next(*self) -> Option[int]
+        if self.n >= self.stop then return None
+        val v = self.n
+        self.n += 1
+        Some(v)
+
+struct MapIt[I, F, U]
+    src: I
+    f: F
+
+impl[I: It, F: Fn1[I::Item, U], U] It for MapIt[I, F, U]
+    type Item = U
+    next(*self) -> Option[U]
+        self.src.next() match
+            Some(x) -> Some(self.f(x))
+            None -> None
+
+struct FilterIt[I, P]
+    src: I
+    p: P
+
+impl[I: It, P: Fn1[I::Item, bool]] It for FilterIt[I, P]
+    type Item = I::Item
+    next(*self) -> Option[I::Item]
+        loop
+            self.src.next() match
+                Some(x) -> if self.p(x) then return Some(x)
+                None -> return None
+
+struct TakeIt[I]
+    src: I
+    left: int
+
+impl[I: It] It for TakeIt[I]
+    type Item = I::Item
+    next(*self) -> Option[I::Item]
+        if self.left <= 0 then return None
+        self.left -= 1
+        self.src.next()
+
+map[I: It, R, G: Fn1[I::Item, R]](it: I, g: G) -> MapIt[I, G, R] = MapIt(it, g)
+filter[I: It, Q: Fn1[I::Item, bool]](it: I, q: Q) -> FilterIt[I, Q] = FilterIt(it, q)
+take[I: It](it: I, n: int) -> TakeIt[I] = TakeIt(it, n)
+
+fold[I: It, A](it: I, init: A, f: (A, I::Item) -> A) -> A
+    var acc = init
+    var cur = it
+    loop
+        cur.next() match
+            Some(x) -> acc = f(acc, x)
+            None -> break
+    acc
+end fold
+
+@export("chain_sum")
+chain_sum(n: int) -> int
+    val s1 = map(Count(0, n), x -> x * 3)
+    val s2 = filter(s1, x -> x % 2 == 0)
+    val s3 = map(s2, x -> x + 1)
+    val s4 = take(s3, 1000)
+    val s5 = filter(s4, x -> x > 10)
+    fold(s5, 0, (a, b) -> a +% b)
+
+@export("hand_sum")
+hand_sum(n: int) -> int
+    var acc = 0
+    var taken = 0
+    for i in 0..<n
+        val a = i * 3
+        if a % 2 != 0 then continue
+        val b = a + 1
+        if taken >= 1000 then break
+        taken += 1
+        if b > 10 then acc = acc +% b
+    acc
+
+main()
+    print(chain_sum(100), hand_sum(100))
