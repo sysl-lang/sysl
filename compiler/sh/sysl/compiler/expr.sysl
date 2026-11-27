@@ -832,8 +832,17 @@ private names_storage_of(cx: &Analyzer, from: &Table[ValueDecl], name: string) -
         (value_key_of(cx, from, name).is_some() ||
          offered_by(cx.an, cx.scope, name, k -> from.has(k)).len() > 1)
 
+// Whether the name is a count parameter in reach: `K` of a `count K`.
+names_count_parameter(cx: &Analyzer, name: string) -> bool = bound_type(cx.subst, name) match
+    Some(ConstArg(_, ty, _, _)) -> is_count_kind(*ty)
+    _ -> false
+
 private const_parameter(cx: &Analyzer, span: Span, name: string,
                         expected: Option[Type]) -> Option[TExpr]
+    if names_count_parameter(cx, name) then
+        return Some(cx.err_whatever_the_types(span, s"'$name' is a count parameter: it is written after " +
+            s"'&', as '&$name T', or handed to another count parameter, and it is no value a body reads"))
+
     bound_type(cx.subst, name) match
         Some(ConstArg(v, ty, _, _)) -> underlying(*ty) match
             Enum(d) ->
@@ -2024,7 +2033,7 @@ private unary_expr(cx: &Analyzer, e: Expr, op: string, operand: Expr,
         // The sigil in a type is a counted box and the operator is an address; neither is a way of
         // writing the other, and a value read into a box needs no operator at all.
         expected match
-            Some(Ref(_, _)) ->
+            Some(Ref(_, _, _)) ->
                 val box = type_show(expected.unwrap())
 
                 return cx.err(e.span, s"'&' in front of a value takes its address, and the '&' in " +
@@ -2614,7 +2623,7 @@ private identity_operands(cx: &Analyzer, span: Span, op: string, a: Type, b: Typ
     val ua = underlying(a)
     val ub = underlying(b)
     val addressed = ua match
-        Ref(_, _) -> true
+        Ref(_, _, _) -> true
         Ptr(_, _, _) -> true
         _ -> false
 
@@ -2640,8 +2649,8 @@ end identity_operands
 // Two references of one sharing, or two pointers: the handles a trait object and the value it was
 // made from are both of.
 private same_handle_kind(a: Type, b: Type) -> bool = a match
-    Ref(_, sa) -> b match
-        Ref(_, sb) -> sa == sb
+    Ref(_, sa, _) -> b match
+        Ref(_, sb, _) -> sa == sb
         _ -> false
     Ptr(_, _, _) -> b match
         Ptr(_, _, _) -> true
@@ -3316,7 +3325,7 @@ private collection_expected(expected: Option[Type]) -> bool
 end collection_expected
 
 private inner_of(t: Type) -> Type = t match
-    Ref(inner, _) -> inner_of(*inner)
+    Ref(inner, _, _) -> inner_of(*inner)
     Ptr(inner, _, _) -> inner_of(*inner)
     Weak(inner) -> inner_of(*inner)
     Volatile(inner) -> inner_of(*inner)

@@ -68,11 +68,12 @@ resolve_type_arg(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) ->
 
 // The type a written one means.
 resolve_type(a: &Analysis, scope: Scope, t: TypeRef, subst: Buf[Binding]) -> Type = *t.kind match
-    NamedType(name, args) -> resolve_named(a, scope, t.span, name, args, subst, "")
+    NamedType(name, args) ->
+        if name == CountParamType then count_kind_type(a) else resolve_named(a, scope, t.span, name, args, subst, "")
     // **A hop is what makes a cycle finite**, so the four forms that point rather than hold are
     // counted -- and the count is what a type reached again is judged against.
     PtrType(inner, read_only, non_null) -> resolve_ptr(a, scope, t.span, inner, read_only, non_null, subst)
-    RefType(inner, sync) -> resolve_ref(a, scope, t.span, inner, sync, subst)
+    RefType(inner, sync, kind) -> resolve_ref(a, scope, t.span, inner, sync, kind, subst)
     WeakType(inner) ->
         Weak(under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "weak")))
     // Everywhere but a field, an element and a pointee, what is being named is a **value** -- what a
@@ -372,7 +373,7 @@ end volatile_admits
 private volatile_refusal(t: Type, shown: string) -> string = t match
     Ptr(_, _, _) -> ""
     CFn(_, _, _) -> ""
-    Ref(_, _) -> volatile_counted()
+    Ref(_, _, _) -> volatile_counted()
     Weak(_) -> volatile_counted()
     Slice(_, _) -> volatile_counted()
     Str -> volatile_counted()
@@ -429,20 +430,103 @@ private volatile_constrains(t: Type) -> bool = t match
 // about everything the object holds (`reference/memory.md § Crossing a concurrency domain`). A trait
 // object is the one pointee whose contents are not known here -- the type it forgot is settled
 // where a value is erased into one, and that is where it is asked.
-private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync: bool,
+//
+// **`&K T` is settled by what `K` is bound to.** At an instance that is `plain` or `sync`, and the
+// reference is the `&T` or the `&sync T` a program writes by hand -- asked the same question about
+// what it shares, there. While the declaration is read in its own terms `K` is its own stand-in,
+// and the reference carries the parameter's form as its kind.
+private resolve_ref(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, sync: bool, kind: string,
                     subst: Buf[Binding]) -> Type
     val ty = under_indirection(a, () -> resolve_pointee(a, scope, inner, subst, "&"))
 
     if check_object_written(a, scope, inner, ty, "&", subst) then return Unknown
 
-    if sync
+    var atomic = sync
+    var form: Buf[Mono] = buf()
+
+    if kind != ""
+        val bound = count_binding(bound_type(subst, kind))
+
+        if bound.is_none()
+            a.fault(scope, span, s"'$kind' is not a count parameter, and '&$kind' is how a reference is " +
+                    "written whose count a count parameter chooses \u{2014} declare it in the list, as " +
+                    s"'[count $kind]', or write '&' or '&sync'")
+            return Unknown
+        end if
+
+        atomic = bound.unwrap().0
+        form = bound.unwrap().1
+    end if
+
+    if atomic
         ty match
             Trait(_, _, _) -> ()
             _ -> check_shared(a, scope, span, ty)
     end if
 
-    Ref(ty, sync)
+    Ref(ty, atomic, form)
 end resolve_ref
+
+// The library's `sysl.CountKind`, the type a count parameter's argument has. Read in the declaring
+// module's own terms, as `type_reflect.sysl`'s `library_type` reads the types its answers are made
+// of, so the program's imports and its own names have no say in it.
+count_kind_type(a: &Analysis) -> Type =
+    resolve_type(a, Scope("sysl", no_imports(), source_of("", ""), no_packaging()),
+                 named_type(span_zero(), "sysl.CountKind"), no_bindings())
+
+// Whether a type is the one a count parameter's argument has.
+is_count_kind(t: Type) -> bool = t match
+    Enum(d) -> qualified_name(d.base) == "sysl.CountKind"
+    _ -> false
+
+// What a count parameter is bound to, read for the reference written with it: whether the count is
+// atomic, and the parameter's form where the binding is its own stand-in. Nothing where the name is
+// bound to no count at all.
+count_binding(bound: Option[Type]) -> Option[(bool, Buf[Mono])] = bound match
+    Some(ConstArg(v, ty, stood, term)) ->
+        if !is_count_kind(*ty) then None
+        else if stood then Some((false, term))
+        else Some((!v.is_zero(), buf()))
+    _ -> None
+
+// A reference of kind `kind` over `inner`, with whatever `subst` binds the kind's parameter to put in
+// for it: the `&T` or `&sync T` of an instance, or the reference as it stood where nothing binds it.
+settled_ref(inner: Type, sync: bool, kind: Buf[Mono], subst: Buf[Binding]) -> Type
+    if kind.is_empty() then return Ref(inner, sync, kind)
+
+    count_binding(bound_type(subst, term_text(kind))) match
+        Some((atomic, form)) -> Ref(inner, atomic, form)
+        None -> Ref(inner, sync, kind)
+end settled_ref
+
+// The argument written for a count parameter: `plain`, `sync`, or the name of a count parameter the
+// enclosing declaration has, which hands its own kind on. Both words are soft, read only here.
+private count_argument(a: &Analysis, scope: Scope, span: Span, e: Expr, ty: Type, subst: Buf[Binding],
+                       subject: string) -> Option[Type]
+    val name = *e.kind match
+        Ident(n) -> n
+        _ -> ""
+
+    val handed = bound_type(subst, name)
+
+    handed match
+        Some(ConstArg(_, held, _, _)) -> if is_count_kind(*held) then return handed
+        _ -> ()
+
+    if handed.is_none() && name == "plain" then return Some(ConstArg(from_int(0), ty, false, buf()))
+    if handed.is_none() && name == "sync" then return Some(ConstArg(from_int(1), ty, false, buf()))
+
+    val what = if subject == "" then "this argument" else subject
+    val given = if name == "" then "this was" else s"'$name' was"
+
+    a.fault(scope, e.span, s"$what takes a count \u{2014} 'plain', the ordinary count of a '&T', or " +
+            s"'sync', the atomic count of a '&sync T' \u{2014} but $given given")
+    None
+end count_argument
+
+// A count argument as an instance holds it: `plain` is the type's first value and `sync` its second.
+count_arg(a: &Analysis, sync: bool) -> Type =
+    ConstArg(from_int(if sync then 1 else 0), count_kind_type(a), false, buf())
 
 // `*T` — and where `T` is a trait, a raw object, asked about as the counted one is.
 private resolve_ptr(a: &Analysis, scope: Scope, span: Span, inner: TypeRef, read_only: bool,
@@ -1560,6 +1644,13 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
         NamedType(n, targs) -> if targs.is_empty() then Some(expr(arg.span, Ident(n))) else None
         _ -> None
 
+    if written.is_none() && is_count_kind(ty)
+        a.fault(scope, arg.span, s"${if subject == "" then "this argument" else subject} takes a count " +
+                "\u{2014} 'plain', the ordinary count of a '&T', or 'sync', the atomic count of a " +
+                "'&sync T' \u{2014} but a type was given")
+        return None
+    end if
+
     if written.is_none()
         a.fault(scope, span, "this argument stands where the declaration wrote 'const', so a value " +
                 s"belongs here rather than a type — one of ${type_show(ty)}")
@@ -1567,6 +1658,9 @@ private value_arg(a: &Analysis, scope: Scope, span: Span, arg: TypeRef, ty: Type
     end if
 
     val e = written.unwrap()
+
+    // A count argument is one of two words, or a count parameter in reach handed on.
+    if is_count_kind(ty) then return count_argument(a, scope, span, e, ty, subst, subject)
 
     // A variant is read against the enum the parameter names before anything is folded: a bare
     // `High` is that enum's, whatever else the name might mean.

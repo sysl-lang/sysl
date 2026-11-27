@@ -271,7 +271,8 @@ end parse_pointer_type
 private at_nonnull_word(p: *Parser) -> bool =
     p.at_word("nonnull") && (begins_type(p.peek_at(1)) || p.kw_at(1, "const") || p.kw_at(1, "extern"))
 
-// `&T` and `&sync T`. `sync` is soft, so `&sync` on its own is a reference to a type called `sync`.
+// `&T`, `&sync T` and `&K T`. `sync` is soft, so `&sync` on its own is a reference to a type called
+// `sync`.
 private parse_ref_type(p: *Parser, start: Span) -> TypeRef
     p.bump()
 
@@ -279,10 +280,58 @@ private parse_ref_type(p: *Parser, start: Span) -> TypeRef
 
     if sync then p.bump()
 
+    val kind = if sync then "" else count_kind_ahead(p)
+
+    if kind != "" then p.bump()
+
     val inner = parse_core_type(p)
 
-    type_ref(start.to(p.just_taken()), RefType(inner, sync))
+    type_ref(start.to(p.just_taken()), RefType(inner, sync, kind))
 end parse_ref_type
+
+// The count parameter a reference is written with, `&K T`, or nothing: **a name followed by the start
+// of another type**, which is no type on its own. Two shapes need more than the next token:
+//
+// - `&K [4]int` is a kind and an array, and `&K[4]` a type applied to an argument. What follows the
+//   bracketed group tells them apart -- a type begins there only after a kind.
+// - `&Fn(int) -> int` is a callable's type, so a name before a `(` is never a kind; a reference to a
+//   tuple takes its kind inside an alias.
+//
+// `where` is soft and follows a result type, so it is not the start of one here.
+private count_kind_ahead(p: *Parser) -> string
+    val name = p.peek() match
+        Ident(n) -> n
+        _ -> return ""
+
+    p.peek_at(1) match
+        Ident(w) -> if w == "where" then "" else name
+        QuotedIdent(_) -> name
+        Keyword(w) ->
+            if w == "(" || !begins_type(p.peek_at(1)) then ""
+            else if w != "[" then name
+            else if begins_type(p.peek_at(past_brackets(p, 1))) && !p.word_at(past_brackets(p, 1), "where") then name
+            else ""
+        _ -> ""
+end count_kind_ahead
+
+// The token after the bracketed group that opens at `from`.
+private past_brackets(p: *Parser, from: usize) -> usize
+    var depth = 0
+    var i = from
+
+    loop
+        p.peek_at(i) match
+            Keyword(w) ->
+                if w == "[" then depth += 1
+                if w == "]" then depth -= 1
+            Eof -> return i
+            Newline -> return i
+            _ -> ()
+
+        i += 1
+
+        if depth == 0 then return i
+end past_brackets
 
 // `weak T`. An atomic object has no weak form, and the refusal is at the spelling so a reader is
 // told which chapter it waits on rather than "newline expected" -- at the `weak`, the whole
@@ -293,6 +342,11 @@ private parse_weak_type(p: *Parser, start: Span) -> TypeRef
     if p.at_word("sync") && begins_type(p.peek_at(1))
         p.fault(start, "an atomic reference has no weak form yet \u{2014} 'weak sync T' wants the " +
             "concurrency model of '06', which is not built")
+        p.bump()
+    elif count_kind_ahead(p) != ""
+        p.fault(start, s"a weak reference has no atomic kind, so it cannot follow a count parameter " +
+            s"\u{2014} 'weak ${count_kind_ahead(p)} T' would have to be 'weak sync T' in one " +
+            "instance. Hold the object by '&' and weaken that where the kind is ordinary")
         p.bump()
     end if
 
@@ -637,9 +691,10 @@ end parse_bounds
 // `[T: Ord + Eq = int, const N: usize, ..A]` -- the bracketed list a declaration writes after its
 // name.
 //
-// **Three kinds of parameter in one list**, told apart by what each begins with: `const` makes it a
-// value, `..` makes it a pack, and anything else is a type. What each may carry differs, and the
-// three refusals below are where that is said rather than left to a parse error.
+// **Four kinds of parameter in one list**, told apart by what each begins with: `const` makes it a
+// value, `count` (a soft word, before a name) makes it a count kind, `..` makes it a pack, and
+// anything else is a type. What each may carry differs, and the refusals below are where that is
+// said rather than left to a parse error.
 parse_type_params(p: *Parser) -> TypeParams
     var out = no_type_params()
 
@@ -688,6 +743,37 @@ private parse_one_type_param(p: *Parser, out: *TypeParams)
         return
     end if
 
+    // `count K` -- a parameter standing for a kind of count, ordinary or atomic. It is held as a
+    // value parameter of the two-valued type the library declares for it, so everything a value
+    // parameter is given -- a default, an argument, a place in an instance's name -- it is given.
+    if p.at_word("count") && names_parameter(p.peek_at(1))
+        val at = p.here()
+
+        p.bump()
+
+        val n = p.name() match
+            Some(x) -> x
+            None -> ""
+
+        out.names.push(n)
+        out.values.push(TypeBinding(n, named_type(at, CountParamType)))
+
+        if p.accept_kw(":")
+            p.fault(p.just_taken(), "a count parameter takes no bound \u{2014} it stands for 'plain' or " +
+                "'sync', and nothing else can be asked of it")
+            parse_bounds(p)
+        end if
+
+        if p.accept_kw("=")
+            val from = p.here()
+            val e = parse_expr(p)
+
+            out.defaults.push(TypeBinding(n, type_ref(from.to(p.just_taken()), ValueArgType(e))))
+        end if
+
+        return
+    end if
+
     // `..A` -- a parameter standing for a list of types.
     if p.accept_kw("..")
         val n = p.name() match
@@ -717,6 +803,11 @@ private parse_one_type_param(p: *Parser, out: *TypeParams)
     if p.accept_kw(":") then out.bounds.push(NamedBounds(n, parse_bounds(p)))
     if p.accept_kw("=") then out.defaults.push(TypeBinding(n, parse_type(p)))
 end parse_one_type_param
+
+private names_parameter(t: Tok) -> bool = t match
+    Ident(_) -> true
+    QuotedIdent(_) -> true
+    _ -> false
 
 // `where T: Display, U: Eq` -- the same pairing a bound written inline makes, read after a
 // signature. `where` is a soft word, so a program may still have a name of its own that is one.

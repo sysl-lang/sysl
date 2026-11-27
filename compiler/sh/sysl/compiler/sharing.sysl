@@ -69,7 +69,7 @@ share_refusal(t: Type) -> Option[Unshareable] = share_walk(t, buf(), None, false
 private share_walk(t: Type, path: Buf[string], holder: Option[Type],
                    laid: bool, copied: bool, named: bool,
                    formed: bool = false) -> Option[Unshareable] = t match
-    Ref(_, sync) -> if sync || laid then None else Some(Unshareable(path, t, holder))
+    Ref(_, sync, _) -> if sync || laid then None else Some(Unshareable(path, t, holder))
     Ptr(_, _, _) -> None
     Weak(_) -> if laid then None else Some(Unshareable(path, t, holder))
     Slice(elem, read_only) ->
@@ -156,7 +156,7 @@ private is_frozen(t: Type) -> bool = t match
 // library's signature names `&sync Frozen[T]`, and only the call knows which `T` it was made at.
 check_shared_result(cx: &Analyzer, span: Span, ret: Type)
     val inner = ret match
-        Ref(t, sync) -> if sync && is_frozen(*t) then Some(*t) else None
+        Ref(t, sync, _) -> if sync && is_frozen(*t) then Some(*t) else None
         _ -> None
 
     // A call inside the library is one step of a call the program made, which is where it is asked.
@@ -323,7 +323,7 @@ sealed_holder(p: Unshareable, a: &Analysis, scope: Scope) -> Option[Type]
     if p.holder.is_none() then return None
 
     val key = p.ty match
-        Ref(inner, _) -> (*inner) match
+        Ref(inner, _, _) -> (*inner) match
             Struct(d) -> d.base
             Enum(d) -> d.base
             _ -> ""
@@ -481,13 +481,30 @@ crossing_refused_by_parameter(bound: string, t: Type) -> bool
 
     part.unwrap().ty match
         Abstract(_, _) -> true
+        Ref(_, _, kind) -> !kind.is_empty()
         _ -> false
 end crossing_refused_by_parameter
+
+// Whether what keeps a type from crossing is a reference whose kind is a count parameter: `&K T`,
+// an ordinary count in the instance where `K` is `plain`. Inside the declaration the parameter is
+// both kinds at once, so the refusal is the declaration's, kept by the walk over it rather than left
+// for the one instance it is true of.
+crossing_refused_by_count(part: Option[Unshareable]) -> bool = part match
+    Some(p) -> p.ty match
+        Ref(_, _, kind) -> !kind.is_empty()
+        _ -> false
+    None -> false
+
+// A crossing's refusal, kept where the walk is a generic's own and a count parameter is in the way.
+private crossing_fault(cx: &Analyzer, span: Span, message: string, part: Option[Unshareable])
+    if cx.at_definition && crossing_refused_by_count(part) then cx.an.bound_fault(cx.scope, span, message)
+    else cx.fault(span, message)
+end crossing_fault
 
 // `sealed_holder` asked from outside the library, about a count the library declares.
 private sealed_library_holder(a: &Analysis, p: Unshareable) -> Option[Type]
     val key = p.ty match
-        Ref(inner, _) -> (*inner) match
+        Ref(inner, _, _) -> (*inner) match
             Struct(d) -> d.base
             Enum(d) -> d.base
             _ -> ""
@@ -510,7 +527,10 @@ end share_where
 // What to do about the part in the way: a plain reference has an atomic spelling to reach for, a
 // weak one has none yet, and a view has a distinction the language cannot draw.
 share_remedy(head: string, ty: Type) -> string = ty match
-    Ref(inner, _) -> head + s"whose count is not. Hold it as a '&sync ${type_show(*inner)}' ('06')"
+    Ref(inner, _, kind) ->
+        if kind.is_empty() then head + s"whose count is not. Hold it as a '&sync ${type_show(*inner)}' ('06')"
+        else head + s"whose count is ordinary where '${term_text(kind)}' is 'plain'. Name the kind: " +
+                    s"'&sync ${type_show(*inner)}'"
     Weak(_) -> head + "and a weak count has no atomic form yet"
     Str -> head + share_string_remedy()
     _ -> head + share_view_remedy("elements")
@@ -594,7 +614,7 @@ private check_copied_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: s
     val why = copied_crossing_complaint(subject, pty, cx.an, cx.scope)
 
     if why.is_some()
-        cx.fault(arg.span, why.unwrap())
+        crossing_fault(cx, arg.span, why.unwrap(), copied_unshareable(pty))
         return false
     end if
 
@@ -615,7 +635,11 @@ private check_crossing(cx: &Analyzer, arg: TExpr, pname: string, shown: string, 
         Ptr(inner, _, _) -> crossing_complaint(subject, *inner, cx.an, cx.scope)
         _ -> crossing_complaint(subject, pty, cx.an, cx.scope)
 
-    if why.is_some() then cx.fault(arg.span, why.unwrap())
+    val part = pty match
+        Ptr(inner, _, _) -> unshareable(*inner)
+        _ -> unshareable(pty)
+
+    if why.is_some() then crossing_fault(cx, arg.span, why.unwrap(), part)
     else note_task_crossing(cx, arg.span, CrossArg(subject), arg)
 end check_crossing
 
@@ -735,7 +759,7 @@ private note_sync_erasure(out: &DomainRoots, p: TProgram, tables: Map[string, us
         TPark(_) -> out.parks = true
         TErase(operand, vtable, want) ->
             val sync = want match
-                Ref(_, s) -> s
+                Ref(_, s, _) -> s
                 _ -> false
 
             if !sync then return
@@ -793,7 +817,7 @@ private note_sync_targets(out: &RootNames, p: TProgram, tables: Map[string, usiz
     *e.kind match
         TErase(_, vtable, want) ->
             val sync = want match
-                Ref(_, s) -> s
+                Ref(_, s, _) -> s
                 _ -> false
 
             if !sync then return
@@ -808,7 +832,7 @@ end note_sync_targets
 
 // The type a value was before it was boxed for an object.
 private erased_inner(t: Type) -> Type = t match
-    Ref(inner, _) -> *inner
+    Ref(inner, _, _) -> *inner
     _ -> t
 
 // Why one piece of module storage may not be reached from the root, or nothing where it may.

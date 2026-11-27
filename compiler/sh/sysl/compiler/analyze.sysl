@@ -1506,6 +1506,12 @@ private resolve_method(a: &Analysis, scope: Scope, m: MethodDecl, outer: Buf[Bin
 
     a.settled = before
 
+// The value parameters a type's declaration wrote, each with the type it gave.
+private declared_tvalues(kind: DeclKind) -> Buf[TypeBinding] = kind match
+    StructOf(d) -> d.tvalues
+    EnumOf(d) -> d.tvalues
+    _ -> buf()
+
 // What `Self` stands for inside a type's own members: the type at its own parameters.
 private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string],
                   bounds: Buf[NamedBounds]) -> Type
@@ -1521,11 +1527,21 @@ private self_type(a: &Analysis, scope: Scope, owner: string, tparams: Buf[string
     // This builds the type at its own parameters, which reads its fields -- and a field's length is
     // judged where something instantiates the type, not here. Standing at a number, `[N + 1]int`
     // and `[N - 1]int` would be judged as the lengths of a type nobody asked for.
+    //
+    // **A count parameter stands as itself all the same**: it sizes nothing, and a field written
+    // `&K Node[T, K]` is only a reference where `K` is the count it was declared as.
     val stood = abstract_subst(a, scope, tparams, bounds, buf(), buf(), buf())
+    val counts = stand_ins(a, scope, tparams, declared_tvalues(decl.unwrap().kind))
     var targs: Buf[Type] = buf()
 
     for tparam in tparams
-        targs.push(bound_type(stood, tparam).unwrap_or(Abstract(tparam, buf())))
+        val count = bound_type(counts, tparam) match
+            Some(ConstArg(v, ty, stood_in, term)) ->
+                if is_count_kind(*ty) then Some(ConstArg(v, *ty, stood_in, term)) else None
+            _ -> None
+
+        targs.push(count.unwrap_or(bound_type(stood, tparam).unwrap_or(Abstract(tparam, buf()))))
+    end for
 
     decl.unwrap().kind match
         StructOf(d) -> instantiate_struct(a, decl.unwrap().scope, decl.unwrap().span, d.name, owner,
@@ -1841,7 +1857,7 @@ private type_keys(out: *Buf[string], t: Type)
         Constrained(d) -> push_key(out, d.name)
         Ptr(inner, _, _) -> type_keys(out, *inner)
         Volatile(inner) -> type_keys(out, *inner)
-        Ref(inner, _) -> type_keys(out, *inner)
+        Ref(inner, _, _) -> type_keys(out, *inner)
         Weak(inner) -> type_keys(out, *inner)
         Array(_, elem, _) -> type_keys(out, *elem)
         Vector(_, elem, _) -> type_keys(out, *elem)
@@ -1907,7 +1923,7 @@ names_in(out: *Buf[(string, Span)], t: TypeRef, skip: Buf[string])
             for arg in args
                 names_in(out, arg, skip)
         PtrType(inner, _, _) -> names_in(out, inner, skip)
-        RefType(inner, _) -> names_in(out, inner, skip)
+        RefType(inner, _, _) -> names_in(out, inner, skip)
         WeakType(inner) -> names_in(out, inner, skip)
         VolatileType(inner) -> names_in(out, inner, skip)
         ArrayType(_, elem, _) -> names_in(out, elem, skip)

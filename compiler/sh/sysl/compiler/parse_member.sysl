@@ -639,7 +639,7 @@ private names_a_variant(t: Tok) -> bool = t match
 private names_self(t: TypeRef) -> bool = *t.kind match
     NamedType(n, _) -> n == "self"
     PtrType(inner, _, _) -> names_self(inner)
-    RefType(inner, _) -> names_self(inner)
+    RefType(inner, _, _) -> names_self(inner)
     _ -> false
 
 private positional_payload_refusal(typ: TypeRef) -> string =
@@ -757,6 +757,18 @@ end parse_enum_variant
 
 // -- trait -------------------------------------------------------------------------------------
 
+// A trait declares no count parameter: its members would be one slot per kind, which a trait object
+// has no way to choose between. A generic type with one implements an ordinary trait at each kind.
+private refuse_counts(p: *Parser, at: Span, tp: TypeParams)
+    for v in tp.values
+        if is_count_param(v.typ)
+            p.fault(at, s"a trait takes no count parameter yet \u{2014} 'count ${v.name}' belongs on a " +
+                    "struct, an enum, a function or an 'impl'. A type declared with one implements " +
+                    "this trait at each kind: 'impl[T, count K] Name for Type[T, K]'")
+            return
+        end if
+end refuse_counts
+
 parse_trait_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     p.bump()
 
@@ -770,6 +782,7 @@ parse_trait_decl(p: *Parser, start: Span, vis: Visibility) -> Stmt
     if p.accept_kw(":") then supers = parse_bounds(p)
 
     refuse_packs(p, tp, "a trait")
+    refuse_counts(p, start, tp)
 
     tp = parse_where_on(p, tp)
 
@@ -988,8 +1001,8 @@ private derive_receiver(p: *Parser, param: string) -> Option[RecvMode]
         PtrType(inner, _, _) -> *inner.kind match
             NamedType(n, args) -> if n == param && args.is_empty() then Some(ByPtr) else None
             _ -> None
-        RefType(inner, _) -> *inner.kind match
-            NamedType(n, args) -> if n == param && args.is_empty() then Some(ByRef(false)) else None
+        RefType(inner, _, _) -> *inner.kind match
+            NamedType(n, args) -> if n == param && args.is_empty() then Some(ByRef(false, "")) else None
             _ -> None
         _ -> None
 end derive_receiver
@@ -1766,7 +1779,12 @@ private at_sync_self(p: *Parser) -> bool = p.peek_at(1) match
     Ident(n) -> n == "sync" && p.kw_at(2, "self")
     _ -> false
 
-// How a method takes its receiver: `self`, `*self`, `&self`, `&sync self`.
+// `K self` after the `&`: a receiver counted the way the count parameter `K` says.
+private at_kind_self(p: *Parser) -> Option[string] = p.peek_at(1) match
+    Ident(n) -> if p.kw_at(2, "self") then Some(n) else None
+    _ -> None
+
+// How a method takes its receiver: `self`, `*self`, `&self`, `&sync self`, `&K self`.
 private parse_receiver(p: *Parser) -> Option[RecvMode]
     if p.at_kw("self")
         p.bump()
@@ -1782,14 +1800,25 @@ private parse_receiver(p: *Parser) -> Option[RecvMode]
     if p.at_kw("&") && p.kw_at(1, "self")
         p.bump()
         p.bump()
-        return Some(ByRef(false))
+        return Some(ByRef(false, ""))
     end if
 
     if p.at_kw("&") && at_sync_self(p)
         p.bump()
         p.bump()
         p.bump()
-        return Some(ByRef(true))
+        return Some(ByRef(true, ""))
+    end if
+
+    if p.at_kw("&")
+        val kind = at_kind_self(p)
+
+        if kind.is_some()
+            p.bump()
+            p.bump()
+            p.bump()
+            return Some(ByRef(false, kind.unwrap()))
+        end if
     end if
 
     None

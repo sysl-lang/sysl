@@ -161,7 +161,9 @@ private canonical_name(t: Type) -> string = t match
     Never -> "never"
     Unknown -> "?"
     Ptr(inner, ro, nn) -> s"*${if ro then "const " else ""}${if nn then "nonnull " else ""}${type_show(*inner)}"
-    Ref(inner, sync) -> s"&${if sync then "sync " else ""}${type_show(*inner)}"
+    Ref(inner, sync, kind) ->
+        if !kind.is_empty() then s"&${term_text(kind)} ${type_show(*inner)}"
+        else s"&${if sync then "sync " else ""}${type_show(*inner)}"
     Weak(inner) -> s"weak ${type_show(*inner)}"
     CFn(ps, r, k) ->
         s"${if marks_abandon(k) then "@abandons " else ""}*${if marks_nonnull(k) then "nonnull " else ""}" +
@@ -195,7 +197,9 @@ end before_hash
 private const_arg_text(v: BigInt, ty: Type) -> string = ty match
     Bool -> if v.is_zero() then "false" else "true"
     Char -> s"'${char(u32(v.to_long().unwrap_or(0)))}'"
-    Enum(d) -> enum_tag_text(d, v)
+    Enum(d) ->
+        if qualified_name(d.base) != "sysl.CountKind" then enum_tag_text(d, v)
+        else if v.is_zero() then "plain" else "sync"
     _ -> v.to_string()
 
 private enum_tag_text(d: &EnumType, v: BigInt) -> string
@@ -496,7 +500,7 @@ mangle(t: Type) -> string = t match
     Ptr(inner, ro, nn) ->
         if nn then (if ro then s"constnnptr.${mangle(*inner)}" else s"nnptr.${mangle(*inner)}")
         else if ro then s"constptr.${mangle(*inner)}" else s"ptr.${mangle(*inner)}"
-    Ref(inner, sync) -> if sync then s"sync.${mangle(*inner)}" else s"ref.${mangle(*inner)}"
+    Ref(inner, sync, _) -> if sync then s"sync.${mangle(*inner)}" else s"ref.${mangle(*inner)}"
     Weak(inner) -> s"weak.${mangle(*inner)}"
     Array(n, elem, _) -> s"arr$n.${mangle(*elem)}"
     Vector(n, elem, _) -> s"vec$n.${mangle(*elem)}"

@@ -160,7 +160,7 @@ analyze_unwidened(cx: &Analyzer, e: Expr, expected: Option[Type]) -> TExpr
 
     // A `&T` written where a `&T` was wanted is already one; anything else is asked for a `T`.
     want match
-        Ref(inner, _) ->
+        Ref(inner, _, _) ->
             if address_of(cx, e) then return analyze_value(cx, e, expected)
 
             *e.kind match
@@ -237,7 +237,7 @@ private converts(want: Type) -> bool
     if erased(want) then return true
 
     want match
-        Ref(_, _) -> true
+        Ref(_, _, _) -> true
         Weak(_) -> true
         Slice(e, ro) -> ro || is_volatile_elem(*e)
         Ptr(_, ro, _) -> ro
@@ -445,7 +445,7 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
             end if
 
             t
-        Ref(inner, sync) ->
+        Ref(inner, sync, _) ->
             if type_eq(got, *inner)
                 // A task it holds is asked about once the body that made it is typed.
                 if sync then note_task_crossing(cx, t.span, CrossShared(type_show(*inner)), t)
@@ -455,7 +455,7 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
                 return TExpr(t.span, TBox(t, expected))
             end if
 
-            if type_eq(got, Ref(*inner, !sync)) then
+            if type_eq(got, Ref(*inner, !sync, buf())) then
                 return cx.err(t.span, s"'&${type_show(*inner)}' and '&sync ${type_show(*inner)}' " +
                               "are distinct types, and neither converts to the other: a count is " +
                               "atomic or it is not from the moment the object is allocated, and a " +
@@ -466,10 +466,24 @@ coerce(cx: &Analyzer, t: TExpr, expected: Type) -> TExpr
 
             t
         Weak(inner) ->
-            if type_eq(got, Ref(*inner, false)) then return TExpr(t.span, TDowngrade(t, expected))
+            if type_eq(got, Ref(*inner, false, buf())) then return TExpr(t.span, TDowngrade(t, expected))
+
+            // A reference whose kind is a count parameter has no weak form: it is a `&sync T` in one
+            // instance, and an atomic reference has none.
+            got match
+                Ref(gi, _, kind) ->
+                    if !kind.is_empty() && type_eq(*gi, *inner)
+                        val k = term_text(kind)
+                        val shown = type_show(*inner)
+
+                        return cx.err_whatever_the_types(t.span, s"a '&$k $shown' has no weak form — " +
+                            s"'$k' is 'sync' in one instance, and an atomic reference cannot be " +
+                            s"weakened. Weaken a '&$shown', where the kind is written out")
+                    end if
+                _ -> ()
 
             *inner match
-                Ref(deep, _) ->
+                Ref(deep, _, _) ->
                     if type_eq(got, *inner) then
                         return cx.err(t.span, s"'weak ${type_show(*deep)}' is already a weak edge " +
                                       s"to a counted ${type_show(*deep)}, so the '&' says the mode " +
@@ -599,7 +613,7 @@ end array_view
 // (`escape.sysl`).
 array_elem(t: Type) -> Option[Type] = t match
     Array(_, e, _) -> Some(*e)
-    Ref(inner, _) -> *inner match
+    Ref(inner, _, _) -> *inner match
         Array(_, e, _) -> Some(*e)
         _ -> None
     _ -> None

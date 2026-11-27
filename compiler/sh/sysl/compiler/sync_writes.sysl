@@ -72,7 +72,8 @@ sync_shared_elements(cx: &Analyzer, t: TExpr) -> bool
     val ty = texpr_type(t)
 
     repr(ty) match
-        Ref(inner, sync) -> return sync && owns_elements(*inner) && !exempt_from_sync(element_of(*inner))
+        Ref(inner, sync, kind) ->
+            return (sync || !kind.is_empty()) && owns_elements(*inner) && !exempt_from_sync(element_of(*inner))
         _ -> ()
 
     owns_elements(ty) && !exempt_from_sync(element_of(ty)) && sync_write_refusal(cx, t).is_some()
@@ -87,7 +88,7 @@ sync_view_note(cx: &Analyzer, t: TExpr) -> string = *t.kind match
         val ty = texpr_type(base)
 
         repr(ty) match
-            Ref(inner, _) -> " — " + sync_write_message("and it views", ty, *inner)
+            Ref(inner, _, _) -> " — " + sync_write_message("and it views", ty, *inner)
             _ -> sync_write_refusal(cx, base) match
                 Some((through, owner)) -> " — " + sync_write_message("and it views", through, owner)
                 None -> ""
@@ -106,7 +107,15 @@ sync_write_message(head: string, through: Type, owner: Type) -> string
         Struct(_) -> s"'@unchecked(Share)' above '$name' where its writes are synchronised another way"
         _ -> "'@unchecked(Share)' above the type where its writes are synchronised another way"
 
-    s"$head a field reached through a '${type_show(through)}', which is read-only: every thread " +
+    val shown = type_show(through)
+    val read_only = repr(through) match
+        Ref(inner, _, kind) ->
+            if kind.is_empty() then s"a '$shown', which is read-only"
+            else s"a '$shown', which is a '&sync ${type_show(*inner)}' where '${term_text(kind)}' is " +
+                 "'sync' and so read-only"
+        _ -> s"a '$shown', which is read-only"
+
+    s"$head a field reached through $read_only: every thread " +
         "holding the reference may reach it at once, and a plain write would race theirs. Make the " +
         "field an 'Atomic', name it in a '@guards' (the field is then private, so only the type's own members write it, " +
         "and they must take the lock, which is not checked), or write " + promise
@@ -142,12 +151,20 @@ private guarded_field(own: Type, idx: int) -> bool = own match
     Struct(d) -> idx >= 0 && usize(idx) < d.fields.len() && holds_string(d.guarded, d.fields[usize(idx)].0)
     _ -> false
 
+// **A reference whose kind is a count parameter is read-only too**: it is a `&sync T` in one
+// instance, and inside the declaration it is every instance at once.
 private is_sync_ref(t: Type) -> bool = repr(t) match
-    Ref(_, sync) -> sync
+    Ref(_, sync, kind) -> sync || !kind.is_empty()
+    _ -> false
+
+// Whether a write was refused through a reference whose kind is a count parameter, which is refused
+// whatever the instance -- the walk over a generic's own declaration keeps it.
+through_count_kind(through: Type) -> bool = repr(through) match
+    Ref(_, _, kind) -> !kind.is_empty()
     _ -> false
 
 private holds_address(t: Type) -> bool = repr(t) match
-    Ref(_, _) -> true
+    Ref(_, _, _) -> true
     Weak(_) -> true
     Ptr(_, _, _) -> true
     _ -> false

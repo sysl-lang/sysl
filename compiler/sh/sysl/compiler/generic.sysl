@@ -37,7 +37,7 @@ subst_params(a: &Analysis, t: Type, subst: Buf[Binding]) -> Type
         Constrained(d) ->
             if d.targs.is_empty() then t else reinstantiate(a, d.generic, subst_list(a, d.targs, subst))
         Ptr(inner, ro, nn) -> Ptr(subst_params(a, *inner, subst), ro, nn)
-        Ref(inner, sync) -> Ref(subst_params(a, *inner, subst), sync)
+        Ref(inner, sync, kind) -> settled_ref(subst_params(a, *inner, subst), sync, kind, subst)
         Weak(inner) -> Weak(subst_params(a, *inner, subst))
         Array(n, elem, term) -> Array(n, subst_params(a, *elem, subst), term)
         Vector(n, elem, term) -> Vector(n, subst_params(a, *elem, subst), term)
@@ -166,9 +166,17 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
 
         // A `&T` parameter also accepts a bare `T`, which the call boxes, so the payload type is
         // matched against either shape.
-        RefType(inner, sync) -> actual match
-            Ref(t, s) ->
-                if s == sync && !binds_object(inner, *t, tparams, sub) then
+        //
+        // **`&K T` reads `K` off the argument's kind** the way `[N]T` reads `N` off its length: a
+        // `&sync X` binds it to `sync`, a `&X` to `plain`, and a reference whose own kind is a
+        // parameter still standing for itself binds it to that parameter.
+        RefType(inner, sync, kind) -> actual match
+            Ref(t, s, held) ->
+                if kind != "" && holds_string(tparams, kind) && bound_type(*sub, kind).is_none() then
+                    sub.push(Binding(kind, if held.is_empty() then count_arg(a, s)
+                                           else ConstArg(from_int(0), count_kind_type(a), true, held)))
+
+                if (kind != "" || s == sync) && !binds_object(inner, *t, tparams, sub) then
                     unify(a, scope, inner, *t, tparams, sub)
             other -> unify(a, scope, inner, other, tparams, sub)
 
@@ -176,7 +184,7 @@ private unify_nameless(a: &Analysis, scope: Scope, want: TypeRef, actual: Type, 
         // is given, for the same reason.
         WeakType(inner) -> actual match
             Weak(t) -> unify(a, scope, inner, *t, tparams, sub)
-            Ref(t, _) -> unify(a, scope, inner, *t, tparams, sub)
+            Ref(t, _, _) -> unify(a, scope, inner, *t, tparams, sub)
             _ -> ()
 
         ArrayType(length, elem, _) ->

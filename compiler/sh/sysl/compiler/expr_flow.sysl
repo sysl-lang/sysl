@@ -482,7 +482,7 @@ private cond_is(cx: &Analyzer, span: Span, subject: Expr, patterns: Buf[Pattern]
 
     // A test whose every alternative reaches through the reference is `*x is …`, as a `match` is.
     repr(texpr_type(ts)) match
-        Ref(inner, _) if all_through(tpats) ->
+        Ref(inner, _, _) if all_through(tpats) ->
             TCondIs(TExpr(ts.span, TDeref(ts, *inner)), patterns_through(tpats, *inner).unwrap(), negated)
         _ -> TCondIs(ts, tpats, negated)
 end cond_is
@@ -556,7 +556,7 @@ end match_expr
 // dereference it has always been asked of. Nothing where an arm names or tests the reference itself.
 private matched_through(ts: TExpr, arms: Buf[TArm]) -> Option[(TExpr, Buf[TArm])]
     val held = repr(texpr_type(ts)) match
-        Ref(inner, _) -> *inner
+        Ref(inner, _, _) -> *inner
         _ -> return None
 
     var reached = false
@@ -2057,6 +2057,27 @@ private unrolled(cx: &Analyzer, span: Span, name: string, each: Buf[Buf[Binding]
     TExpr(span, TSeq(copies))
 end unrolled
 
+// The count parameter a condition compares, where it is one side of a comparison.
+private count_condition(cx: &Analyzer, cond: Expr) -> Option[string]
+    var sides: Buf[Expr] = buf()
+
+    *cond.kind match
+        Compare(operands, _) ->
+            for o in operands
+                sides.push(o)
+        Binary(_, l, r) ->
+            sides.push(l)
+            sides.push(r)
+        _ -> ()
+
+    for s in sides
+        *s.kind match
+            Ident(n) -> if names_count_parameter(cx, n) then return Some(n)
+            _ -> ()
+
+    None
+end count_condition
+
 // `if const cond` -- the branch decided **while compiling**. The condition is folded, and only the arm
 // it picks is read: the other is never type-checked, which is what lets one generic body hold an arm
 // that makes sense only for some of its instances. A generic body read before any instance has no
@@ -2064,6 +2085,14 @@ end unrolled
 // takes -- except that the first arm of `if const N == c` is read for what it keeps (`refined_arm`).
 const_if_expr(cx: &Analyzer, span: Span, cond: Expr, then_body: Buf[Stmt], else_body: Option[Buf[Stmt]],
               expected: Option[Type], discarded: bool) -> TExpr
+    // A count parameter chooses no arm: a body generic in one is read once, for both kinds.
+    val kind = count_condition(cx, cond)
+
+    if kind.is_some() then
+        return cx.err_whatever_the_types(cond.span, s"'${kind.unwrap()}' is a count parameter, and an " +
+            "'if const' does not read one yet — a body generic in a count is one body for both kinds. " +
+            "Write what differs as two functions, one taking '&T' and one '&sync T'")
+
     if cx.at_definition
         refined_arm(cx, cond, then_body, expected, discarded)
         return TExpr(span, TZero(Unknown))

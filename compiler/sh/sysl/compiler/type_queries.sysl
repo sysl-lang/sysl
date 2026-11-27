@@ -99,7 +99,7 @@ mentions_abstract(t: Type) -> bool = t match
     // A `new` type's parameters are carried for typing alone, and still make it generic.
     Constrained(d) -> any_mentions_abstract(d.targs)
     Ptr(inner, _, _) -> mentions_abstract(*inner)
-    Ref(inner, _) -> mentions_abstract(*inner)
+    Ref(inner, _, _) -> mentions_abstract(*inner)
     Weak(inner) -> mentions_abstract(*inner)
     Array(_, elem, _) -> mentions_abstract(*elem)
     Vector(_, elem, _) -> mentions_abstract(*elem)
@@ -130,7 +130,8 @@ stand_in_tag(t: Type) -> string = t match
     Enum(d) -> tag_list(d.targs)
     Results(parts) -> tag_list(parts.targs)
     Ptr(inner, _, _) -> stand_in_tag(*inner)
-    Ref(inner, _) -> stand_in_tag(*inner)
+    // A reference's kind likewise, so `&K T` and `&J T` are two.
+    Ref(inner, _, kind) -> s"${extent_tag(kind)}${stand_in_tag(*inner)}"
     Weak(inner) -> stand_in_tag(*inner)
     // A length's form likewise, so `[N]T` and `[M]T` are two.
     Array(_, elem, term) -> s"${extent_tag(term)}${stand_in_tag(*elem)}"
@@ -194,7 +195,7 @@ mentions_unknown(t: Type) -> bool = t match
     Enum(d) -> any_mentions_unknown(d.targs)
     Results(parts) -> any_mentions_unknown(parts.targs)
     Ptr(inner, _, _) -> mentions_unknown(*inner)
-    Ref(inner, _) -> mentions_unknown(*inner)
+    Ref(inner, _, _) -> mentions_unknown(*inner)
     Weak(inner) -> mentions_unknown(*inner)
     Array(_, elem, _) -> mentions_unknown(*elem)
     Vector(_, elem, _) -> mentions_unknown(*elem)
@@ -276,7 +277,7 @@ private holds_name_only(t: Type) -> bool = t match
     Integer(_, _, _, m) -> m.is_some()
     Floating(_, _, m) -> m.is_some()
     Ptr(inner, _, _) -> holds_name_only(*inner)
-    Ref(inner, _) -> holds_name_only(*inner)
+    Ref(inner, _, _) -> holds_name_only(*inner)
     Weak(inner) -> holds_name_only(*inner)
     Array(_, elem, _) -> holds_name_only(*elem)
     Vector(_, elem, _) -> holds_name_only(*elem)
@@ -298,7 +299,7 @@ private stripped_names(t: Type) -> Type = t match
     Integer(_, _, _, _) -> unmeasured(t)
     Floating(_, _, _) -> unmeasured(t)
     Ptr(inner, ro, nn) -> Ptr(nameless(*inner), ro, nn)
-    Ref(inner, sync) -> Ref(nameless(*inner), sync)
+    Ref(inner, sync, kind) -> Ref(nameless(*inner), sync, kind)
     Weak(inner) -> Weak(nameless(*inner))
     Array(n, elem, term) -> Array(n, nameless(*elem), term)
     Vector(n, elem, term) -> Vector(n, nameless(*elem), term)
@@ -360,7 +361,7 @@ end unique_inside
 
 // Whether the type holds anything that carries a count, which is what says a copy is not a copy.
 contains_counted(t: Type) -> bool = t match
-    Ref(_, _) -> true
+    Ref(_, _, _) -> true
     Weak(_) -> true
     Slice(_, _) -> true
     Str -> true
@@ -487,7 +488,7 @@ pointee(t: Type) -> Option[Type]
 
     t match
         Ptr(inner, _, _) -> Some(*inner)
-        Ref(inner, _) -> Some(*inner)
+        Ref(inner, _, _) -> Some(*inner)
         Constrained(d) ->
             if d.cname.is_some() && !d.derived && d.lo.is_none() && d.hi.is_none() &&
                d.pred_fn.is_none() then pointee(d.base)
@@ -501,12 +502,12 @@ end pointee
 bound_referent(t: Type) -> Option[Type]
     val inner = t match
         Ptr(i, _, _) -> *i
-        Ref(i, _) -> *i
+        Ref(i, _, _) -> *i
         _ -> return None
 
     inner match
         Ptr(_, _, _) -> None
-        Ref(_, _) -> None
+        Ref(_, _, _) -> None
         Trait(_, _, _) -> None
         Pack(_) -> None
         Unknown -> None
@@ -519,7 +520,7 @@ erased(t: Type) -> bool = erased_trait(t).is_some()
 // The trait an erased pointer was made against.
 erased_trait(t: Type) -> Option[Type] = t match
     Ptr(inner, _, _) -> if is_trait(*inner) then Some(*inner) else None
-    Ref(inner, _) -> if is_trait(*inner) then Some(*inner) else None
+    Ref(inner, _, _) -> if is_trait(*inner) then Some(*inner) else None
     _ -> None
 
 is_trait(t: Type) -> bool = t match
@@ -573,7 +574,7 @@ is_equatable(t: Type) -> bool
         Constrained(d) -> is_equatable(d.base)
         Bool -> true
         Ptr(_, _, _) -> true
-        Ref(_, _) -> true
+        Ref(_, _, _) -> true
         CFn(_, _, _) -> true
         Enum(d) -> d.simple
         _ -> is_ordered(t)

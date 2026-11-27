@@ -981,7 +981,7 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
     // which reach no table of members -- unless the referent's own type has a member of the name.
     if name == "into_raw" && !owns_member(cx, rty, name)
         held match
-            Ref(_, _) -> return into_raw_call(cx, span, receiver, args, wants_non_null(expected))
+            Ref(_, _, _) -> return into_raw_call(cx, span, receiver, args, wants_non_null(expected))
             _ -> ()
     end if
 
@@ -1248,7 +1248,7 @@ private address_member(cx: &Analyzer, span: Span, receiver: TExpr, held: Type, n
 
     val word = Integer(64, false, false, None)
     val address = held match
-        Ref(_, _) -> TExpr(span, TCast(receiver, Ptr(byte_type(), false, false)))
+        Ref(_, _, _) -> TExpr(span, TCast(receiver, Ptr(byte_type(), false, false)))
         _ -> receiver
     var call_args: Buf[TExpr] = buf()
 
@@ -1681,7 +1681,8 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
     if receiver.is_some() then
         ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver.unwrap(),
-                                            written, m.marks.relocates),
+                                            written, m.marks.relocates,
+                                            if params.is_empty() then Unknown else params[0].1),
                              if params.is_empty() then Unknown else params[0].1))
 
     if receiver.is_some() && m.marks.relocates then check_ref_call(cx, span, receiver.unwrap(), m.name)
@@ -1819,7 +1820,8 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     val mode = if target.is_some() && target.unwrap().recv_mode().is_some()
                then target.unwrap().recv_mode().unwrap() else m.recv_mode().unwrap()
 
-    ts.push(as_read_only(build_receiver(cx, span, mode, receiver, written, m.marks.relocates),
+    ts.push(as_read_only(build_receiver(cx, span, mode, receiver, written, m.marks.relocates,
+                                        if params.is_empty() then Unknown else params[0].1),
                          if params.is_empty() then Unknown else params[0].1))
 
     // A `@relocates` member may move what a live `ref` stands on, whatever mode its receiver is in.
@@ -2053,7 +2055,7 @@ private as_read_only(tr: TExpr, want: Type) -> TExpr
 end as_read_only
 
 build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
-                       member: string, relocates: bool = false) -> TExpr = mode match
+                       member: string, relocates: bool = false, wanted: Type = Unknown) -> TExpr = mode match
     // A by-value receiver is a **copy**, made by the caller, so calling one needs the layout exactly
     // as building the value does: without the refusal an opaque type's `self` methods would copy the
     // fields as they stood when the caller was compiled. `*self` and `&self` need no shape.
@@ -2078,7 +2080,7 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
             tr
         _ ->
             val place = texpr_type(tr) match
-                Ref(_, _) -> auto_deref(cx, tr)
+                Ref(_, _, _) -> auto_deref(cx, tr)
                 _ -> tr
 
             // **A callable called where it was produced is given a slot**, as Rust gives a temporary
@@ -2116,9 +2118,21 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
     // **The receiver's kind is the method's kind**: `&T` and `&sync T` are distinct types, so a
     // `&self` method is not called on a `&sync T`, nor a `&sync self` one on a `&T`
     // (`receiver_kind_refusal`).
-    ByRef(sync) -> texpr_type(tr) match
-        Ref(inner, held) ->
-            if held != sync then return receiver_kind_refusal(cx, span, member, *inner, sync)
+    //
+    // **A `&K self` member's kind is what its instance bound `K` to**, read off the `self` parameter
+    // the instance's signature resolved (`wanted`). A receiver whose own kind is a count parameter
+    // still standing for itself is one kind in one instance and the other in another, so only a
+    // member written with that same parameter takes it (`count_receiver_refusal`).
+    ByRef(sync, kind) -> texpr_type(tr) match
+        Ref(inner, held, form) ->
+            val asked: (bool, Buf[Mono]) = if kind == "" then (sync, buf()) else wanted match
+                Ref(_, ws, wk) -> (ws, wk)
+                _ -> (held, form)
+
+            if term_cmp(form, asked.1) != 0 then
+                return count_receiver_refusal(cx, span, member, *inner, form, asked.0, asked.1)
+
+            if held != asked.0 then return receiver_kind_refusal(cx, span, member, *inner, asked.0)
 
             tr
         Unknown -> tr
@@ -2130,6 +2144,31 @@ build_receiver(cx: &Analyzer, span: Span, mode: RecvMode, tr: TExpr,
                    s"the stack — a '${kind}self' method may keep hold of what it is called on, so what " +
                    "it wants is a share of a box rather than an address. Bind the value into one and " +
                    s"call it on that: 'var r: $kind$shown = …'")
+
+// A member whose receiver is one kind called on a reference whose kind is a count parameter, or the
+// reverse. Said whatever the instance: inside the declaration the parameter is both kinds at once.
+count_receiver_refusal(cx: &Analyzer, span: Span, member: string, inner: Type, held: Buf[Mono],
+                       wants_sync: bool, wants: Buf[Mono]) -> TExpr
+    val t = type_show(inner)
+    val takes = if !wants.is_empty() then s"&${term_text(wants)} self" else if wants_sync then "&sync self" else "&self"
+
+    if held.is_empty() then
+        return cx.err_whatever_the_types(span, s"'$member' takes '$takes', and this receiver's kind is " +
+            s"written out — '${term_text(wants)}' is a count parameter, ordinary in one instance and " +
+            s"atomic in another, and this reference is one kind in all of them. Hold it as a " +
+            s"'&${term_text(wants)} $t'")
+
+    val k = term_text(held)
+
+    if !wants.is_empty() then
+        return cx.err_whatever_the_types(span, s"'$member' takes '$takes', and this receiver is a " +
+            s"'&$k $t' — '$k' and '${term_text(wants)}' are different count parameters")
+
+    cx.err_whatever_the_types(span, s"'$member' takes '$takes', and this receiver is a '&$k $t', whose " +
+        s"count is ordinary in one instance and atomic in another — a body generic in '$k' may do only " +
+        s"what both kinds allow. Declare '$member' with '&$k self' where its type declares '$k', or " +
+        "with 'self' where it only reads")
+end count_receiver_refusal
 
 // A `&self` method called on a `&sync T`, or a `&sync self` one on a `&T`.
 //
@@ -3128,7 +3167,7 @@ private into_raw_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr
         return cx.err(span, "'into_raw' takes no arguments — it gives up the reference it is called on")
 
     underlying(ty) match
-        Ref(inner, _) ->
+        Ref(inner, _, _) ->
             if is_trait(*inner) then
                 return cx.err(span, s"'into_raw' gives up a reference as one address, and a " +
                               s"'${type_show(ty)}' is two words — the address and the table of the type " +
@@ -3435,7 +3474,7 @@ private object_downcast(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, n
     end if
 
     val ref_ty = obj match
-        Ref(_, sync) -> Ref(target, sync)
+        Ref(_, sync, kind) -> Ref(target, sync, kind)
         Ptr(_, ro, nn) -> Ptr(target, ro, nn)
         _ -> return bad_expr(span)
 
@@ -3471,7 +3510,7 @@ private downcast_refusal(cx: &Analyzer, obj: Type, rty: Type, target: Type, name
     if is_trait(target) then return Some(downcast_to_trait(shown, asked, name))
 
     target match
-        Ref(_, _) | Ptr(_, _, _) | Weak(_) ->
+        Ref(_, _, _) | Ptr(_, _, _) | Weak(_) ->
             return Some(s"a $shown holds the value a reference was erased from, never a reference " +
                         s"itself, so '$asked' is never what it holds — ask for the type it points at")
         _ -> ()
@@ -3609,8 +3648,11 @@ private erased_call(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, slot:
                     tr: Bound, m: MethodDecl, args: Buf[Expr]) -> TExpr
     // A trait object's kind is its receiver's, as a type's is (`receiver_kind_refusal`).
     m.recv_mode() match
-        Some(ByRef(sync)) -> texpr_type(receiver) match
-            Ref(inner, held) ->
+        Some(ByRef(sync, _)) -> texpr_type(receiver) match
+            Ref(inner, held, form) ->
+                if !form.is_empty() then
+                    return count_receiver_refusal(cx, span, m.name, *inner, form, sync, buf())
+
                 if held != sync then return receiver_kind_refusal(cx, span, m.name, *inner, sync)
             _ -> ()
         _ -> ()
@@ -3807,7 +3849,7 @@ private weak_get(cx: &Analyzer, span: Span, receiver: TExpr, inner: Type, name: 
     val key = library_key("Option")
     var targs: Buf[Type] = buf()
 
-    targs.push(Ref(inner, false))
+    targs.push(Ref(inner, false, buf()))
 
     val opt = reinstantiate(cx.an, key, targs)
 

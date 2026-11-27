@@ -965,7 +965,7 @@ refine_type(a: &Analysis, t: Type, rs: Buf[Refinement]) -> Type = t match
         else reinstantiate(a, d.base, refine_list(a, d.targs, rs))
     Enum(d) -> if d.targs.is_empty() then t else reinstantiate(a, d.base, refine_list(a, d.targs, rs))
     Ptr(inner, ro, nn) -> Ptr(refine_type(a, *inner, rs), ro, nn)
-    Ref(inner, sync) -> Ref(refine_type(a, *inner, rs), sync)
+    Ref(inner, sync, kind) -> Ref(refine_type(a, *inner, rs), sync, kind)
     Weak(inner) -> Weak(refine_type(a, *inner, rs))
     Slice(elem, ro) -> Slice(refine_type(a, *elem, rs), ro)
     Volatile(inner) -> Volatile(refine_type(a, *inner, rs))
@@ -1077,7 +1077,7 @@ value_clash_told(refusal: string, want: Type, got: Type, own: Buf[string]) -> Op
 
     if found.is_none()
         want match
-            Ref(inner, _) -> found = value_clash(*inner, got, own)
+            Ref(inner, _, _) -> found = value_clash(*inner, got, own)
             _ -> ()
     end if
 
@@ -1086,7 +1086,20 @@ end value_clash_told
 
 private clash_difference(want: Type, got: Type) -> string = (want, got) match
     (Abstract(wn, _), Abstract(gn, _)) -> s"'$gn' and '$wn' are different type parameters"
+    (Ref(_, _, wk), Ref(inner, _, gk)) -> kind_difference(wk, gk, *inner)
     _ -> term_difference(want, got)
+
+// What tells two references apart that differ only in kind, one of them a count parameter's.
+private kind_difference(want: Buf[Mono], got: Buf[Mono], inner: Type) -> string
+    if !want.is_empty() && !got.is_empty() then
+        return s"'${term_text(got)}' and '${term_text(want)}' are different count parameters"
+
+    val k = term_text(if want.is_empty() then got else want)
+    val t = type_show(inner)
+
+    s"'$k' is a count parameter, ordinary in one instance and atomic in another, so '&$k $t' is " +
+        s"neither '&$t' nor '&sync $t'. Write '&$k $t' on both sides, or name one kind on both"
+end kind_difference
 
 // (whether the two agree outside the parameters, the first pair of parameters that differs).
 private clash_in(want: Type, got: Type, own: Buf[string]) -> (bool, Option[(Type, Type)])
@@ -1104,7 +1117,12 @@ private clash_in(want: Type, got: Type, own: Buf[string]) -> (bool, Option[(Type
         (Enum(w), Enum(g)) -> if w.base == g.base then clash_list(w.targs, g.targs, own) else (false, None)
         (Trait(wn, wa, _), Trait(gn, ga, _)) -> if wn == gn then clash_list(wa, ga, own) else (false, None)
         (Ptr(w, wro, wnn), Ptr(g, gro, gnn)) -> if wro == gro && wnn == gnn then clash_in(*w, *g, own) else (false, None)
-        (Ref(w, ws), Ref(g, gs)) -> if ws == gs then clash_in(*w, *g, own) else (false, None)
+        // Two references that part at their KIND, one of them a count parameter's: inside the
+        // declaration `&K T` is neither `&T` nor `&sync T` nor another parameter's `&J T`.
+        (Ref(w, ws, wk), Ref(g, gs, gk)) ->
+            if term_cmp(wk, gk) != 0 then (if type_eq(*w, *g) then (true, Some((want, got))) else (false, None))
+            else if ws == gs then clash_in(*w, *g, own)
+            else (false, None)
         (Weak(w), Weak(g)) -> clash_in(*w, *g, own)
         (Volatile(w), Volatile(g)) -> clash_in(*w, *g, own)
         (Slice(w, wro), Slice(g, gro)) -> if wro == gro then clash_in(*w, *g, own) else (false, None)

@@ -182,7 +182,7 @@ private call_read(cx: &Analyzer, span: Span, callee: Expr, args: Buf[Expr],
                 if form == "ptr_cast" then return ptr_cast_call(cx, span, args, targ)
 
                 // `from_raw[T](p)` names the pointee, as `into_raw` answered a `*T`.
-                if form == "from_raw" then return from_raw_call(cx, span, args, targ.map(t -> Ref(t, false)))
+                if form == "from_raw" then return from_raw_call(cx, span, args, targ.map(t -> Ref(t, false, buf())))
 
                 // `slot_storage[T](n)` names the ELEMENT; the position the form fills is a view.
                 if storage_form(written) then
@@ -1050,7 +1050,7 @@ end null_test_call
 // What 'is_null' may not be asked of. A trait object is two words and a weak reference already has
 // its own answer for "nothing there", so neither is a plain counted address.
 private null_test_fault(t: Type) -> Option[string] = t match
-    Ref(inner, _) ->
+    Ref(inner, _, _) ->
         if !is_trait_type(*inner) then return None
 
         Some("'is_null' asks about a reference's address, and a reference to a trait is two words — " +
@@ -1097,7 +1097,7 @@ end release_call
 // What 'release' may not be given. Each of the near misses already has its own way to be emptied, and
 // the refusal names it rather than only saying what the value is not.
 private release_fault(cx: &Analyzer, t: Type) -> Option[string] = underlying(t) match
-    Ref(_, _) -> None
+    Ref(_, _, _) -> None
     Weak(_) -> Some("'release' gives back the count a '&T' holds, and a weak reference holds none " +
                     "to give — assign 'None' to empty it")
     Enum(d) ->
@@ -1187,7 +1187,7 @@ private from_raw_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
 
     val wanted = expected.map(underlying).unwrap_or(Unknown)
     val t = wanted match
-        Ref(inner, _) -> type_expr(cx, args[0], Some(Ptr(inner, false, false)))
+        Ref(inner, _, _) -> type_expr(cx, args[0], Some(Ptr(inner, false, false)))
         _ -> type_expr_bare(cx, args[0])
     val ty = texpr_type(t)
 
@@ -1200,11 +1200,11 @@ private from_raw_call(cx: &Analyzer, span: Span, args: Buf[Expr], expected: Opti
                               "pointer to a trait is two words — 'into_raw' never answers one")
 
             val sync = wanted match
-                Ref(_, s) -> s
+                Ref(_, s, _) -> s
                 _ -> false
 
-            TExpr(span, TFromRaw(t, Ref(inner, sync)))
-        Ref(_, _) ->
+            TExpr(span, TFromRaw(t, Ref(inner, sync, buf())))
+        Ref(_, _, _) ->
             cx.err(span, s"'from_raw' adopts a pointer 'into_raw' answered, and ${type_show(ty)} is a " +
                    "counted reference already — use it as it is")
         other ->
@@ -1271,7 +1271,7 @@ private ptr_cast_target_fault(to: Type) -> Option[string] = underlying(to) match
              "not say")
     CFn(_, _, _) -> None
     Unknown -> None
-    Ref(_, _) -> Some("'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an " +
+    Ref(_, _, _) -> Some("'ptr_cast' never produces a reference: a '&T' is counted and non-null, and an " +
                       "address read out of bytes carries no count for anything to own — read it as a '*T'")
     Weak(_) -> Some("'ptr_cast' never produces a weak reference, which is a counted reference that " +
                     "does not keep its referent alive — read the address as a '*T'")
@@ -5458,7 +5458,7 @@ end implicit_call
 // subtype is not reduced to its base, whose members are not its own -- seen through the counted
 // reference a `&T` position boxes it into.
 implicit_subject(t: Type) -> Type = t match
-    Ref(inner, _) -> implicit_subject(*inner)
+    Ref(inner, _, _) -> implicit_subject(*inner)
     other -> other
 
 // The refusal for a leading dot where the position supplies no type to look the name up in.

@@ -131,7 +131,10 @@ require_place(cx: &Analyzer, t: TExpr, target: Expr, what: string, writes: bool,
     if writes
         sync_write_refusal(cx, t) match
             Some((through, owner)) ->
-                cx.fault(at, sync_write_message(s"this $what writes", through, owner))
+                if through_count_kind(through) then
+                    cx.err_whatever_the_types(at, sync_write_message(s"this $what writes", through, owner))
+                else cx.fault(at, sync_write_message(s"this $what writes", through, owner))
+
                 return t
             None -> ()
     end if
@@ -214,7 +217,11 @@ refuse_written_once_receiver(cx: &Analyzer, span: Span, place: TExpr, member: st
     if member != "call"
         sync_write_refusal(cx, place) match
             Some((through, owner)) ->
-                cx.fault(span, sync_write_message(s"'$member' takes '*self', so it writes", through, owner))
+                val message = sync_write_message(s"'$member' takes '*self', so it writes", through, owner)
+
+                if through_count_kind(through) then cx.err_whatever_the_types(span, message)
+                else cx.fault(span, message)
+
                 return
             None -> ()
     end if
@@ -417,7 +424,7 @@ private pointee_of(t: Type) -> Type = repr(t) match
 // Whether a value of this type is an address of storage kept elsewhere -- a counted box, a weak
 // reference, a raw pointer. A step through one leaves the binding behind.
 private holds_an_address(t: Type) -> bool = repr(t) match
-    Ref(_, _) -> true
+    Ref(_, _, _) -> true
     Weak(_) -> true
     Ptr(_, _, _) -> true
     _ -> false
@@ -435,7 +442,7 @@ sync_box_around(base: TExpr, stood: (string) -> Option[TExpr]) -> Option[Type]
         val t = texpr_type(base)
 
         return repr(t) match
-            Ref(inner, sync) -> if sync && owns_its_elements(*inner) then Some(t) else None
+            Ref(inner, sync, _) -> if sync && owns_its_elements(*inner) then Some(t) else None
             _ -> None
     end if
 
@@ -465,7 +472,7 @@ private box_or_further(recv: TExpr, stood: (string) -> Option[TExpr]) -> Option[
 end box_or_further
 
 private sync_box(t: Type) -> Option[Type] = repr(t) match
-    Ref(_, sync) -> if sync then Some(t) else None
+    Ref(_, sync, _) -> if sync then Some(t) else None
     _ -> None
 
 // Whether this type's elements are its own storage, which an array's and a vector's are and a
@@ -603,7 +610,7 @@ private key_step(base: Option[string], step: string) -> Option[string] = base ma
 // held; a view releases the buffer it owned, and nothing in the type says whether it owns one, so
 // every view counts. A `*T` owns nothing and is deliberately absent.
 private owning_step(t: Type) -> bool = t match
-    Ref(_, _) -> true
+    Ref(_, _, _) -> true
     Slice(_, _) -> true
     Str -> true
     _ -> false
@@ -907,7 +914,7 @@ private holders_have(holders: Buf[Type], t: Type) -> bool
 end holders_have
 
 private indirect_type(t: Type) -> bool = repr(t) match
-    Ref(_, _) -> true
+    Ref(_, _, _) -> true
     Ptr(_, _, _) -> true
     Slice(_, _) -> true
     Str -> true

@@ -419,7 +419,7 @@ private type_arg_read(cx: &Analyzer, e: Expr, at_address: bool) -> Type = *e.kin
         if op == "*" then resolve_type(cx.an, cx.scope, type_ref(e.span,
             PtrType(written_type_ref(cx, inner, at_address), false, false)), cx.subst)
         else if op == "&" then resolve_type(cx.an, cx.scope, type_ref(e.span,
-            RefType(written_type_ref(cx, inner, at_address), false)), cx.subst)
+            RefType(written_type_ref(cx, inner, at_address), false, "")), cx.subst)
         else not_a_type_arg(cx, e, at_address)
     Tuple(parts) ->
         var written: Buf[TypeRef] = buf()
@@ -461,7 +461,7 @@ written_type_ref(cx: &Analyzer, e: Expr, at_address: bool) -> TypeRef = *e.kind 
         type_ref(e.span, TupleType(written, false))
     Unary(op, inner) ->
         if op == "*" then type_ref(e.span, PtrType(written_type_ref(cx, inner, at_address), false, false))
-        else if op == "&" then type_ref(e.span, RefType(written_type_ref(cx, inner, at_address), false))
+        else if op == "&" then type_ref(e.span, RefType(written_type_ref(cx, inner, at_address), false, ""))
         else
             not_a_type_arg(cx, e, at_address)
             named_type(e.span, "")
@@ -1016,7 +1016,7 @@ private shape_refuses(a: &Analysis, want: TypeRef, actual: Type) -> bool
             Slice(_, _) -> length.is_some()
             Str -> length.is_none()
             _ -> true
-        RefType(inner, _) -> *inner.kind match
+        RefType(inner, _, _) -> *inner.kind match
             FnType(_, _, _) -> t match
                 CFn(_, _, _) -> false
                 _ -> callable_of(a, t).is_none()
@@ -1390,7 +1390,7 @@ private box_wanted(cx: &Analyzer, span: Span, scope: Scope, tparams: Buf[string]
     var payload = Unknown
 
     box match
-        Ref(inner, _) -> payload = *inner
+        Ref(inner, _, _) -> payload = *inner
         _ -> return None
 
     if !type_eq(payload, expected) || is_trait(payload) then return None
@@ -1483,7 +1483,7 @@ end boxed_result
 // but a callable yielding another -- a `&sync Foo` where `&Foo` was asked, or a `&Bar` -- is told it
 // should yield the box rather than the payload, which is the disagreement the program has.
 private is_box(t: Type) -> bool = t match
-    Ref(_, _) -> true
+    Ref(_, _, _) -> true
     _ -> false
 
 // What the callables a call wrote say about its type parameters through the types their own
@@ -1679,7 +1679,7 @@ ref_mentions(t: TypeRef, names: Buf[string]) -> bool
     *t.kind match
         NamedType(n, args) -> holds_string(names, n) || any_ref_mentions(args, names)
         PtrType(inner, _, _) -> ref_mentions(inner, names)
-        RefType(inner, _) -> ref_mentions(inner, names)
+        RefType(inner, _, _) -> ref_mentions(inner, names)
         WeakType(inner) -> ref_mentions(inner, names)
         VolatileType(inner) -> ref_mentions(inner, names)
         // A **length** names a value parameter the way an element names a type one, so a walk that
@@ -2056,7 +2056,7 @@ private call_shape(cx: &Analyzer, scope: Scope, ptype: TypeRef, tparams: Buf[str
             if key.is_none() then return None
 
             Some((key.unwrap(), params, Some(ret)))
-        RefType(inner, _) -> call_shape(cx, scope, inner, tparams, bounds)
+        RefType(inner, _, _) -> call_shape(cx, scope, inner, tparams, bounds)
         PtrType(inner, _, _) -> call_shape(cx, scope, inner, tparams, bounds)
         _ -> None
 end call_shape
