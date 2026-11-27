@@ -173,6 +173,9 @@ note_oom_scope(e: *Emit, p: TProgram)
         if f.exported.is_some() && names.has(oom_value_name(f.name))
             root.call(f.name)
             e.oom_scope.add(OomExportMark + f.name)
+
+            if f.variadic then e.oom_scope.add(OomEntryMark + symbol_of(e, f.name))
+
             any = true
         end if
 
@@ -438,6 +441,100 @@ oom_leave_export(e: *Emit, was: Val, refused_l: string, fine_l: string)
     emit(e, InIntCmp(set, INe, l_i32(), bit, VInt(from_int(0))))
     emit_term(e, InCondBr(set, refused_l, fine_l))
 end oom_leave_export
+
+// -- a variadic export, which has no thunk ---------------------------------------------------------------
+
+// **An opted variadic export is its own boundary.** No function can hand a C tail on, so its
+// definition is the symbol C calls (`codegen.sysl`'s `record_symbols`) and there is no thunk to count
+// it in. The definition does both halves itself: it counts itself in before its first statement, and
+// each of its returns is the thunk's -- where the bit is set the count goes back and the answer is the
+// `@out_of_memory` value's, called with the declared parameters.
+//
+// **A sysl call by name is still outside the boundary**, as it is for every other export, and it
+// reaches the same definition. So the caller says it is one: it sets `OomDirect` in the word on the
+// call, and the definition, finding it, takes it out again and counts nothing -- a refusal then passes
+// through its returns to whoever is counting, or traps where nobody is. A call through the export's
+// address says nothing, and is a boundary like C's.
+private const OomEntryMark: string = "\u{1}oom-entry "
+private const OomDirect: int = 1073741824
+private const OomWas: string = "oom.was"
+private const OomCounted: string = "oom.counted"
+
+// Whether `f`'s definition is such a boundary.
+oom_entry_here(e: *Emit, f: TFunc) -> bool = f.variadic && !f.marks.is_async() && oom_opted(e, f.name)
+
+// The way in, before anything of the body: `oom.was` is the word without the caller's mark, which is
+// what every return puts back, and `oom.counted` is 1 where this call counted itself in.
+oom_enter_entry(e: *Emit)
+    val at = oom_state_addr(e)
+    val s = oom_load(e, at)
+    val direct = oom_bin(e, OpAnd, oom_bin(e, OpLShr, s, 30), 1)
+
+    emit(e, InBin(VReg(OomWas), OpAnd, l_i32(), s, VInt(from_int(-1 - OomDirect))))
+    emit(e, InBin(VReg(OomCounted), OpXor, l_i32(), direct, VInt(from_int(1))))
+
+    val two = oom_bin(e, OpShl, VReg(OomCounted), 1)
+    val inside = fresh_reg(e)
+
+    emit(e, InBin(inside, OpAdd, l_i32(), VReg(OomWas), two))
+    oom_store(e, at, inside)
+    e.oom_entry = true
+end oom_enter_entry
+
+// A return of such a definition, laid in place of the bare `ret`: true where it was.
+oom_entry_return(e: *Emit, i: Inst) -> bool
+    if !e.oom_entry || e.body_func.is_none() then return false
+
+    i match
+        InRet(_, _) -> ()
+        _ -> return false
+
+    val f = e.body_func.unwrap()
+    val bound_l = fresh_label(e, "oom.bound")
+    val answer_l = fresh_label(e, "oom.answer")
+    val fine_l = fresh_label(e, "oom.fine")
+    val counted = fresh_reg(e)
+    val here = e.oom_here
+
+    e.oom_entry = false
+    emit(e, InIntCmp(counted, INe, l_i32(), VReg(OomCounted), VInt(from_int(0))))
+    emit_term(e, InCondBr(counted, bound_l, fine_l))
+    emit_label(e, bound_l)
+    oom_leave_export(e, VReg(OomWas), answer_l, fine_l)
+    emit_label(e, answer_l)
+
+    // A variadic export's declared parameters are scalars, each in its own register.
+    var args: Buf[IrArg] = buf()
+
+    for p in f.params
+        if !zero_sized(p.1) then args.push(ir_arg(sysl_param_lty(e, p.1), VReg(s"${p.0}.param")))
+
+    val v = fresh_reg(e)
+
+    e.oom_here = false
+    emit(e, form_call(sysl_result_form(e, f.ret_ty), Some(v), VGlobal(symbol_of(e, oom_value_name(f.name))),
+                      args))
+    e.oom_here = here
+    emit_term(e, InRet(Some(lty(e, f.ret_ty)), Some(v)))
+    emit_label(e, fine_l)
+    emit_term(e, i)
+    e.oom_entry = true
+    true
+end oom_entry_return
+
+// A sysl call by name to such a definition says so on the way in.
+oom_call_direct(e: *Emit, callee: Val)
+    if e.terminated || e.oom_scope.is_empty() then return
+
+    callee match
+        VGlobal(sym) ->
+            if e.oom_scope.has(OomEntryMark + sym)
+                val at = oom_state_addr(e)
+
+                oom_store(e, at, oom_bin(e, OpOr, oom_load(e, at), OomDirect))
+            end if
+        _ -> ()
+end oom_call_direct
 
 // -- the runtime's own allocations -----------------------------------------------------------------------
 

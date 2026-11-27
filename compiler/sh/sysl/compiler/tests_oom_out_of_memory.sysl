@@ -95,7 +95,12 @@ private val oom_heap_c: string = raw"""
 
 // A project naming `theap`'s pair, with `main` as its program, built once and run once for each of
 // `cells`: each run's status as the shell hears it, and its standard output, by cell.
-private oom_runs(main: string, cells: []const string) -> Buf[(string, int, string)]
+private oom_runs(main: string, cells: []const string) -> Buf[(string, int, string)] =
+    oom_runs_of(main, oom_heap_c, cells, false)
+
+// The same, with the C beside the heap given and the build's mode chosen.
+private oom_runs_of(main: string, c: string, cells: []const string,
+                    release: bool) -> Buf[(string, int, string)]
     val root = make_temp_dir("sysl-oom").unwrap()
     val exe = s"$root/out"
     var out: Buf[(string, int, string)] = buf()
@@ -105,9 +110,10 @@ private oom_runs(main: string, cells: []const string) -> Buf[(string, int, strin
     write_text(s"$root/main.sysl", main).unwrap()
     make_dir_all(s"$root/theap").unwrap()
     write_text(s"$root/theap/theap.sysl", oom_heap).unwrap()
-    write_text(s"$root/theap/callback.c", oom_heap_c).unwrap()
+    write_text(s"$root/theap/callback.c", c).unwrap()
 
-    val (code, said, err) = clx_ran(["sysl", "build", root, "-o", exe])
+    val (code, said, err) = if release then clx_ran(["sysl", "build", root, "-o", exe, "--release"])
+                            else clx_ran(["sysl", "build", root, "-o", exe])
 
     use_allocator(("malloc", "free"))
 
@@ -119,7 +125,7 @@ private oom_runs(main: string, cells: []const string) -> Buf[(string, int, strin
 
     remove_dir_all(root).unwrap_or(())
     out
-end oom_runs
+end oom_runs_of
 
 // One cell's run held to its status and its whole output.
 private oom_expect(runs: Buf[(string, int, string)], cell: string, code: int, text: string)
@@ -519,6 +525,271 @@ oom_trapping_cells()
     // An opted export C calls from inside answers its own value; one that did not opt in traps.
     oom_expect(runs, "nested", 133, "before\ninner answered -5\n8\ninner answered -5\n")
 end oom_trapping_cells
+
+// -- a variadic export ----------------------------------------------------------------------------------------
+
+// **A variadic export has no thunk, so its definition is the boundary** (`oom_boundary.sysl`). Found by
+// cstd: `@out_of_memory` on its `snprintf` compiled and did nothing, so a refused allocation trapped.
+// The cells: the tail unread, and three of it read; a value over the parameter; a pointer result; a
+// `defer`, a `defer va_end`, an `errdefer` and a destructor on the way out; one that never allocates;
+// one called from sysl by name outside every boundary (a trap) and inside another export's (which
+// answers its own value); each in a debug and a release build. C calls them, since only C reaches a
+// variadic export through its symbol.
+private val oom_variadic_c: string = raw"""
+    int v_none(int n, ...);
+    int v_sum(int n, ...);
+    void *v_ptr(int n, ...);
+    int v_order(int n, ...);
+    int v_quiet(int n, ...);
+    int outer(int n);
+
+    int c_none(int n) { return v_none(n); }
+    int c_sum(int n) { return v_sum(n, 10, 20, 30); }
+    int c_ptr_null(int n) { return v_ptr(n, 4) == (void *)0; }
+    int c_order(int n) { return v_order(n, 2); }
+    int c_quiet(int n) { return v_quiet(n, 7); }
+    int c_outer(int n) { return outer(n); }
+    """
+
+private val oom_variadic: string = raw"""
+    import sysl.buf.{Buf, buf}
+    import sysl.c.{va_arg, va_end, va_start}
+    import theap.{fail_from_now, heal, live}
+
+    make(n: int) -> int
+        var b: Buf[int] = buf()
+
+        for i in 0..<n do b.push(i)
+
+        int(b.len())
+
+    @export("v_none")
+    @out_of_memory(-1)
+    v_none(n: i32, ...) -> i32 = i32(make(int(n)))
+
+    @export("v_sum")
+    @out_of_memory(-2 - n)
+    v_sum(n: i32, ...) -> i32
+        var ap: va_list
+
+        va_start(ap)
+        defer va_end(ap)
+
+        var total: i32 = 0
+
+        for i in 0..<3 do total += va_arg(ap)
+
+        total + i32(make(int(n)))
+    end v_sum
+
+    var anchor: u8 = 0
+
+    @export("v_ptr")
+    @out_of_memory(null)
+    v_ptr(n: i32, ...) -> *u8
+        var ap: va_list
+
+        va_start(ap)
+        defer va_end(ap)
+
+        val k: i32 = va_arg(ap)
+
+        if make(int(n) + int(k)) == 0 then return null
+
+        &anchor
+    end v_ptr
+
+    struct Res
+        name: string
+
+    impl Drop for Res
+        drop(self)
+            print("drop", self.name)
+
+    step(n: int) -> Result[int, string]
+        errdefer print("errdefer")
+
+        val r: &Res = Res("step")
+
+        defer print("defer")
+        fail_from_now()
+
+        Ok(make(n) + int(r.name.len))
+    end step
+
+    @export("v_order")
+    @out_of_memory(-7)
+    v_order(n: i32, ...) -> i32
+        var ap: va_list
+
+        va_start(ap)
+        defer va_end(ap)
+        defer print("outer defer")
+
+        val k: i32 = va_arg(ap)
+        val made = step(int(n)) match
+            Ok(m) -> m
+            Err(_) -> 0
+
+        print("never here", made)
+        k + i32(made)
+    end v_order
+
+    @export("v_quiet")
+    @out_of_memory(-3)
+    v_quiet(n: i32, ...) -> i32
+        var ap: va_list
+
+        va_start(ap)
+        defer va_end(ap)
+
+        val k: i32 = va_arg(ap)
+
+        n + k
+    end v_quiet
+
+    @export("outer")
+    @out_of_memory(-9)
+    outer(n: i32) -> i32 = v_order(n, n + 1) + 100
+
+    extern "c_none" c_none(n: i32) -> i32
+    extern "c_sum" c_sum(n: i32) -> i32
+    extern "c_ptr_null" c_ptr_null(n: i32) -> i32
+    extern "c_order" c_order(n: i32) -> i32
+    extern "c_quiet" c_quiet(n: i32) -> i32
+    extern "c_outer" c_outer(n: i32) -> i32
+
+    main(args: []string)
+        val cell = args[1]
+        val base = live
+
+        if cell == "none"
+            print(c_none(3))
+            fail_from_now()
+
+            val r = c_none(3)
+
+            heal()
+            print(r, live - base)
+        end if
+
+        if cell == "sum"
+            print(c_sum(2))
+            fail_from_now()
+
+            val r = c_sum(2)
+
+            heal()
+            print(r, live - base, c_sum(2))
+        end if
+
+        if cell == "pointer"
+            print(c_ptr_null(1))
+            fail_from_now()
+
+            val r = c_ptr_null(1)
+
+            heal()
+            print(r, live - base)
+        end if
+
+        if cell == "order"
+            val r = c_order(1)
+
+            heal()
+            print("answered", r, live - base)
+        end if
+
+        if cell == "quiet"
+            print(c_quiet(3))
+            fail_from_now()
+
+            val r = c_quiet(3)
+
+            heal()
+            print(r)
+        end if
+
+        if cell == "inside"
+            val r = c_outer(1)
+
+            heal()
+            print("answered", r, live - base)
+        end if
+
+        if cell == "direct"
+            fail_from_now()
+
+            val r = c_sum(2)
+
+            heal()
+            print("answered", r)
+
+            val ten: i32 = 10
+
+            print(v_sum(2, ten, ten + ten, ten + ten + ten))
+            print("before")
+            fail_from_now()
+            print(v_sum(2, ten, ten + ten, ten + ten + ten))
+        end if
+    end main
+    """
+
+private oom_variadic_cells(release: bool)
+    if !oom_ready() then return
+
+    val runs = oom_runs_of(oom_variadic, oom_variadic_c,
+                           ["none", "sum", "pointer", "order", "quiet", "inside", "direct"], release)
+
+    // The tail unread: the value, and nothing left allocated.
+    oom_expect(runs, "none", 0, "3\n-1 0\n")
+
+    // Three of the tail read, a `defer va_end`, and a value over the parameter; the next call succeeds.
+    oom_expect(runs, "sum", 0, "62\n-4 0 62\n")
+
+    // A pointer result answers null.
+    oom_expect(runs, "pointer", 0, "0\n1 0\n")
+
+    // Each defer, the errdefer and the destructor run, in reverse.
+    oom_expect(runs, "order", 0, "defer\ndrop step\nerrdefer\nouter defer\nanswered -7 0\n")
+
+    // One that never allocates answers its own result, a refusing heap or not.
+    oom_expect(runs, "quiet", 0, "10\n10\n")
+
+    // Called by name inside another export's boundary it is no boundary: that export answers.
+    oom_expect(runs, "inside", 0, "defer\ndrop step\nerrdefer\nouter defer\nanswered -9 0\n")
+
+    // Called by name outside every boundary it traps, the count an answered call left being none.
+    oom_expect(runs, "direct", 133, "answered -4\n62\nbefore\n")
+end oom_variadic_cells
+
+@test("a variadic export answers its value: the tail unread and read, a pointer, the way out, by name inside and outside a boundary")
+oom_variadic_debug()
+    oom_variadic_cells(false)
+end oom_variadic_debug
+
+@test("a variadic export answers its value in a release build too")
+oom_variadic_release()
+    oom_variadic_cells(true)
+end oom_variadic_release
+
+@test("beside a variadic function that is not an export, it is refused")
+oom_refused_off_a_variadic_export()
+    if !oom_ready() then return
+
+    val said = oom_refused("@out_of_memory(-1)\nf(n: i32, ...) -> i32 = n\n\nprint(f(1, 2))\n")
+
+    assert(said.contains("'@out_of_memory' says what an export answers its C caller"), said)
+end oom_refused_off_a_variadic_export
+
+@test("beside a variadic export with no result, it is refused")
+oom_refused_variadic_without_a_result()
+    if !oom_ready() then return
+
+    val said = oom_refused("@export(\"f\")\n@out_of_memory(-1)\nf(n: i32, ...)\n    print(n)\n\nf(1, 2)\n")
+
+    assert(said.contains("writes no result to put it in"), said)
+end oom_refused_variadic_without_a_result
 
 // -- a C caller ---------------------------------------------------------------------------------------------
 
