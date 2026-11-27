@@ -1,0 +1,56 @@
+// A node that is a leaf or an internal node, the internal one holding children of the same enum in
+// slot storage -- recursion through a generic enum, a reference and a view. Plus a `@no_alloc` lookup
+// walking it, and the drop of a deep tree.
+
+enum Node[K: Ord, V]
+    Leaf(l: &LeafN[K, V])
+    Inner(n: &InnerN[K, V])
+
+struct LeafN[K: Ord, V]
+    len: usize
+    keys: []K
+    vals: []V
+
+struct InnerN[K: Ord, V]
+    len: usize
+    keys: []K
+    kids: []Node[K, V]
+
+@no_alloc
+find[K: Ord, V](root: Node[K, V], k: K) -> Option[V]
+    var at = root
+
+    loop
+        at match
+            Node.Leaf(l) ->
+                for i in 0..<l.len
+                    if !(l.keys[i] < k) && !(k < l.keys[i]) then return Some(l.vals[i])
+
+                return None
+            Node.Inner(n) ->
+                var i: usize = 0
+
+                while i < n.len && !(k < n.keys[i])
+                    i += 1
+
+                at = n.kids[i]
+end find
+
+leaf(k: int, v: string) -> Node[int, string]
+    var ks: []int = slot_storage(4)
+    var vs: []string = slot_storage(4)
+
+    slot_place(ks, 0, k)
+    slot_place(vs, 0, v)
+    Node.Leaf(LeafN(1, ks, vs))
+
+var ks: []int = slot_storage(4)
+var kids: []Node[int, string] = slot_storage(5)
+
+slot_place(ks, 0, 10)
+slot_place(kids, 0, leaf(5, "five"))
+slot_place(kids, 1, leaf(15, "fifteen"))
+
+val root = Node.Inner(InnerN(1, ks, kids))
+
+print(find(root, 15).unwrap_or("-"), find(root, 5).unwrap_or("-"), find(root, 7).unwrap_or("-"))
