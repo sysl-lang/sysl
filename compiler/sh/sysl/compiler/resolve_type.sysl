@@ -595,7 +595,23 @@ private resolve_array(a: &Analysis, scope: Scope, span: Span, length: Option[Exp
     // The rule the declaration asks of a written length, asked again of the substitution -- which is
     // what reaches a length written inside a BODY, where the declaration-time walk never looks: a
     // name bound to a value may be the length but not be computed with.
-    length_arithmetic(a, scope, span, written, const_arg_names(subst), "length")
+    //
+    // **A type's own field is not asked** (`kids: [B + 1]Child`): nothing is solved from a field, so
+    // its length is the computation over the symbols, compared by its form as a struct's value
+    // argument written there is (`extent_term`), and each instantiation folds its own. A length
+    // written in a shape no form reads (a `match`) has nothing to be compared by, and is still asked.
+    val in_field = !a.resolving.is_empty() && length_has_form(written)
+
+    if !in_field then length_arithmetic(a, scope, span, written, const_arg_names(subst), "length")
+
+    // **A field's length the stand-in zero cannot fold to a count still has its form**: `[N - 1]T`
+    // is one below zero there and `[N / M]T` divides by `M`'s zero, neither a number anybody gave.
+    // The array stands at no elements for that walk, under the form it was written in.
+    if in_field && names_stand_in(written, subst) && !folds_to_count(a, scope, written, subst)
+        val term = extent_term(a, scope, written, subst)
+
+        if !term.is_empty() then return Array(0, e, term)
+    end if
 
     // A length over a type parameter has no value during the walk that checks the generic body
     // itself, there being no `T` yet — and that is not a mistake to report, since the body is
@@ -676,6 +692,52 @@ private length_is_type_param(a: &Analysis, scope: Scope, span: Span, len: Expr,
     a.const_refusals += 1
     true
 end length_is_type_param
+
+// Whether a written length is built only of what a value argument's form reads (`value_terms.sysl`'s
+// `term_of`): names and literals under operators, comparisons, calls and a two-armed `if`.
+private length_has_form(e: Expr) -> bool = *e.kind match
+    Unary(_, operand) -> length_has_form(operand)
+    Binary(_, l, r) -> length_has_form(l) && length_has_form(r)
+    Compare(operands, _) -> all_have_form(operands)
+    Call(_, args) -> all_have_form(args)
+    NamedArg(_, value) -> length_has_form(value)
+    IfExpr(cond, then_body, else_body, _) ->
+        else_body.is_some() && length_has_form(cond) && branch_has_form(then_body) &&
+            branch_has_form(else_body.unwrap())
+    ClausesExpr(_, _) -> false
+    MatchExpr(_, _) -> false
+    _ -> true
+
+private all_have_form(es: Buf[Expr]) -> bool
+    for e in es
+        if !length_has_form(e) then return false
+
+    true
+
+private branch_has_form(body: Buf[Stmt]) -> bool
+    for s in body
+        *s.kind match
+            ExprStmt(inner) -> if !length_has_form(inner) then return false
+            _ -> return false
+
+    true
+end branch_has_form
+
+// Whether a written length folds to a number an array can have, asked without leaving a complaint.
+private folds_to_count(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> bool
+    val inner = analyzer_for(a, scope)
+
+    inner.subst = subst
+
+    val refusals = a.const_refusals
+    val mark = a.complaints()
+    val folded = const_int(inner, e)
+
+    a.restore_complaints(mark)
+    a.const_refusals = refusals
+
+    folded.is_some() && folded.unwrap() >= from_int(0) && !too_many_elements(folded.unwrap())
+end folds_to_count
 
 // The length a written one folds to, where that is below zero.
 private negative_extent(a: &Analysis, scope: Scope, e: Expr, subst: Buf[Binding]) -> Option[BigInt]

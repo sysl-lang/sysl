@@ -2125,6 +2125,44 @@ print(1)
 the type argument 'N * N * N * N * N * N * N * N * N' is too large to compare (of degree over 8)
 ```
 
+**A field's array length is such a computation too.** Nothing is solved from a field, so a type may
+size one from its value parameters, `[B + 1]T`, and the length is compared by the same polynomial:
+`[B + 1]T` and `[1 + B]T` are one type, as is the `a` of an `Arr[T, B + 1]` whose field is `a: [N]T`.
+Each instantiation folds its own, and one whose length comes out below zero is refused. A local's
+declared type inside a body is still held to the length that is the parameter alone.
+
+```sysl
+struct Node[K, const B: usize]
+    keys: [B]K
+    kids: [B + 1]usize
+
+impl[K, const B: usize] Node[K, B]
+    room(self) -> usize = self.keys.len + self.kids.len
+
+var small: Node[int, 2]
+var wide: Node[string, 16]
+
+print(small.kids.len, wide.kids.len, wide.room())
+```
+
+```output
+3 17 33
+```
+
+```sysl
+struct Node[const B: usize]
+    kids: [B + 1]int
+
+impl[const B: usize] Node[B]
+    short() -> Node[B] = Node([0; B])
+
+print(1)
+```
+
+```error
+'kids' of 'Node[B]' is [B + 1]int, but [B]int was given — the two differ by 1 for every B
+```
+
 So a body that yields what its signature does not name is wrong for every instantiation, and it is
 refused at the declaration, whether or not anything calls it:
 
@@ -2962,7 +3000,7 @@ takes the place of expansion, in the one direction the catalog needs.
 
 | absent | why, and what to write instead |
 |---|---|
-| type-level arithmetic in a signature (`-> [N + 1]T`, `Buf[N + 1]`) | a value parameter may be named in a signature but not computed with there, since a call is solved from it; a body and a field may compute a struct's value argument, compared by its polynomial |
+| type-level arithmetic in a signature (`-> [N + 1]T`, `Buf[N + 1]`) | a value parameter may be named in a signature but not computed with there, since a call is solved from it; a body and a field may compute a struct's value argument, and a field an array's length, compared by its polynomial |
 | pack expansion (`f(..a)`, `(..A, int)`) | a pack may be matched and walked, not spread into an argument list or appended to; use `for const` instead |
 | higher-kinded parameters (`F[_]`) | **excluded** by design: they push inference toward undecidability, and traits and bounds already serve abstraction over containers |
 
