@@ -985,6 +985,14 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
             _ -> ()
     end if
 
+    // **`is_unique` is every counted reference's too**, a trait object's and a generic `&T`'s
+    // included, unless the referent's own type has a member of the name.
+    if name == "is_unique" && !owns_member(cx, rty, name)
+        held match
+            Ref(_, _) -> return is_unique_call(cx, span, receiver, args)
+            _ -> ()
+    end if
+
     // **`nonnull` is every raw pointer's** -- `p.nonnull()` answers `Some` of the same address as a
     // pointer that is never null, or `None` for null -- unless the pointee's own type has a member of
     // the name, which a call through the pointer reaches as it always has.
@@ -3153,6 +3161,16 @@ private into_raw_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr
             cx.err(span, s"type '${type_show(ty)}' has no method 'into_raw' — 'into_raw' gives up a " +
                    s"counted reference, so hold the value as a '&${type_show(other)}'")
 end into_raw_call
+
+// `r.is_unique()` -- whether the counted reference a place holds is the only one to its object, a
+// `bool`. Which places may be asked is `unique_place.sysl`'s question, over the finished body: here
+// the form is only held to taking nothing, the receiver being a counted reference already.
+private is_unique_call(cx: &Analyzer, span: Span, receiver: TExpr, args: Buf[Expr]) -> TExpr
+    if !args.is_empty() then
+        return cx.err(span, "'is_unique' takes no arguments — it asks about the reference it is called on")
+
+    TExpr(span, TIsUnique(receiver))
+end is_unique_call
 
 // What a refusal of a data-pointer name (`ptr`, `data`, `as_ptr`) on a slice or an array adds: the
 // capability is the library's `as_ptr` / `as_mut_ptr`, not a member. Nothing for any other type or name.

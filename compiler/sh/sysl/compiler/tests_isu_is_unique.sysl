@@ -1,0 +1,976 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Var}
+import sysl.testing.skip
+import sysl.text.split
+
+// `r.is_unique()` (`unique_place.sysl`, `emit_box.sysl`'s `gen_is_unique`, `reference/memory.md § Asking
+// whether a reference is the only one`): whether the counted reference a place holds is the only one
+// to its object.
+//
+// Every accepted cell is built at `-O0` and at `-O2`, run on the counted heap, and held to the same
+// output at both and to giving back all it took. The axes:
+//
+// - the count: plain (`&T`, compact and full header), atomic (`&sync T`), a trait object, a
+//   `&Frozen[T]` and a `&sync Frozen[T]`;
+// - the holders: one, two, one of two dropped; a weak reference beside the one; a view's owner share;
+// - the place asked: a `val` and a `var` local, a field through `*self`, the place a `*&T` parameter
+//   points at, a `Buf`'s element and an array's, a module `var` and a module `val` (a box laid in the
+//   object file), a closure's capture (lent and kept), a pattern's binding, a `for`'s element, a
+//   `var` read out of storage that would otherwise take no count, a `var` a lent parameter is copied
+//   into;
+// - a second local beside the place asked about, read out of a struct local's field, a nested
+//   struct's, an array's element and a field through a reference;
+// - the type referred to: a plain struct and a `@unique` one;
+// - the target: the host, and a freestanding Thumb archive (plain and atomic counts);
+// - where the box lies: the heap and the frame (compact and full header), told apart by the bytes
+//   the run allocates;
+// - generic twins: a generic function and a generic struct's member, each at two types;
+// - a tree three levels deep, descended through a `*&T` parameter and through a `*self` member;
+// - copy on write: `push(self)` copies every time, `push_mut(*self)` writes in place unless shared,
+//   counted in bytes allocated;
+// - the refusals, each with its diagnostic: a `(self)` member's `self`, a by-value struct parameter,
+//   a `&T` parameter, a field through a `&T` parameter, a closure's parameter, a call's answer, an
+//   argument given, a value that is no reference; and a type's own `is_unique` reached first.
+//
+// Skipped cells, and why: early exits and `defer` (the form holds nothing to give back on any path);
+// codegen units and a library build (the lowering is per body, and a precompiled callee is code
+// nobody can see, across which every local keeps its count already).
+
+// -- the harness ----------------------------------------------------------------------------------
+
+private struct IsuRun
+    out: string
+    err: string
+    bytes: long
+end IsuRun
+
+// The program built at optimization `level` on the counted heap, and run.
+private isu_run(text: string, level: string) -> IsuRun
+    val root = make_temp_dir("sysl-isu").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", forms_imported(text)).unwrap()
+
+    val exe = s"$root/built"
+
+    force_alloc_counting(true)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, level, Some(exe))
+
+    force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return IsuRun(failure_text(why), "", -1)
+        Ok(_) -> ()
+
+    val ran = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    ran match
+        Err(_) -> IsuRun("could not be started", "", -1)
+        Ok(o) -> IsuRun(o.text, o.err.unwrap_or(""), alloc_bytes_reported(o.err.unwrap_or("")))
+end isu_run
+
+// The program prints `want` at `-O0` and at `-O2`, and gives back everything it took at both.
+private isu_check(text: string, want: string)
+    for level in ["0", "2"]
+        val got = isu_run(text, level)
+
+        assert_eq(got.out, want)
+        assert_eq(alloc_count_reported(got.err), 0)
+end isu_check
+
+// The bytes the program allocates in all, the same at `-O0` and at `-O2`.
+private isu_bytes(text: string) -> long
+    val low = isu_run(text, "0")
+    val high = isu_run(text, "2")
+
+    assert_eq(alloc_count_reported(low.err), 0)
+    assert_eq(alloc_count_reported(high.err), 0)
+    assert_eq(low.out, high.out)
+    assert_eq(low.bytes, high.bytes)
+    low.bytes
+end isu_bytes
+
+// What the compiler says of a program it refuses.
+private isu_refusal(text: string) -> string
+    val got = isu_run(text, "0")
+
+    assert_eq(got.bytes, -1)
+    got.out
+end isu_refusal
+
+private isu_refused(text: string, part: string)
+    val said = isu_refusal(text)
+
+    assert(said.contains(part), s"expected a refusal holding:\n$part\ngot:\n$said")
+end isu_refused
+
+// -- locals: one holder, two, one dropped ------------------------------------------------------------
+
+private const isu_locals: string = raw"""
+    struct Node
+        n: int
+
+    var held: Option[&Node] = None
+
+    main()
+        val a: &Node = Node(1)
+
+        print(a.is_unique())
+
+        var b = a
+
+        print(a.is_unique(), b.is_unique())
+        b = Node(2)
+        print(a.is_unique(), b.is_unique())
+        held = Some(a)
+        print(a.is_unique())
+        held = None
+        print(a.is_unique(), b.n)
+    """
+
+private const isu_locals_sync: string = raw"""
+    struct Cell
+        n: int
+
+    var held: Option[&sync Cell] = None
+
+    main()
+        val a: &sync Cell = Cell(1)
+
+        print(a.is_unique())
+
+        var b = a
+
+        print(a.is_unique(), b.is_unique())
+        b = Cell(2)
+        print(a.is_unique(), b.is_unique())
+        held = Some(a)
+        print(a.is_unique())
+        held = None
+        print(a.is_unique(), b.n)
+    """
+
+@test("is_unique of a local: true for one holder, false for two, true again once one is dropped")
+isu_a_local_counts_its_holders()
+    if !enm_ready() then return
+
+    val want = "true\nfalse false\ntrue true\nfalse\ntrue 2\n"
+
+    isu_check(isu_locals, want)
+    isu_check(isu_locals_sync, want)
+end isu_a_local_counts_its_holders
+
+// -- fields through `*self` ---------------------------------------------------------------------------
+
+private const isu_fields: string = raw"""
+    struct Node
+        n: int
+
+    struct Cell
+        n: int
+
+    struct Holder
+        root: &Node
+        cell: &sync Cell
+
+        alone(*self) -> bool = self.root.is_unique()
+        cell_alone(*self) -> bool = self.cell.is_unique()
+
+    struct Outer
+        inner: Holder
+
+        deep(*self) -> bool = self.inner.root.is_unique()
+
+    var kept: Option[&Node] = None
+    var kept_cell: Option[&sync Cell] = None
+
+    main()
+        var h = Holder(Node(1), Cell(2))
+
+        print(h.alone(), h.cell_alone(), h.root.is_unique(), h.cell.is_unique())
+        kept = Some(h.root)
+        kept_cell = Some(h.cell)
+        print(h.alone(), h.cell_alone(), h.root.is_unique(), h.cell.is_unique())
+        kept = None
+        kept_cell = None
+        print(h.alone(), h.cell_alone())
+
+        var o = Outer(Holder(Node(3), Cell(4)))
+
+        print(o.deep())
+
+        val second = o.inner
+
+        print(o.deep(), second.root.n)
+    """
+
+@test("is_unique of a field through '*self', plain and atomic, at one and two levels of struct")
+isu_a_field_through_a_pointer_receiver()
+    if !enm_ready() then return
+
+    isu_check(isu_fields, "true true true true\nfalse false false false\ntrue true\ntrue\nfalse 3\n")
+end isu_a_field_through_a_pointer_receiver
+
+// -- elements, and module storage ---------------------------------------------------------------------
+
+private const isu_elements: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        n: int
+
+    var top: &Node = Node(3)
+    val fixed: &Node = Node(4)
+
+    main()
+        var b: Buf[&Node] = buf()
+
+        b.push(Node(1))
+        b.push(Node(2))
+        print(b[0].is_unique(), b[1].is_unique())
+
+        val second = b[1]
+
+        print(b[0].is_unique(), b[1].is_unique(), second.n)
+
+        var pair: [2]&Node = [Node(5), Node(6)]
+
+        print(pair[0].is_unique(), pair[1].is_unique())
+
+        // A `ref` and a view name the places; neither holds the object.
+        if pair[0].n == 5
+            ref r = pair[1]
+            val xs: []&Node = pair[0..<2]
+
+            print(r.is_unique(), xs[0].is_unique(), xs[1].is_unique())
+
+        pair[0] = pair[1]
+        print(pair[0].is_unique(), pair[1].is_unique())
+
+        print(top.is_unique(), fixed.is_unique())
+
+        val t = top
+        val f = fixed
+
+        print(top.is_unique(), fixed.is_unique(), t.n + f.n)
+    """
+
+@test("is_unique of a buffer's element, an array's, a module 'var' and a module 'val' laid in the object file")
+isu_elements_and_module_storage()
+    if !enm_ready() then return
+
+    isu_check(isu_elements, "true true\ntrue false 2\ntrue true\ntrue true true\nfalse false\ntrue true\nfalse false 7\n")
+end isu_elements_and_module_storage
+
+// -- a trait object, a frozen buffer, a weak reference, a view ---------------------------------------
+
+private const isu_kinds: string = raw"""
+    import sysl.buf.{Buf, buf, Frozen}
+
+    trait Shape
+        area(self) -> int
+
+    struct Sq
+        side: int
+
+    impl Shape for Sq
+        area(self) -> int = self.side * self.side
+
+    struct Par
+        name: int
+        up: weak Par
+
+    struct Row
+        cells: [4]int
+
+    main()
+        var s: &Shape = Sq(3)
+
+        print(s.is_unique())
+
+        var s2 = s
+
+        print(s.is_unique(), s2.area())
+        s2 = Sq(1)
+        print(s.is_unique())
+
+        var b: Buf[int] = buf()
+
+        b.push(4)
+
+        var f: &Frozen[int] = b.freeze()
+
+        print(f.is_unique())
+
+        var f2 = f
+
+        print(f.is_unique(), f2.len())
+
+        var c: Buf[int] = buf()
+
+        c.push(5)
+
+        var g: &sync Frozen[int] = c.freeze()
+
+        print(g.is_unique())
+
+        var g2 = g
+
+        print(g.is_unique(), g2.len())
+
+        var p: &Par = Par(1, None)
+
+        print(p.is_unique())
+
+        var child: &Par = Par(2, p)
+
+        print(p.is_unique(), child.is_unique())
+        child = Par(3, None)
+        print(p.is_unique())
+
+        var row: &Row = Row([1, 2, 3, 4])
+
+        print(row.is_unique())
+
+        val cut: []int = row.cells[1..<3]
+
+        print(row.is_unique(), cut.len)
+    """
+
+@test("is_unique of a trait object and a frozen buffer; a weak reference or a view's owner share makes it false")
+isu_every_kind_of_count()
+    if !enm_ready() then return
+
+    isu_check(isu_kinds,
+              "true\nfalse 9\ntrue\ntrue\nfalse 1\ntrue\nfalse 1\ntrue\nfalse true\ntrue\ntrue\nfalse 2\n")
+end isu_every_kind_of_count
+
+// -- the locals the count elisions would leave uncounted ---------------------------------------------
+
+private const isu_elided: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Node
+        n: int
+
+    struct Link
+        v: int
+        next: Option[&Link]
+
+    struct Vec
+        root: &Node
+
+        // A `var` read out of a lent receiver is a second holder beside the field.
+        walked(self) -> bool
+            var r = self.root
+
+            r.is_unique()
+
+        // The same out of a place: the field and the local both hold it.
+        walked_place(*self) -> bool
+            val r = self.root
+
+            r.is_unique()
+
+        // The local is gone again where the field is asked.
+        after(*self) -> bool
+            val n = self.root.n
+
+            self.root.is_unique() && n == 0
+
+    // A lent parameter copied into a `var`: the caller's reference and the copy.
+    copied(p: &Node) -> bool
+        var mine = p
+
+        mine.is_unique()
+
+    bound(head: *Option[&Link]) -> bool = *head match
+        Some(n) -> n.is_unique()
+        None -> false
+
+    main()
+        var v = Vec(Node(0))
+
+        print(v.walked(), v.walked_place())
+        print(v.after())
+
+        val a: &Node = Node(1)
+
+        print(copied(a), copied(Node(2)), a.n)
+
+        var head: Option[&Link] = Some(Link(1, None))
+
+        print(bound(&head))
+
+        var b: Buf[&Node] = buf()
+
+        b.push(Node(3))
+
+        for k in b
+            print(k.is_unique(), b[0].is_unique())
+
+        // A second name that is never read again still holds its count while it is in scope.
+        val c: &Node = Node(4)
+        val d = c
+
+        print(c.is_unique())
+        print(d.n)
+    """
+
+@test("a local asked whether it is the only reference is counted: read out of storage, copied from a parameter, bound by a pattern or a 'for'")
+isu_a_local_asked_holds_a_count()
+    if !enm_ready() then return
+
+    isu_check(isu_elided, "false false\ntrue\nfalse false 1\nfalse\nfalse false\nfalse\n4\n")
+end isu_a_local_asked_holds_a_count
+
+// -- a second local read out of the place asked about ------------------------------------------------
+
+private const isu_beside: string = raw"""
+    struct Tok
+        n: int
+
+    struct Shelf
+        held: &Tok
+
+    struct Pair
+        a: Shelf
+        b: int
+
+    main()
+        var s = Shelf(Tok(2))
+
+        print(s.held.is_unique())
+
+        val c = s.held
+
+        print(s.held.is_unique(), c.n)
+
+        var p = Pair(Shelf(Tok(3)), 0)
+        val d = p.a.held
+
+        print(p.a.held.is_unique(), d.n)
+
+        var xs: [2]&Tok = [Tok(4), Tok(5)]
+        val x = xs[0]
+
+        print(xs[0].is_unique(), xs[1].is_unique(), x.n)
+
+        val t: &Shelf = Shelf(Tok(6))
+        val g = t.held
+
+        print(t.held.is_unique(), g.n)
+    """
+
+@test("a local read out of a struct local's field, a nested one's or an array's element is counted beside the place asked about")
+isu_a_local_beside_the_place_asked()
+    if !enm_ready() then return
+
+    isu_check(isu_beside, "true\nfalse 2\nfalse 3\nfalse true 4\nfalse 6\n")
+end isu_a_local_beside_the_place_asked
+
+// -- a reference to a `@unique` type -----------------------------------------------------------------
+
+private const isu_unique_type: string = raw"""
+    @unique
+    struct Tok
+        n: int
+
+    struct Shelf
+        held: &Tok
+
+    main()
+        val a: &Tok = Tok(1)
+
+        print(a.is_unique())
+
+        val b = a
+
+        print(a.is_unique(), b.n)
+
+        var s = Shelf(Tok(2))
+
+        print(s.held.is_unique())
+
+        val c = s.held
+
+        print(s.held.is_unique(), c.n)
+    """
+
+@test("is_unique of a reference to a '@unique' type counts the references, which are copied as any other")
+isu_a_reference_to_a_unique_type()
+    if !enm_ready() then return
+
+    isu_check(isu_unique_type, "true\nfalse 1\ntrue\nfalse 2\n")
+end isu_a_reference_to_a_unique_type
+
+// -- bare metal ----------------------------------------------------------------------------------------
+
+private val IsuNm: string = "/opt/homebrew/opt/llvm/bin/llvm-nm"
+
+private const isu_bare: string = raw"""
+    struct Node
+        n: int
+
+    var sink = 0
+    var kept: Option[&Node] = None
+    var shared: Option[&sync Node] = None
+
+    @export("ask")
+    ask(n: int) -> int
+        val a: &Node = Node(n)
+        var got = 0
+
+        if a.is_unique() then got += 1
+
+        kept = Some(a)
+
+        if a.is_unique() then got += 2
+
+        val s: &sync Node = Node(n)
+
+        if s.is_unique() then got += 4
+
+        shared = Some(s)
+
+        if s.is_unique() then got += 8
+
+        got
+    end ask
+
+    @export("main")
+    main()
+        sink = ask(3)
+    """
+
+@test("is_unique builds for a freestanding Thumb target, plain and atomic, and needs nothing but the allocator")
+isu_on_bare_metal()
+    if !is_file(IsuNm) then skip(s"there is no llvm-nm at $IsuNm to read the archive")
+
+    find_backend_clang(target_named("thumb-freestanding-softfp").unwrap()) match
+        Err(why) ->
+            skip(why)
+            return
+        Ok(_) -> ()
+
+    val root = make_temp_dir("sysl-isu-thumb").unwrap()
+
+    write_text(s"$root/main.sysl", isu_bare).unwrap()
+
+    val archive = s"$root/probe.a"
+    val built = build_c_archive(root, Some("thumb-freestanding-softfp"), None, DefaultOptimization, Some(archive),
+                                None, (m) -> ())
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            assert(false, failure_text(why))
+            return
+        Ok(_) -> ()
+
+    val listing = capture(IsuNm, ["-u", archive]).map((o) -> o.text).unwrap_or("llvm-nm could not be run")
+
+    remove_dir_all(root).unwrap_or(())
+
+    var seen = 0
+
+    for line in split(listing, "\n")
+        val t = line.trim()
+
+        if t == "" || t.ends_with(":") then continue
+
+        seen += 1
+        assert(t == "U malloc" || t == "U free" || t == "U memcpy" || t == "U memset", s"the archive leaves $t undefined")
+
+    assert(seen > 0, listing)
+end isu_on_bare_metal
+
+// -- a closure's capture ------------------------------------------------------------------------------
+
+private const isu_captures: string = raw"""
+    struct Node
+        n: int
+
+    var job: Option[&Fn() -> bool] = None
+
+    // The kept closure is called where it lies, so no local holds a second copy of it.
+    ask() -> bool
+        job match
+            Some(f) -> f()
+            None -> false
+
+    main()
+        var lent: &Node = Node(7)
+        val read: &Fn() -> bool = () -> lent.is_unique()
+
+        print(read())
+
+        val other = lent
+
+        print(read(), other.n)
+
+        var copied: &Node = Node(8)
+
+        job = Some(() -> copied.is_unique())
+
+        print(ask(), copied.n)
+
+        // A local holding the closure holds its capture with it, for as long as the local lives.
+        if copied.n == 8
+            val asked = job.unwrap()
+
+            job = None
+            print(asked(), copied.is_unique())
+
+        print(copied.is_unique())
+    """
+
+@test("is_unique of a closure's capture: a lent closure asks the local itself, a kept one holds a copy")
+isu_a_closure_capture()
+    if !enm_ready() then return
+
+    isu_check(isu_captures, "true\nfalse 7\nfalse 8\nfalse false\ntrue\n")
+end isu_a_closure_capture
+
+// -- a box laid in the frame answers as one on the heap ----------------------------------------------
+
+private const isu_frame_head: string = raw"""
+    struct Node
+        n: int
+
+    struct Par
+        name: int
+        up: weak Par
+
+    var held: Option[&Node] = None
+    var held_par: Option[&Par] = None
+
+    """
+
+private const isu_frame_body: string = raw"""
+    main()
+        val a: &Node = Node(1)
+
+        print(a.is_unique())
+
+        val b = a
+
+        print(a.is_unique(), b.n)
+
+        val p: &Par = Par(1, None)
+
+        print(p.is_unique())
+
+        val q = p
+
+        print(p.is_unique(), q.name)
+
+        // A weak reference to a `Par` is made, so its boxes carry the full header.
+        val parent: &Par = Par(0, None)
+        val kid: &Par = Par(2, parent)
+
+        print(parent.is_unique(), kid.is_unique())
+    """
+
+private const isu_heap_tail: string = raw"""
+        held = Some(a)
+        held_par = Some(p)
+        held = None
+        held_par = None
+    """
+
+@test("a box laid in the frame answers is_unique as one on the heap does, compact and full header, at -O0 and -O2")
+isu_a_frame_box_answers_the_same()
+    if !enm_ready() then return
+
+    val framed = isu_frame_head + isu_frame_body
+    val heaped = framed + isu_heap_tail
+    val want = "true\nfalse 1\ntrue\nfalse 1\nfalse true\n"
+
+    isu_check(framed, want)
+    isu_check(heaped, want)
+
+    // The two programs differ in where the boxes lie: the frame's allocate nothing.
+    assert(isu_bytes(framed) < isu_bytes(heaped), "the boxes nothing keeps were not laid in the frame")
+end isu_a_frame_box_answers_the_same
+
+// -- generic twins ------------------------------------------------------------------------------------
+
+private const isu_generic: string = raw"""
+    struct Node
+        n: int
+
+    struct Cell
+        n: int
+
+    only[T](slot: *&T) -> bool = (*slot).is_unique()
+
+    struct Kept[T]
+        r: &T
+
+        alone(*self) -> bool = self.r.is_unique()
+
+    main()
+        var a: &Node = Node(1)
+        var c: &Cell = Cell(2)
+
+        print(only(&a), only(&c))
+
+        val a2 = a
+
+        print(only(&a), only(&c), a2.n)
+
+        var k: Kept[Node] = Kept(Node(3))
+        var j: Kept[Cell] = Kept(c)
+
+        print(k.alone(), j.alone())
+    """
+
+@test("is_unique in a generic function and a generic struct's member, each at two types")
+isu_generic_twins()
+    if !enm_ready() then return
+
+    isu_check(isu_generic, "true true\nfalse true 1\ntrue false\n")
+end isu_generic_twins
+
+// -- a tree, three levels deep -----------------------------------------------------------------------
+
+private const isu_tree: string = raw"""
+    import sysl.buf.{Buf, buf}
+
+    struct Tree
+        v: int
+        kids: Buf[&Tree]
+
+    var copies: int = 0
+
+    // The path only this tree holds is written in place; a node something else holds is copied
+    // first, and every node below the copy is then asked afresh.
+    bump(slot: *&Tree)
+        if !(*slot).is_unique()
+            var kids: Buf[&Tree] = buf()
+
+            for k in (*slot).kids
+                kids.push(k)
+
+            *slot = Tree((*slot).v, kids)
+            copies += 1
+        end if
+
+        (*slot).v += 1
+
+        if (*slot).kids.len() > 0 then bump(&(*slot).kids[0])
+
+    struct Version
+        root: &Tree
+
+        step(*self) = bump(&self.root)
+
+    chain(n: int) -> &Tree
+        var kids: Buf[&Tree] = buf()
+
+        if n > 0 then kids.push(chain(n - 1))
+
+        Tree(0, kids)
+
+    sum(t: &Tree) -> int
+        var s = t.v
+
+        for k in t.kids
+            s += sum(k)
+
+        s
+
+    main()
+        var t = chain(2)
+
+        bump(&t)
+        print(sum(t), copies)
+
+        val old = t.kids[0]
+
+        bump(&t)
+        print(sum(t), sum(old), copies)
+        bump(&t)
+        print(sum(t), sum(old), copies)
+
+        var v = Version(chain(2))
+
+        v.step()
+        print(sum(v.root), copies)
+
+        val w = v
+
+        v.step()
+        print(sum(v.root), sum(w.root), copies)
+        v.step()
+        print(sum(v.root), sum(w.root), copies)
+    """
+
+@test("a tree three levels deep: the unique path is written in place and a shared subtree copied, through '*&T' and through '*self'")
+isu_a_tree_descended_by_place()
+    if !enm_ready() then return
+
+    isu_check(isu_tree, "3 0\n6 2 2\n9 2 2\n3 2\n6 3 5\n9 3 5\n")
+end isu_a_tree_descended_by_place
+
+// -- copy on write, counted in bytes -----------------------------------------------------------------
+
+private const isu_cow_head: string = raw"""
+    struct Leaf
+        items: [16]int
+        n: int
+
+    struct Vec
+        root: &Leaf
+
+        // A lent receiver cannot ask, so this copies every time.
+        push(self, x: int) -> Vec
+            var items = self.root.items
+
+            items[self.root.n % 16] = x
+            Vec(Leaf(items, self.root.n + 1))
+
+        // A place can: the leaf is written where it lies unless something else holds it.
+        push_mut(*self, x: int)
+            if !self.root.is_unique() then self.root = Leaf(self.root.items, self.root.n)
+
+            self.root.items[self.root.n % 16] = x
+            self.root.n += 1
+
+    var keep: Option[&Leaf] = None
+
+    """
+
+private const isu_cow_copying: string = raw"""
+    main()
+        var v = Vec(Leaf([0; 16], 0))
+
+        keep = Some(v.root)
+
+        for i in 0..<100
+            v = v.push(i)
+
+        print(v.root.n, v.root.items[3], keep.unwrap().n)
+        keep = None
+    """
+
+private const isu_cow_in_place: string = raw"""
+    main()
+        var v = Vec(Leaf([0; 16], 0))
+
+        keep = Some(v.root)
+        keep = None
+
+        for i in 0..<100
+            v.push_mut(i)
+
+        print(v.root.n, v.root.items[3], 0)
+    """
+
+private const isu_cow_shared_once: string = raw"""
+    main()
+        var v = Vec(Leaf([0; 16], 0))
+
+        keep = Some(v.root)
+
+        for i in 0..<100
+            v.push_mut(i)
+
+        print(v.root.n, v.root.items[3], keep.unwrap().n)
+        keep = None
+    """
+
+@test("copy on write: 'push(self)' copies every time, 'push_mut(*self)' writes in place and copies once when shared, counted in bytes allocated")
+isu_copy_on_write_allocations()
+    if !enm_ready() then return
+
+    val want = "100 99 0\n"
+
+    isu_check(isu_cow_head + isu_cow_copying, want)
+    isu_check(isu_cow_head + isu_cow_in_place, want)
+    isu_check(isu_cow_head + isu_cow_shared_once, want)
+
+    val copying = isu_bytes(isu_cow_head + isu_cow_copying)
+    val in_place = isu_bytes(isu_cow_head + isu_cow_in_place)
+    val shared_once = isu_bytes(isu_cow_head + isu_cow_shared_once)
+
+    // One leaf's bytes is what the shared run allocates beyond the unshared one: it copies once, and
+    // the old version it left alone still reads 0. The copying run allocates a hundred of them.
+    val leaf = shared_once - in_place
+
+    assert(leaf > 0, s"a shared leaf was written in place: $shared_once bytes against $in_place")
+    assert_eq(copying - in_place, 100 * leaf)
+end isu_copy_on_write_allocations
+
+// -- the refusals -------------------------------------------------------------------------------------
+
+private isu_lent(name: string) -> string =
+    s"'is_unique' counts the references to an object, and '$name' is a parameter, which is lent — it " +
+    "takes no count, so the reference its caller holds would not be counted. Ask a place that holds " +
+    "a count of its own: a field reached through '*self' or through a pointer to the place, or a " +
+    "'var' the reference is copied into"
+
+private const isu_node: string = "struct Node\n    n: int\n    left: Option[&Node]\n\n"
+
+@test("is_unique of a lent reference is refused: a '(self)' member's field, a struct parameter's, a '&T' parameter and a field through one, a closure's parameter")
+isu_a_lent_reference_is_refused()
+    if !enm_ready() then return
+
+    isu_refused(isu_node + "struct Vec\n    root: &Node\n\n    push(self) -> bool = self.root.is_unique()\n\n" +
+                "main()\n    var v = Vec(Node(1, None))\n\n    print(v.push())\n", isu_lent("self"))
+    isu_refused(isu_node + "struct Vec\n    root: &Node\n\nask(v: Vec) -> bool = v.root.is_unique()\n\n" +
+                "main()\n    var v = Vec(Node(1, None))\n\n    print(ask(v))\n", isu_lent("v"))
+    isu_refused(isu_node + "ask(p: &Node) -> bool = p.is_unique()\n\n" +
+                "main()\n    var a: &Node = Node(1, None)\n\n    print(ask(a))\n", isu_lent("p"))
+    isu_refused("struct Pair\n    a: &Leaf\n\nstruct Leaf\n    n: int\n\n" +
+                "ask(p: &Pair) -> bool = p.a.is_unique()\n\n" +
+                "main()\n    var x: &Pair = Pair(Leaf(1))\n\n    print(ask(x))\n", isu_lent("p"))
+    isu_refused(isu_node + "main()\n    val f: &Fn(&Node) -> bool = n -> n.is_unique()\n\n" +
+                "    print(f(Node(1, None)))\n", isu_lent("n"))
+end isu_a_lent_reference_is_refused
+
+@test("is_unique of a value in no place, with an argument, or of something that is no counted reference is refused")
+isu_the_other_refusals()
+    if !enm_ready() then return
+
+    isu_refused(isu_node + "make() -> &Node = Node(1, None)\n\nmain()\n    print(make().is_unique())\n",
+                "'is_unique' asks about the reference a place holds — a local, a field or an element — and " +
+                "this value is in no place. Bind it to a 'var' and ask that")
+    isu_refused(isu_node + "main()\n    var a: &Node = Node(1, None)\n\n    print(a.is_unique(1))\n",
+                "'is_unique' takes no arguments — it asks about the reference it is called on")
+    isu_refused(isu_node + "main()\n    var a = Node(1, None)\n\n    print(a.is_unique())\n",
+                "type 'Node' has no method 'is_unique'")
+    isu_refused("main()\n    var a = 1\n\n    print(a.is_unique())\n", "has no method 'is_unique'")
+end isu_the_other_refusals
+
+private const isu_own_member: string = raw"""
+    struct Token
+        n: int
+
+        is_unique(self) -> bool = self.n == 7
+
+    ask(t: &Token) -> bool = t.is_unique()
+
+    main()
+        val a: &Token = Token(7)
+        val b = a
+
+        print(a.is_unique(), ask(b), ask(Token(1)))
+    """
+
+@test("a type's own 'is_unique' member is what a call through its reference reaches")
+isu_a_types_own_member_wins()
+    if !enm_ready() then return
+
+    isu_check(isu_own_member, "true true false\n")
+end isu_a_types_own_member_wins
