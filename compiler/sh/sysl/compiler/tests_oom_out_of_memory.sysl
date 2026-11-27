@@ -773,6 +773,153 @@ oom_variadic_release()
     oom_variadic_cells(true)
 end oom_variadic_release
 
+// **The export in another tree than its caller**: a `--lib` root, whose compiled half is kept and only
+// declared by the program (`root_artifact.sysl`), and a package named by path. C's call answers the
+// value; a call by name from the program inside its own export's boundary lets that export answer; one
+// outside every boundary traps -- so the caller marks a definition it only declares.
+private val oom_variadic_base: string = raw"""
+    module vbase
+
+    import sysl.buf.{Buf, buf}
+    import sysl.c.{va_arg, va_end, va_start}
+
+    make(n: int) -> int
+        var b: Buf[int] = buf()
+
+        for i in 0..<n do b.push(i)
+
+        int(b.len())
+
+    @export("p_sum")
+    @out_of_memory(-2 - n)
+    p_sum(n: i32, ...) -> i32
+        var ap: va_list
+
+        va_start(ap)
+        defer va_end(ap)
+
+        var total: i32 = 0
+
+        for i in 0..<3 do total += va_arg(ap)
+
+        total + i32(make(int(n)))
+    end p_sum
+    """
+
+private val oom_variadic_top_c: string = raw"""
+    int p_sum(int n, ...);
+    int outer(int n);
+
+    int c_sum(int n) { return p_sum(n, 10, 20, 30); }
+    int c_outer(int n) { return outer(n); }
+    """
+
+private val oom_variadic_top: string = raw"""
+    import theap.{fail_from_now, heal, live}
+    import vbase.p_sum
+
+    @export("outer")
+    @out_of_memory(-9)
+    outer(n: i32) -> i32
+        defer print("outer defer")
+
+        val ten: i32 = 10
+
+        p_sum(n, ten, ten + ten, ten + ten + ten) + 100
+    end outer
+
+    extern "c_sum" c_sum(n: i32) -> i32
+    extern "c_outer" c_outer(n: i32) -> i32
+
+    main(args: []string)
+        val base = live
+
+        print(c_sum(2), c_outer(2))
+        fail_from_now()
+
+        val r = c_sum(2)
+
+        heal()
+        print("answered", r, live - base)
+        fail_from_now()
+
+        val q = c_outer(2)
+
+        heal()
+        print("outer answered", q, live - base)
+
+        val ten: i32 = 10
+
+        print(p_sum(2, ten, ten + ten, ten + ten + ten))
+        print("before")
+        fail_from_now()
+        print(p_sum(2, ten, ten + ten, ten + ten + ten))
+    end main
+    """
+
+// The pair built and run once: `rooted` names the base as a `--lib` root, otherwise as a package by path.
+private oom_variadic_pair(rooted: bool) -> (int, string)
+    val root = make_temp_dir("sysl-oom-pair").unwrap()
+    val exe = s"$root/out"
+    val named = if rooted then "" else "dependencies {\n  vbase { path = \"../base\" }\n}\n"
+
+    make_dir_all(s"$root/base/vbase").unwrap()
+    make_dir_all(s"$root/top/theap").unwrap()
+    write_text(s"$root/base/sysl.hocon", "package {\n  name = \"vbase\"\n  version = \"0.1.0\"\n}\n").unwrap()
+    write_text(s"$root/base/vbase/lib.sysl", oom_variadic_base).unwrap()
+    write_text(s"$root/top/sysl.hocon", "package { name = \"vtop\", version = \"0.1.0\" }\n" +
+               "allocator { alloc = \"t_alloc\", free = \"t_free\" }\n" + named).unwrap()
+    write_text(s"$root/top/main.sysl", oom_variadic_top).unwrap()
+    write_text(s"$root/top/theap/theap.sysl", oom_heap).unwrap()
+    write_text(s"$root/top/theap/callback.c", oom_variadic_top_c).unwrap()
+
+    val (code, said, err) = if rooted then clx_ran(["sysl", "build", s"$root/top", "--lib", s"$root/base", "-o", exe])
+                            else clx_ran(["sysl", "build", s"$root/top", "-o", exe])
+
+    use_allocator(("malloc", "free"))
+
+    var got = (-1, s"build failed: $said$err")
+
+    if code == 0
+        got = capture(exe, ["pair"], "", [], true) match
+            Err(_) -> (-1, "did not run")
+            Ok(o) -> (shell_status(o.status), o.text)
+
+    remove_dir_all(root).unwrap_or(())
+    got
+end oom_variadic_pair
+
+private const OomPairSaid: string = "outer defer\n62 162\nanswered -4 0\nouter defer\nouter answered -9 0\n62\nbefore\n"
+
+@test("a variadic export of a '--lib' root answers C, and called by name from the program is no boundary")
+oom_variadic_in_a_root()
+    if !oom_ready() then return
+
+    val got = oom_variadic_pair(true)
+
+    assert_eq(got.1, OomPairSaid)
+    assert_eq(got.0, 133)
+end oom_variadic_in_a_root
+
+@test("a variadic export of a package answers C, and called by name from the program is no boundary")
+oom_variadic_in_a_package()
+    if !oom_ready() then return
+
+    val got = oom_variadic_pair(false)
+
+    assert_eq(got.1, OomPairSaid)
+    assert_eq(got.0, 133)
+end oom_variadic_in_a_package
+
+@test("a variadic export's address cannot be taken, so C's call and a call by name are the only two")
+oom_variadic_address_refused()
+    if !oom_ready() then return
+
+    val said = oom_refused("@export(\"f\")\n@out_of_memory(-1)\nf(n: i32, ...) -> i32 = n\n\nval g = &f\n\nprint(g(1, 2))\n")
+
+    assert(said.contains("'f' is variadic, and a '*extern' fixes the arguments a call passes"), said)
+end oom_variadic_address_refused
+
 @test("beside a variadic function that is not an export, it is refused")
 oom_refused_off_a_variadic_export()
     if !oom_ready() then return
