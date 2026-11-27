@@ -4,7 +4,7 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.fenv
-summary: "The floating-point environment: the rounding mode, the five exception flags, and on Arm the flush-to-zero and default-NaN controls."
+summary: "The floating-point environment: the rounding mode, the five exception flags, and on Arm the flush-to-zero, default-NaN and alternative half-precision controls and the input-denormal flag."
 requires: "no alloc"
 ---
 
@@ -24,9 +24,29 @@ is refused at the call; so is one asking for a control its unit does not have.
 
 ## Index
 
-[`clear_flags`](#clear_flags) [`default_nan`](#default_nan) [`flags`](#flags) [`flush_to_zero`](#flush_to_zero) [`rounding`](#rounding) [`set_default_nan`](#set_default_nan) [`set_flush_to_zero`](#set_flush_to_zero) [`set_rounding`](#set_rounding) [`with_rounding`](#with_rounding) [`FpFlags`](#fpflags) [`RoundingMode`](#roundingmode)
+[`alternative_half_precision`](#alternative_half_precision) [`clear_flags`](#clear_flags) [`default_nan`](#default_nan) [`flags`](#flags) [`flush_to_zero`](#flush_to_zero) [`input_denormal`](#input_denormal) [`rounding`](#rounding) [`set_alternative_half_precision`](#set_alternative_half_precision) [`set_default_nan`](#set_default_nan) [`set_flush_to_zero`](#set_flush_to_zero) [`set_rounding`](#set_rounding) [`with_rounding`](#with_rounding) [`FpFlags`](#fpflags) [`RoundingMode`](#roundingmode)
 
 ## Functions
+
+### `alternative_half_precision`
+
+```sysl
+alternative_half_precision() -> bool
+```
+
+Whether a conversion to or from `f16` reads binary16 as Arm's alternative half-precision format
+rather than IEEE 754's: FPCR.AHP on AArch64, FPSCR.AHP on an Arm core.
+
+The alternative format spends the top exponent on numbers, up to 131008, instead of on infinities
+and NaNs. So with it on a conversion to `f16` turns a NaN into a zero and an infinity -- or a
+number past 131008 -- into the largest magnitude, raising invalid for each, and a conversion from
+`f16` reads `0x7c00` as 65536 rather than an infinity.
+
+The compiler knows `f16` only as IEEE's binary16: a literal, a `const` and whatever the optimizer
+works out while compiling are IEEE's bits, and LLVM's strict conversions model the rounding mode
+and the exceptions but not this control. So with it on, a conversion is the unit's -- and follows
+it -- only where the instruction runs: in a `@strict_fp` body of a value read at run time. Of a value
+the compiler can see, what it answers is not something a program can count on.
 
 ### `clear_flags`
 
@@ -34,7 +54,8 @@ is refused at the call; so is one asking for a control its unit does not have.
 clear_flags()
 ```
 
-Clears the five flags on this thread, leaving the controls as they are.
+Clears the five flags on this thread, and on Arm the input-denormal flag with them, leaving the
+controls as they are.
 
 ### `default_nan`
 
@@ -61,6 +82,20 @@ flush_to_zero() -> bool
 
 Whether a subnormal result -- and, on x86-64, a subnormal operand -- is read as a zero of its sign.
 
+### `input_denormal`
+
+```sysl
+input_denormal() -> bool
+```
+
+Whether, since the flags were last cleared, flush-to-zero has replaced a subnormal OPERAND with a
+zero: Arm's input-denormal flag, FPSR.IDC on AArch64 and FPSCR.IDC on an Arm core. A subnormal
+result that is flushed raises underflow instead, and with flush-to-zero off nothing raises this.
+It is sticky like the five, and `clear_flags` clears it with them.
+
+It is not one of IEEE 754's exceptions, so it is not a field of `FpFlags`, which every machine
+answers; this is an Arm flag, and a program asking for it elsewhere is refused at the call.
+
 ### `rounding`
 
 ```sysl
@@ -68,6 +103,14 @@ rounding() -> RoundingMode
 ```
 
 The rounding mode in force on this thread.
+
+### `set_alternative_half_precision`
+
+```sysl
+set_alternative_half_precision(on: bool)
+```
+
+Turns Arm's alternative half-precision format on or off on this thread.
 
 ### `set_default_nan`
 

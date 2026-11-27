@@ -19,7 +19,7 @@ that `ẞ` lower-cases to `ß`, and it is the other module that does.
 
 ## Index
 
-[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f16_prefix`](#f16_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`join`](#join) [`lines`](#lines) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f16`](#parse_f16) [`parse_f16`](#parse_f16-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`try_cstring`](#try_cstring) [`try_str_builder`](#try_str_builder) [`try_str_builder_with_capacity`](#try_str_builder_with_capacity) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [`Text`](#text) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Fallible for TrySink](#fallible-for-trysink) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string) [Text for string](#text-for-string) [Writer for TrySink](#writer-for-trysink)
+[`char_columns`](#char_columns) [`char_from_u32`](#char_from_u32) [`char_indices`](#char_indices) [`chars_of`](#chars_of) [`cluster_columns`](#cluster_columns) [`columns`](#columns) [`contains_fold`](#contains_fold) [`cstring`](#cstring) [`ends_with_fold`](#ends_with_fold) [`eq_fold`](#eq_fold) [`f128_prefix`](#f128_prefix) [`f16_prefix`](#f16_prefix) [`f32_prefix`](#f32_prefix) [`fields`](#fields) [`from_cstring`](#from_cstring) [`from_utf8`](#from_utf8) [`from_utf8_lossy`](#from_utf8_lossy) [`from_utf8_unchecked`](#from_utf8_unchecked) [`grapheme_columns`](#grapheme_columns) [`is_char_boundary`](#is_char_boundary) [`is_utf8`](#is_utf8) [`join`](#join) [`lines`](#lines) [`parse_bool`](#parse_bool) [`parse_bool`](#parse_bool-1) [`parse_f128`](#parse_f128) [`parse_f128`](#parse_f128-1) [`parse_f16`](#parse_f16) [`parse_f16`](#parse_f16-1) [`parse_f32`](#parse_f32) [`parse_f32`](#parse_f32-1) [`parse_int`](#parse_int) [`parse_int`](#parse_int-1) [`parse_int_base`](#parse_int_base) [`parse_int_base`](#parse_int_base-1) [`parse_long`](#parse_long) [`parse_long`](#parse_long-1) [`parse_long_base`](#parse_long_base) [`parse_long_base`](#parse_long_base-1) [`parse_real`](#parse_real) [`parse_real`](#parse_real-1) [`parse_uint`](#parse_uint) [`parse_uint`](#parse_uint-1) [`parse_ulong`](#parse_ulong) [`parse_ulong`](#parse_ulong-1) [`parse_ulong_base`](#parse_ulong_base) [`parse_ulong_base`](#parse_ulong_base-1) [`real_prefix`](#real_prefix) [`repeat`](#repeat) [`replace_all`](#replace_all) [`split`](#split) [`starts_with_fold`](#starts_with_fold) [`str_builder`](#str_builder) [`str_builder_with_capacity`](#str_builder_with_capacity) [`str_view`](#str_view) [`to_lower`](#to_lower) [`to_upper`](#to_upper) [`try_cstring`](#try_cstring) [`try_str_builder`](#try_str_builder) [`try_str_builder_with_capacity`](#try_str_builder_with_capacity) [`validate_utf8`](#validate_utf8) [`CharIndices`](#charindices) [`Chars`](#chars) [`CString`](#cstring-1) [`ParseError`](#parseerror) [`StrBuilder`](#strbuilder) [`Utf8Error`](#utf8error) [`Ascii`](#ascii) [`Join`](#join-1) [`Search`](#search) [`Text`](#text) [Ascii for char](#ascii-for-char) [Ascii for u8](#ascii-for-u8) [Display for ParseError](#display-for-parseerror) [Iterate for CharIndices](#iterate-for-charindices) [Iterate for Chars](#iterate-for-chars) [Join for []const T](#join-for-const-t) [Join for [N]T](#join-for-nt) [Join for Buf[T]](#join-for-buft) [Search for []const u8](#search-for-const-u8) [Search for string](#search-for-string) [Text for string](#text-for-string)
 
 ## Functions
 
@@ -239,8 +239,9 @@ The validation is `scan_at` below, which is also what the lossy form walks -- on
 the two can never come to disagree about which bytes are text.
 
 **Sixteen bytes with no high bit set are sixteen one-byte characters**, so a block of ASCII is
-passed over with one load and one compare. A block holding any other byte goes to `scan_at` for a
-stretch of characters before the vector test is tried again, and each failed test doubles that
+passed over with one load and one compare. A block holding any other byte is passed over up to
+its first high byte, the trailing zeros of the mask's `bits()`, and from there goes to `scan_at`
+for a stretch of characters before the vector test is tried again; each failed test doubles that
 stretch (up to 4 KiB) while a passing one shrinks it back to sixteen bytes: ASCII is skipped a block
 at a time, and text that is mostly not ASCII stops paying for blocks that never pass. The inner
 walk is the plain scalar loop, so it keeps that loop's speed. The positions `scan_at` sees are the
@@ -322,6 +323,15 @@ backwards through text, or snapping an arbitrary offset onto a boundary, needs a
 otherwise write inline. `reference/strings.md § Granularity` calls the same property
 "boundary-checked" where the compiler enforces it on `s[a..b]`; this is how a program asks the
 question for itself.
+
+### `is_utf8`
+
+```sysl
+is_utf8(b: []const u8) -> bool
+```
+
+Whether every byte of `b` is well-formed UTF-8. It is `validate_utf8` with the offset dropped,
+and like it allocates nothing.
 
 ### `join`
 
@@ -726,6 +736,18 @@ try_str_builder_with_capacity(n: usize) -> Result[StrBuilder, AllocError]
 
 `str_builder_with_capacity(n)`, answering `AllocError` as `try_buf_with_capacity` does.
 
+### `validate_utf8`
+
+```sysl
+validate_utf8(b: []const u8) -> Option[int]
+```
+
+The offset of the first byte that keeps `b` from being well-formed UTF-8, or `None` when all of it
+is. It is the offset `from_utf8` reports in its `Utf8Error`, from the same scan, so the two cannot
+disagree; a sequence cut off by the end of the input is reported at its lead byte. Nothing is
+allocated and nothing is converted, which is what a caller that only needs to know (a database
+checking a column, a parser gating its input) wants in place of a `Result` it throws away.
+
 ## Types
 
 ### `CharIndices`
@@ -952,6 +974,7 @@ renders through its `Display`.
 ```sysl
 trait Search
     view(self) -> []const u8
+    view_in_place(*self) -> []const u8
     slice(self, lo: usize, hi: usize) -> Self
     is_empty(self) -> bool
     starts_with(self, prefix: Self) -> bool
@@ -1018,6 +1041,7 @@ A one-byte needle never builds a table at all -- it is a single byte scan, which
 | Member | Signature | Description |
 |---|---|---|
 | `view` | `view(self) -> []const u8` | The bytes to look at. |
+| `view_in_place` | `view_in_place(*self) -> []const u8` | *The same bytes, lent from where the caller holds the receiver**, which is what every member below reads. |
 | `slice` | `slice(self, lo: usize, hi: usize) -> Self` | A piece of the receiver, as the receiver's own type -- what lets a trim answer with a view rather than a copy, and what a default cannot do for itself because it does not know how to build a `Self`. |
 | `is_empty` | `is_empty(self) -> bool` | There is deliberately no `len` here: both implementations already have one the compiler provides, and a trait member of that name would hide it rather than agree with it. |
 | `starts_with` | `starts_with(self, prefix: Self) -> bool` | The empty prefix is a prefix of everything, which falls out of the comparison rather than being said: two slices of no elements are equal. |
@@ -1111,12 +1135,6 @@ impl Display for ParseError
 
 The rendering, so that a refusal can be printed without matching on it.
 
-### Fallible for TrySink
-
-```sysl
-impl Fallible for TrySink
-```
-
 ### Iterate for CharIndices
 
 ```sysl
@@ -1172,10 +1190,4 @@ already knows are boundaries.
 
 ```sysl
 impl Text for string
-```
-
-### Writer for TrySink
-
-```sysl
-impl Writer for TrySink
 ```

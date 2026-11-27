@@ -15,9 +15,29 @@ sink is `x.to_string()`, and that goes through storage the compiler lays out rat
 
 ## Index
 
-[`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`buffer`](#buffer) [`byte_sink`](#byte_sink) [`try_buf`](#try_buf) [`try_buf_filled`](#try_buf_filled) [`try_buf_with_capacity`](#try_buf_with_capacity) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [`Buffer`](#buffer-1) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Fallible for ByteSink](#fallible-for-bytesink) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
+[`aligned`](#aligned) [`buf`](#buf) [`buf_filled`](#buf_filled) [`buf_with_capacity`](#buf_with_capacity) [`buffer`](#buffer) [`byte_sink`](#byte_sink) [`try_buf`](#try_buf) [`try_buf_filled`](#try_buf_filled) [`try_buf_with_capacity`](#try_buf_with_capacity) [`Buf`](#buf-1) [`ByteSink`](#bytesink) [`Frozen`](#frozen) [`FrozenWalk`](#frozenwalk) [`Buffer`](#buffer-1) [Buf[T]](#buft) [Debug for Buf[T]](#debug-for-buft) [Debug for Frozen[T]](#debug-for-frozent) [Display for Buf[T]](#display-for-buft) [Display for Frozen[T]](#display-for-frozent) [Drop for Frozen[T]](#drop-for-frozent) [Eq for Buf[T]](#eq-for-buft) [Eq for Frozen[T]](#eq-for-frozent) [Fallible for ByteSink](#fallible-for-bytesink) [Hash for Buf[T]](#hash-for-buft) [Hash for Frozen[T]](#hash-for-frozent) [Index for Buf[T]](#index-for-buft) [Index for Frozen[T]](#index-for-frozent) [IndexPlace for Buf[T]](#indexplace-for-buft) [IndexSet for Buf[T]](#indexset-for-buft) [Iterate for FrozenWalk[T]](#iterate-for-frozenwalkt) [Walk for Buf[T]](#walk-for-buft) [Walk for Frozen[T]](#walk-for-frozent) [Writer for ByteSink](#writer-for-bytesink)
 
 ## Functions
+
+### `aligned`
+
+```sysl
+aligned[T: AnyBits](n: usize, alignment: usize) -> []T
+```
+
+Storage for `n` elements whose first element is on an `alignment`-byte boundary, every byte zero --
+what a SIMD loop or a cache-line-sized block wants of a buffer whose length is known only while
+running. A `[0; n]` slice promises the allocator's boundary and no more (sixteen bytes on a 64-bit
+host), and a type's `@align` fixes the boundary at compile time; this is the runtime-sized form.
+
+**It is an ordinary `[]T`**: the slice is a view into storage `alignment` elements longer than
+asked for, and it keeps that storage alive, so the whole block goes back when the last view of it
+is gone -- nothing is freed by hand. Elements are `AnyBits` because zero bytes must be a value.
+`n` of zero answers an empty slice.
+
+**`alignment` must be a power of two**, and the element size must be able to reach it: a type of 12
+bytes has no element boundary at 64 from an address that is only 4-aligned, so the call traps
+rather than answering a slice off its boundary. Sizes that are a power of two always reach it.
 
 ### `buf`
 
@@ -161,6 +181,7 @@ the caller's line.
 | `try_insert` | `try_insert(self, i: usize, v: T) -> Result[unit, AllocError]` | `insert`, answering `AllocError` where the storage had to grow; an index past `len()` still traps, as it does in `insert`. |
 | `try_reserve` | `try_reserve(self, more: usize) -> Result[unit, AllocError]` | `reserve`, answering `AllocError`: `CapacityOverflow` where `len() + more` passes the largest size, `OutOfMemory` where the heap refused the storage. |
 | `remove` | `const remove(self, i: usize) -> T` |  |
+| `swap_remove` | `const swap_remove(self, i: usize) -> T` | The element at `i`, taken out by moving the last element into its place: constant time where `remove` shifts everything after `i`, and the order of the rest is not kept. |
 | `copy` | `const copy(self) -> Buf[T]` | A second buffer holding the same elements, sized to them -- the one way to get a buffer that is not this one, every other way of handing a `Buf` on handing on this one. |
 | `try_copy` | `try_copy(self) -> Result[Buf[T], AllocError]` | `copy`, answering `AllocError` where the heap refused the second buffer or its storage, with nothing of either left allocated. |
 | `freeze` | `const freeze(self) -> &Frozen[T]` | The elements, frozen: a `&Frozen[T]` nothing writes, and this buffer -- through this name and every other -- left empty (`Frozen`). |
@@ -340,6 +361,14 @@ rather than the backing slice, whose slots past `count` were never written.
 hard to explain if either answered differently, so the loop is written once, over the slice, and
 this is the growable sequence saying it is the same sequence.
 
+### Eq for Frozen[T]
+
+```sysl
+impl[T: Eq] Eq for Frozen[T]
+```
+
+Frozen buffers are equal when their elements are, and hash as the elements do.
+
 ### Fallible for ByteSink
 
 ```sysl
@@ -349,6 +378,20 @@ impl Fallible for ByteSink
 A buffer that grows has nothing to fail at, so the whole of implementing the latch is opting into
 it: every member of `Fallible` has a default, and a trait like that needs no block
 (`reference/traits.md § Conformance is explicit, always`).
+
+### Hash for Buf[T]
+
+```sysl
+impl[T: Hash] Hash for Buf[T]
+```
+
+A buffer hashes as the sequence it holds, so a `Buf` and the view it compares equal to hash alike.
+
+### Hash for Frozen[T]
+
+```sysl
+impl[T: Hash] Hash for Frozen[T]
+```
 
 ### Index for Buf[T]
 
