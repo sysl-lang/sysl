@@ -43,7 +43,7 @@ freestanding program reaching it answers the `sysl_io_poll_*` hooks itself (`sys
 
 ## Index
 
-[`Event`](#event) [`Mode`](#mode) [`Poller`](#poller) [`WakeFd`](#wakefd) [`Waker`](#waker) [Drop for PollerState](#drop-for-pollerstate) [Drop for WakeState](#drop-for-wakestate)
+[`Event`](#event) [`Mode`](#mode) [`Poller`](#poller) [`WakeFd`](#wakefd) [`Waker`](#waker)
 
 ## Types
 
@@ -162,22 +162,3 @@ counting wakes.
 | Member | Signature | Description |
 |---|---|---|
 | `wake` | `wake(self) -> Result[unit, IoError]` | End the poller's current or next `wait`. |
-
-## Implementations
-
-### Drop for PollerState
-
-```sysl
-impl Drop for PollerState
-```
-
-Both descriptors closed. A failure is not reported, there being nobody to report it to
-(`sysl.Drop`).
-
-### Drop for WakeState
-
-```sysl
-impl Drop for WakeState
-```
-
-Both descriptors closed, unreported (`sysl.Drop`).

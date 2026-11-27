@@ -4,12 +4,12 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.raw
-summary: "The raw tier's reinterpreting forms: `ptr_cast`, `str_cast` and `str_alias`."
+summary: "The raw tier's reinterpreting forms: `ptr_cast`, `str_cast`, `str_alias`, `from_raw` and `nonnull_unchecked` (a `*T` taken as a `*nonnull T` with nothing checked)."
 ---
 
 Each one takes a value the type system has checked and hands it back as something it has not: an
 address read as a pointer to some type, bytes taken as a string with nothing checked, a string laid
-over storage it did not allocate. The compiler answers all three itself -- `ptr_cast` takes its
+over storage it did not allocate. The compiler answers every one itself -- `ptr_cast` takes its
 target from the position its value fills, which no function signature can say -- so nothing here
 is a declaration. What the module gives them is a home: **a file names the ones it uses**, the way
 it names anything else it did not declare, and a reader finds every reinterpretation in a program

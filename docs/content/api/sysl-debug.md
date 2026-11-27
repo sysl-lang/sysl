@@ -21,7 +21,9 @@ next one's.
 
 **One trace per thread**, of thirty-two sites and a count, allocated nowhere: the first thirty-two
 are kept, since the origin end is where the bug is, and the rest are counted. A task records into
-the trace of the thread running it. On a freestanding target there is one trace for the program.
+the trace of the thread running it. On a freestanding target there is one trace for the program
+until a kernel gives each of its tasks an `ErrorTraceStore` and switches them with
+`use_error_trace`.
 
 `main` returning an `Err` prints the trace under its `error:` line, and so do `unwrap` and `expect`
 of an `Err` and a `@test` that returns one. A build with `error_traces = false` in its manifest, or
@@ -30,7 +32,7 @@ no failure had happened.
 
 ## Index
 
-[`ErrorTraceSites`](#errortracesites) [`clear_error_trace`](#clear_error_trace) [`error_trace`](#error_trace) [`print_error_trace`](#print_error_trace) [`ErrorSite`](#errorsite) [`ErrorTrace`](#errortrace) [`ErrorTraceWalk`](#errortracewalk) [Iterate for ErrorTraceWalk](#iterate-for-errortracewalk) [Walk for ErrorTrace](#walk-for-errortrace)
+[`ErrorTraceSites`](#errortracesites) [`clear_error_trace`](#clear_error_trace) [`error_trace`](#error_trace) [`print_error_trace`](#print_error_trace) [`use_error_trace`](#use_error_trace) [`ErrorSite`](#errorsite) [`ErrorTrace`](#errortrace) [`ErrorTraceStore`](#errortracestore) [`ErrorTraceWalk`](#errortracewalk) [Iterate for ErrorTraceWalk](#iterate-for-errortracewalk) [Walk for ErrorTrace](#walk-for-errortrace)
 
 ## Constants
 
@@ -70,6 +72,21 @@ print_error_trace(w: *Writer)
 Writes the current thread's trace to `w` in the form `main` reports it in, or nothing where it is
 empty.
 
+### `use_error_trace`
+
+```sysl
+use_error_trace(s: *ErrorTraceStore) -> *ErrorTraceStore
+```
+
+Makes `s` the trace that every failure records into and every read of the trace reads -- `null`
+for the program's own (the thread's own, on a hosted target) -- and answers the one that was
+current, which is never `null`. On a freestanding target it points `sysl_error_trace_current` at
+`s`, which is what the default `sysl_error_trace_here` hook answers; where a board or an OS links a
+hook of its own, that hook decides which store is current, and this still sets the pointer and
+answers what it held, with nothing recording into it unless the hook reads it. On a hosted one,
+where the trace is the thread's own object, it copies the live trace out and `s` in. With traces
+off it does nothing and answers `null`.
+
 ## Types
 
 ### `ErrorSite`
@@ -102,6 +119,24 @@ constants -- so taking one allocates nothing, and reading a site makes its strin
 | `dropped` | `dropped(self) -> usize` | How many it recorded past the ones it kept. |
 | `is_empty` | `is_empty(self) -> bool` | Whether nothing was recorded. |
 | `at` | `at(self, i: usize) -> ErrorSite` | The `i`th site, the origin being `0`. |
+
+### `ErrorTraceStore`
+
+```sysl
+struct ErrorTraceStore
+    private count: u32
+    private sites: [32]*u8
+```
+
+Storage for one error return trace, of a size known while compiling, so a kernel can keep one in
+each task's control block and make it current on a context switch with `use_error_trace` -- or
+answer it from a `sysl_error_trace_here` hook of its own. What is in it is reached only through the
+trace functions while it is current.
+
+| Member | Signature | Description |
+|---|---|---|
+| `new` | `new() -> ErrorTraceStore` | A store holding no trace. |
+| `init` | `init(*self)` | Empties the store. |
 
 ### `ErrorTraceWalk`
 

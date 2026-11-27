@@ -17,7 +17,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.args`](sysl-args/) | How a program's arguments become a `[]string`, written here because every line of it is ordinary sysl. |
 | [`sysl.buf`](sysl-buf/) | The growable sequence and the sink built on it. |
 | [`sysl.c`](sysl-c/) | The C variadic forms: `va_start`, `va_arg`, `va_copy` and `va_end`. |
-| [`sysl.checksum`](sysl-checksum/) | Checksums that detect accidental corruption and nothing else. |
+| [`sysl.checksum`](sysl-checksum/) | Checksums that detect accidental corruption, and a fast hash for tables -- nothing an attacker cannot forge. |
 | [`sysl.codec`](sysl-codec/) | Turning a value into a format and back, written once for every type and every format. |
 | [`sysl.container`](sysl-container/) | Five containers, each with a shape a slice and a `Buf` cannot give you. |
 | [`sysl.container.ring`](sysl-container-ring/) | A queue of a **fixed** capacity, laid over storage the caller supplies, cheap to take from at either end and needing no allocator at all. |
@@ -30,7 +30,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.env`](sysl-env/) | Reading the environment a program was started with. |
 | [`sysl.env.hosted`](sysl-env-hosted/) |  |
 | [`sysl.env.sys`](sysl-env-sys/) |  |
-| [`sysl.fenv`](sysl-fenv/) | The floating-point environment: the rounding mode, the five exception flags, and on Arm the flush-to-zero and default-NaN controls. |
+| [`sysl.fenv`](sysl-fenv/) | The floating-point environment: the rounding mode, the five exception flags, and on Arm the flush-to-zero, default-NaN and alternative half-precision controls and the input-denormal flag. |
 | [`sysl.fiber`](sysl-fiber/) | Stacks of a program's own, and the switch from one to another: what a runtime builds lightweight threads on, over the operating system's threads that carry them. |
 | [`sysl.fmt`](sysl-fmt/) | What an `f"…"` hole's computed width or precision comes to — `${x}%.${n}f`, `${s}%${w}s` — and what an integer under a specifier renders as — `${n}%08x`. |
 | [`sysl.fs`](sysl-fs/) | What is at the end of a path: reading and writing whole files, metadata, directories, links, and the errors any of it can answer with. |
@@ -51,7 +51,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.math.complex`](sysl-math-complex/) | Complex numbers, at whichever floating-point width the program is already using. |
 | [`sysl.math.decimal`](sysl-math-decimal/) | Exact decimal arithmetic: an integer coefficient and a scale, so `0.1 + 0.2` is `0.3`. |
 | [`sysl.math.rational`](sysl-math-rational/) | Exact fractions: a numerator and a denominator, both `BigInt`s, so a third is a third. |
-| [`sysl.net`](sysl-net/) | Blocking sockets -- a TCP stream, a UDP socket -- and the names a host resolves to. |
+| [`sysl.net`](sysl-net/) | Sockets -- a TCP stream, a UDP socket, a Unix domain stream -- and the names a host resolves to. |
 | [`sysl.net.hosted`](sysl-net-hosted/) |  |
 | [`sysl.net.sys`](sysl-net-sys/) |  |
 | [`sysl.path`](sysl-path/) | Path handling that is decided by the string alone. |
@@ -63,7 +63,7 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.process.hosted`](sysl-process-hosted/) |  |
 | [`sysl.process.sys`](sysl-process-sys/) |  |
 | [`sysl.rand`](sysl-rand/) | Pseudo-random numbers: a named, seedable, reproducible generator, and the distributions that are easy to get wrong. |
-| [`sysl.raw`](sysl-raw/) | The raw tier's reinterpreting forms: `ptr_cast`, `str_cast` and `str_alias`. |
+| [`sysl.raw`](sysl-raw/) | The raw tier's reinterpreting forms: `ptr_cast`, `str_cast`, `str_alias`, `from_raw` and `nonnull_unchecked` (a `*T` taken as a `*nonnull T` with nothing checked). |
 | [`sysl.reflect`](sysl-reflect/) |  |
 | [`sysl.regex`](sysl-regex/) | Matching text against a pattern: compile one, then find, replace or split with it. |
 | [`sysl.seq`](sysl-seq/) | What a sequence of values can be asked, in one trait, so that a slice and a `Buf` answer the same names. |
@@ -73,9 +73,10 @@ These pages are generated from the library's own doc comments: every declaration
 | [`sysl.slices`](sysl-slices/) | Operations over a built-in slice, and the pointer a C binding needs to hand one across. |
 | [`sysl.softfloat`](sysl-softfloat/) |  |
 | [`sysl.softfloat.binary64`](sysl-softfloat-binary64/) |  |
+| [`sysl.softfloat.libm`](sysl-softfloat-libm/) |  |
 | [`sysl.softint`](sysl-softint/) |  |
 | [`sysl.softint.aeabi`](sysl-softint-aeabi/) |  |
-| [`sysl.sync`](sysl-sync/) | What two threads may touch at once: `Atomic[T]`, `SpinLock`, and the five memory orderings. |
+| [`sysl.sync`](sysl-sync/) | What two threads may touch at once: `Atomic[T]`, `SpinLock`, `SeqLock[T]`, and the five memory orderings. |
 | [`sysl.sys`](sysl-sys/) | The platform seam: everything the library asks of what it is hosted on, and nothing else. |
 | [`sysl.term`](sysl-term/) | What a terminal understands: the escape sequences that colour text, emphasise it, and move the cursor about. |
 | [`sysl.term.edit`](sysl-term-edit/) | Reading a line from a terminal that will not do it for you. |

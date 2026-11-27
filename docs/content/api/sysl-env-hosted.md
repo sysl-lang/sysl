@@ -9,7 +9,7 @@ requires: "requires { libc }, requires { os }"
 
 ## Index
 
-[`supply_count`](#supply_count) [`supply_entry`](#supply_entry) [`supply_get`](#supply_get)
+[`supply_count`](#supply_count) [`supply_entry`](#supply_entry) [`supply_exe`](#supply_exe) [`supply_get`](#supply_get)
 
 ## Functions
 
@@ -23,6 +23,12 @@ supply_count() -> isize
 
 ```sysl
 supply_entry(i: usize, into: *u8, room: usize, got: *usize) -> int
+```
+
+### `supply_exe`
+
+```sysl
+supply_exe(into: *u8, room: usize, got: *usize) -> int
 ```
 
 ### `supply_get`

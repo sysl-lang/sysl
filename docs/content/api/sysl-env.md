@@ -44,9 +44,23 @@ by being **present**, whatever it contains, so `NO_COLOR=0` means no colour and 
 
 ## Index
 
-[`get`](#get) [`get_or`](#get_or) [`is_set`](#is_set) [`vars`](#vars)
+[`current_exe`](#current_exe) [`get`](#get) [`get_or`](#get_or) [`is_set`](#is_set) [`vars`](#vars)
 
 ## Functions
+
+### `current_exe`
+
+```sysl
+current_exe() -> Option[string]
+```
+
+The absolute path of the running executable with every symbolic link resolved, or `None` where the
+target cannot say or the path is not UTF-8.
+
+**It is the file itself, not the name the program was started under**: a binary run from the search
+path or through a symlink (a Homebrew `bin/` entry) answers the real file, so a program can find
+what is installed beside it. macOS asks the loader and Linux reads `/proc/self/exe`; both are then
+passed through `realpath`. Any other target answers `None`.
 
 ### `get`
 

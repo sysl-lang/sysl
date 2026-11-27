@@ -44,7 +44,7 @@ opted into. Width is inherited; case mapping is asked for.
 
 ## Index
 
-[`category`](#category) [`fold`](#fold) [`grapheme_count`](#grapheme_count) [`graphemes_of`](#graphemes_of) [`is_alpha`](#is_alpha) [`is_digit`](#is_digit) [`is_lower`](#is_lower) [`is_mark`](#is_mark) [`is_space`](#is_space) [`is_upper`](#is_upper) [`is_valid`](#is_valid) [`normalize`](#normalize) [`to_lower`](#to_lower) [`to_title`](#to_title) [`to_upper`](#to_upper) [`unicode_version`](#unicode_version) [`Category`](#category-1) [`Form`](#form) [`Graphemes`](#graphemes) [Iterate for Graphemes](#iterate-for-graphemes)
+[`category`](#category) [`fold`](#fold) [`grapheme_count`](#grapheme_count) [`graphemes_of`](#graphemes_of) [`is_alpha`](#is_alpha) [`is_digit`](#is_digit) [`is_lower`](#is_lower) [`is_mark`](#is_mark) [`is_space`](#is_space) [`is_upper`](#is_upper) [`is_valid`](#is_valid) [`normalize`](#normalize) [`simple_fold`](#simple_fold) [`to_lower`](#to_lower) [`to_title`](#to_title) [`to_upper`](#to_upper) [`unicode_version`](#unicode_version) [`Category`](#category-1) [`Form`](#form) [`Graphemes`](#graphemes) [Iterate for Graphemes](#iterate-for-graphemes)
 
 ## Functions
 
@@ -203,6 +203,36 @@ normalize(f: Form, s: string) -> string
 the letter and the accent as two. That is the operation two strings have to go through before
 `==` between them means what a reader thinks it means: the same text typed on two machines is
 routinely two different sequences of code points, and nothing about comparing bytes will say so.
+
+### `simple_fold`
+
+```sysl
+simple_fold(c: char) -> char
+```
+
+The character `c` folds to under *simple* case folding, or `c` where the database gives it no
+folding -- CaseFolding.txt's statuses **C** (common) and **S** (simple), one character in and one
+out.
+
+**This is the comparison key for a `char`, and it is not `to_lower`.** Folding exists so that two
+spellings of "the same letter" compare equal, which lowercasing does not promise: `ſ` (the long
+s, U+017F) and the Kelvin sign U+212A are already lowercase-or-not in ways `to_lower` does not
+collapse, and both fold to the ASCII letters `s` and `k`. So `simple_fold('K')`, `simple_fold('k')`
+and `simple_fold('\u{212a}')` are all `'k'`, and `simple_fold('ſ')` is `'s'`.
+
+**`ß` folds to itself.** Its folding is the two characters `ss`, which is status **F** (full) and
+cannot come out of a `char -> char` signature; the database gives it no C or S entry, so the
+simple answer is `ß`. Where a string comparison wants `ß` equal to `ss`, `fold` in `map.sysl` is
+the operation. The capital sharp s `ẞ` (U+1E9E) *does* have an S entry and folds to `ß`.
+
+**Every sigma folds to `σ`**: `Σ`, `σ` and the final sigma `ς` all answer `'σ'`.
+
+Folding is idempotent -- `simple_fold(simple_fold(c)) == simple_fold(c)` -- which is what lets a
+caller fold a key once and compare it with anything folded the same way. The Turkic `T` entries
+(`I` to `ı`, `İ` to `i`) are not in the table, so `simple_fold('I')` is `'i'` as in every
+locale-free comparison.
+
+The table is static, so this allocates nothing and links nothing a program that never calls it.
 
 ### `to_lower`
 
