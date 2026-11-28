@@ -8,7 +8,9 @@ import sysl.text.{Search, StrBuilder, str_builder, from_utf8_unchecked}
 // program**.
 //
 // **The rule is the indent, and nothing else.** A line indented four columns or more is program
-// text; every other line is prose and is not compiled. Nothing marks where a block begins or ends,
+// text wherever Markdown would set it in a code block -- which is everywhere but directly under a
+// line of a paragraph, where it continues the paragraph; every other line is prose and is not
+// compiled. Nothing marks where a block begins or ends,
 // there is no name to declare and no chunk to reference, and a file with no prose in it is a `.sysl`
 // file with four spaces down the left.
 //
@@ -75,6 +77,11 @@ program_lines(src: Source) -> Result[Buf[bool], Diagnostic]
     var list_margin: usize = 0
     var in_list = false
 
+    // Whether the line above left a paragraph of prose open. **An indented line under an open
+    // paragraph continues it** -- Markdown's lazy continuation, under which an indented code block
+    // cannot interrupt a paragraph -- so it is prose, as a renderer shows it.
+    var in_paragraph = false
+
     for line in 1..src.line_count()
         val text = from_utf8_unchecked(src.line_text(line))
 
@@ -90,6 +97,7 @@ program_lines(src: Source) -> Result[Buf[bool], Diagnostic]
 
         val margin = leading_blank(text)
         val bare = text[margin..<text.len]
+        val blank = bare.trim() == ""
 
         // **A tab is refused before the four-column test rather than by failing it.** Asked after, a
         // tab-indented line would answer "not four columns", become prose, and be dropped from the
@@ -103,32 +111,43 @@ program_lines(src: Source) -> Result[Buf[bool], Diagnostic]
 
         // An open list item ends at the first line with content no further in than the marker was. A
         // blank line does not end one -- a list may be written with air between its items.
-        if in_list && bare != "" && margin <= list_margin then in_list = false
+        if in_list && !blank && margin <= list_margin then in_list = false
 
         if in_list
             out.push(false)
             continue
         end if
 
+        if blank then in_paragraph = false
+
         if margin < LiterateIndent && opens_fence(bare)
             fence = fence_run(bare)
             fence_at = line
+            in_paragraph = false
             out.push(false)
             continue
         end if
 
         if margin >= LiterateIndent
-            out.push(true)
+            out.push(blank || !in_paragraph)
+            continue
+        end if
+
+        if blank
+            out.push(false)
             continue
         end if
 
         // Only asked where the line is too shallow to be program text, which is why a `-` or a `*`
         // opening a sysl line can never be read as a bullet: at four columns in, the line was code
-        // before this was consulted.
-        if is_marker(bare)
+        // before this was consulted. A rule drawn with spaced marks (`* * *`) is asked about first,
+        // since it opens with what would otherwise be a bullet.
+        if !is_thematic_break(bare) && is_marker(bare)
             in_list = true
             list_margin = margin
-        end if
+            in_paragraph = false
+        else
+            in_paragraph = leaves_paragraph_open(bare, in_paragraph)
 
         out.push(false)
 
@@ -166,6 +185,80 @@ private tab_in(text: string, margin: usize) -> Option[usize]
 
     None
 end tab_in
+
+// Whether a line of prose leaves a paragraph open below it, so that an indented line directly under
+// it continues the paragraph instead of being program text. `in_paragraph` is whether the line above
+// had left one open.
+//
+// Ordinary text does. A heading, a rule, and the underline that makes the paragraph above a heading
+// do not: each is a block complete in one line, and an indented line under one begins a code block
+// in Markdown and is program text here. A block quote is asked about what it quotes.
+private leaves_paragraph_open(bare: string, in_paragraph: bool) -> bool
+    var rest = bare.trim()
+
+    loop
+        if !rest.starts_with(">") then break
+
+        rest = rest[1..<rest.len].trim()
+
+    if rest == "" then return false
+    if is_atx_heading(rest) then return false
+    if is_thematic_break(rest) then return false
+
+    !(in_paragraph && is_setext_underline(rest))
+end leaves_paragraph_open
+
+// Whether a line is a heading written with `#`: one to six of them, then a space or the line's end.
+private is_atx_heading(bare: string) -> bool
+    val bs = bare.bytes
+    var n: usize = 0
+
+    loop
+        if n >= bs.len then break
+        if bs[n] != u8('#') then break
+
+        n += 1
+
+    if n == 0 || n > 6 then return false
+
+    n == bs.len || bs[n] == u8(' ') || bs[n] == u8('\t')
+end is_atx_heading
+
+// Whether a line is a rule across the page: three or more of one of `*`, `-` and `_`, with nothing
+// else on the line but blanks between them.
+private is_thematic_break(bare: string) -> bool
+    val bs = bare.trim().bytes
+
+    if bs.len < 3 then return false
+
+    val mark = bs[0]
+
+    if mark != u8('*') && mark != u8('-') && mark != u8('_') then return false
+
+    var marks: usize = 0
+
+    for i in 0..<bs.len
+        if bs[i] == mark
+            marks += 1
+        else if bs[i] != u8(' ') && bs[i] != u8('\t')
+            return false
+
+    marks >= 3
+end is_thematic_break
+
+// Whether a line is the underline that makes the paragraph above it a heading: nothing but `=`, or
+// nothing but `-`.
+private is_setext_underline(bare: string) -> bool
+    val bs = bare.trim().bytes
+
+    if bs.len == 0 then return false
+    if bs[0] != u8('=') && bs[0] != u8('-') then return false
+
+    for i in 0..<bs.len
+        if bs[i] != bs[0] then return false
+
+    true
+end is_setext_underline
 
 private opens_fence(bare: string) -> bool = bare.starts_with("```") || bare.starts_with("~~~")
 

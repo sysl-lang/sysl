@@ -1,0 +1,310 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, metadata, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{from_utf8_unchecked, join, replace_all, Search}
+
+// In a `.lsysl` file an indented line is program text only where Markdown would set it in a code
+// block. **An indented line directly under a line of a paragraph continues the paragraph** -- an
+// indented code block cannot interrupt one -- so it is prose, and the compiler never sees it.
+//
+// Each case asks one place an indented line can stand: what is above it decides whether it runs.
+// A line that must stay prose is written as text no compiler would accept, so a reading that
+// compiled it fails; a line that must run prints.
+//
+// Every case is driven through `sysl build` as a shell reaches it, and run; an expectation that
+// quotes a diagnostic writes the root directory as `<root>`.
+
+// What building `files` comes to: the program's output where it built, or what was said instead.
+// `entry` is the file handed to the build, or "" for the directory holding them all.
+private llc_outcome(files: []const (string, string), entry: string) -> string
+    val root = absolute_path(make_temp_dir("sysl-llc").unwrap())
+    val src = s"$root/src"
+    val exe = s"$root/built"
+
+    make_dir_all(src).unwrap()
+    write_text(s"$src/sysl.hocon", "").unwrap()
+
+    for i in 0..<files.len
+        val file = s"$src/${files[i].0}"
+
+        make_dir_all(parent_of(file).unwrap()).unwrap()
+        write_text(file, files[i].1).unwrap()
+
+    val target = if entry == "" then src else s"$src/$entry"
+    var lines: Buf[string] = buf()
+    val sink = &lines
+
+    run_cli(["sysl", "build", target, "-o", exe], (line) -> sink.push(line))
+
+    var said = join(lines.view(), "\n")
+
+    if metadata(exe).is_ok()
+        said = capture(exe, [], "", [], true) match
+            Err(_) -> "the program that was built could not be run"
+            Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+    llc_chomp(replace_all(said, src, "<root>"))
+end llc_outcome
+
+private llc_chomp(s: string) -> string = if s.ends_with("\n") then s[0..<s.bytes.len - 1] else s
+
+// The claim every case makes: these files come to `want`.
+private llc_says(files: []const (string, string), entry: string, want: string)
+    if !twp_ready() then return
+
+    assert_eq(llc_outcome(files, entry), want)
+
+// One file, built by name.
+private llc_one(text: string, want: string) = llc_says([("main.lsysl", text)], "main.lsysl", want)
+
+// The tab refusal, which every tab in an indentation gets wherever the line stands.
+private llc_tab(at: string, line: string) -> string =
+    "error: a tab in the indentation of a literate file — what makes a line program text is four " +
+    "columns of indent, and a tab is as wide as whatever happens to be displaying it, so this line is " +
+    "code in one editor and prose in another\n --> <root>/main.lsysl:" + at + "\n  |\n" + line + "\n  | ^"
+
+// ---- Under a paragraph ----
+
+@test("llc: an indented line under a line of a paragraph continues the paragraph")
+llc_an_indented_line_under_a_paragraph_is_prose()
+    llc_one("A paragraph of prose,\n    continued with an indent.\n\n    print(1)\n", "1")
+
+@test("llc: and so does every indented line under that one, however deep")
+llc_a_run_of_indented_lines_under_a_paragraph_is_prose()
+    llc_one("A paragraph of prose,\n    continued with an indent,\n        and with a deeper one,\n" +
+        "    and back with the first.\n\n    print(2)\n", "2")
+
+@test("llc: a continuation may be followed by a line at the margin and another continuation")
+llc_a_paragraph_may_weave_in_and_out()
+    llc_one("A paragraph of prose,\n    continued with an indent,\nback at the margin,\n" +
+        "    and continued with another.\n\n    print(3)\n", "3")
+
+// The statement directly under the sentence is the paragraph's second line, and only the one after
+// the blank line runs.
+@test("llc: a statement written directly under a sentence is not part of the program")
+llc_a_statement_directly_under_a_sentence_is_prose()
+    llc_one("This prints one:\n    print(1)\n\n    print(2)\n", "2")
+
+@test("llc: so a function declared directly under a sentence is not declared")
+llc_a_function_directly_under_a_sentence_is_not_declared()
+    llc_one("The helper:\n    three() -> int = 3\n\n    print(three())\n",
+        "error: undefined function 'three'\n --> <root>/main.lsysl:4:11\n  |\n4 | print(three())\n  |       ^^^^^")
+
+@test("llc: a blank line is what lets an indented line under a paragraph run")
+llc_a_blank_line_ends_the_paragraph()
+    llc_one("This prints four:\n\n    print(4)\n", "4")
+
+@test("llc: and a line holding only spaces is a blank line")
+llc_a_line_of_spaces_ends_the_paragraph()
+    llc_one("This prints five:\n  \n    print(5)\n", "5")
+
+@test("llc: prose directly under program text opens a paragraph, and an indented line under it continues it")
+llc_prose_directly_under_code_opens_a_paragraph()
+    llc_one("    val a = 6\nWhich is explained here,\n    with an indent.\n\n    print(a)\n", "6")
+
+// ---- Where no paragraph is open ----
+
+@test("llc: the first line of a file has no paragraph above it")
+llc_the_first_line_of_a_file_is_code()
+    llc_one("    print(7)\n", "7")
+
+@test("llc: a blank line inside a block of program text ends nothing")
+llc_a_blank_line_inside_a_block()
+    llc_one("A block\n\n    val a = 8\n\n    \n    print(a)\n", "8")
+
+@test("llc: a heading written with # is complete in its line, so what is indented under it runs")
+llc_under_an_atx_heading()
+    llc_one("# A heading\n    print(9)\n", "9")
+    llc_one("###### The smallest heading\n    print(9)\n", "9")
+    llc_one("#\n    print(9)\n", "9")
+end llc_under_an_atx_heading
+
+@test("llc: a # with no space after it, or seven of them, is a paragraph")
+llc_a_hash_that_is_not_a_heading()
+    llc_one("#tagged prose\n    continued with an indent.\n\n    print(10)\n", "10")
+    llc_one("####### seven is not a heading\n    continued with an indent.\n\n    print(10)\n", "10")
+end llc_a_hash_that_is_not_a_heading
+
+@test("llc: an underline makes the paragraph above it a heading, and what is indented under it runs")
+llc_under_a_setext_heading()
+    llc_one("A heading\n=========\n    print(11)\n", "11")
+    llc_one("A heading\n---------\n    print(11)\n", "11")
+    llc_one("A heading\n-\n    print(11)\n", "11")
+end llc_under_a_setext_heading
+
+// With no paragraph above them the signs are a paragraph of their own.
+@test("llc: a line of = with no paragraph above it underlines nothing")
+llc_an_equals_line_alone_is_a_paragraph()
+    llc_one("===\n    continued with an indent.\n\n    print(12)\n", "12")
+
+@test("llc: what is indented under a rule runs")
+llc_under_a_thematic_break()
+    llc_one("Above the rule.\n\n***\n    print(13)\n", "13")
+    llc_one("Above the rule.\n\n___\n    print(13)\n", "13")
+    llc_one("Above the rule.\n\n---\n    print(13)\n", "13")
+    llc_one("Above the rule.\n\n - - -\n    print(13)\n", "13")
+end llc_under_a_thematic_break
+
+// Each opens with what a bullet opens with, and neither is a list, so the block below is not an
+// example under a bullet.
+@test("llc: a rule drawn with spaced marks is a rule, not a bullet")
+llc_a_spaced_rule_is_not_a_bullet()
+    llc_one("Above the rule.\n\n* * *\n\n    print(14)\n", "14")
+    llc_one("Above the rule.\n\n- - -\n\n    print(14)\n", "14")
+end llc_a_spaced_rule_is_not_a_bullet
+
+@test("llc: what is indented under a fence's closing line runs")
+llc_under_a_closed_fence()
+    llc_one("```\nshown, not run\n```\n    print(15)\n", "15")
+
+@test("llc: a fence ends the paragraph it is written under")
+llc_a_fence_interrupts_a_paragraph()
+    llc_one("This is shown:\n```\nshown, not run\n```\n    print(16)\n", "16")
+
+// ---- Lists and quotations ----
+
+@test("llc: under a bullet an indented line was prose already, and still is")
+llc_under_a_bullet()
+    llc_one("- A bullet,\n    continued with an indent.\n\nThe end of the list.\n\n    print(17)\n", "17")
+
+@test("llc: the prose that ends a list is a paragraph like any other")
+llc_the_prose_that_ends_a_list_is_a_paragraph()
+    llc_one("- A bullet.\n\nThe end of the list,\n    continued with an indent.\n\n    print(18)\n", "18")
+
+@test("llc: an indented line under a quoted paragraph continues it")
+llc_under_a_block_quote()
+    llc_one("> A quoted paragraph,\n    continued with an indent.\n\n    print(19)\n", "19")
+
+@test("llc: a quoted heading and an empty quoted line leave no paragraph open")
+llc_under_a_quoted_heading()
+    llc_one("> # A quoted heading\n    print(20)\n", "20")
+    llc_one("> Quoted.\n>\n    print(20)\n", "20")
+end llc_under_a_quoted_heading
+
+// ---- Display mathematics ----
+
+// The finding: a formula broken across lines, its continuation aligned under the first.
+@test("llc: the continuation lines of a display formula are the paragraph the formula is")
+llc_a_display_formula_continued()
+    llc_one("The sum is\n$$ s = a\n     + \\frac{b}{2}\n     + \\frac{c}{3} $$\nas claimed.\n\n" +
+        "    print(21)\n", "21")
+
+@test("llc: the reference page's file holds the one statement the page says it does")
+llc_the_reference_pages_example()
+    llc_one("The sum of the first terms is\n$$ s = a\n     + \\frac{b}{2}\n     + \\frac{c}{3} $$\n" +
+        "which the program prints,\n    for whole numbers.\n\n    print(6 + 6 / 2 + 6 / 3)\n", "11")
+
+// `$$` is not a block of Markdown's, so a blank line inside one ends the paragraph as it does
+// anywhere, and the indented line after it is program text here and a code block in a renderer.
+@test("llc: a blank line inside a display formula ends its paragraph")
+llc_a_blank_line_inside_a_display_formula()
+    llc_one("$$ s = a\n\n    + \\frac{b}{2} $$\n",
+        "error: illegal character\n --> <root>/main.lsysl:3:7\n  |\n3 | + \\frac{b}{2} $$\n  |   ^")
+
+// ---- The forms that are refused, and line endings ----
+
+// The line would be prose whichever way the tab were measured; the refusal does not depend on what
+// the line would have been.
+@test("llc: a tab in the indentation of a continuation line is refused like any other")
+llc_a_tab_in_a_continuation_is_refused()
+    llc_one("A paragraph of prose,\n\tcontinued with a tab.\n\n    print(1)\n",
+        llc_tab("2:1", "2 | \tcontinued with a tab."))
+
+@test("llc: a file with CRLF line endings reads the same way")
+llc_crlf()
+    llc_one("A paragraph of prose,\r\n    continued with an indent.\r\n\r\n    print(22)\r\n", "22")
+    llc_one("This prints one:\r\n    print(1)\r\n\r\n    print(23)\r\n", "23")
+    llc_one("# A heading\r\n    print(24)\r\n", "24")
+end llc_crlf
+
+// ---- Every kind of file ----
+
+@test("llc: a module's file reads the same way")
+llc_a_module_file()
+    llc_says([("main.sysl", "import geom.*\n\nprint(area(3, 4))\n"),
+              ("geom/area.lsysl", "The area of a rectangle,\n    which is not a square.\n\n" +
+                  "    module geom\n\nIts sides are multiplied,\n    as they would be anywhere.\n\n" +
+                  "    area(w: int, h: int) -> int = w * h\n")], "", "12")
+
+@test("llc: a directory's literate entry file reads the same way")
+llc_an_entry_file_of_a_directory()
+    llc_says([("main.lsysl", "The entry point,\n    which is not a library.\n\n    import geom.*\n\n" +
+                  "    print(area(5, 5))\n"),
+              ("geom/area.sysl", "module geom\n\narea(w: int, h: int) -> int = w * h\n")], "", "25")
+
+// Whether `sysl test` of a directory passed. The runner writes its report to its own output, so the
+// status is what a case can ask: a test that ran and failed is a status that is not zero.
+private llc_tested(files: []const (string, string)) -> int
+    val root = absolute_path(make_temp_dir("sysl-llc-test").unwrap())
+
+    write_text(s"$root/sysl.hocon", "").unwrap()
+
+    for i in 0..<files.len
+        write_text(s"$root/${files[i].0}", files[i].1).unwrap()
+
+    val code = run_cli(["sysl", "test", root], piece -> ())
+
+    remove_dir_all(root).unwrap_or(())
+    code
+end llc_tested
+
+// A literate `@tests` file whose one test, written after a blank line, expects `twice(4)` to be `want`.
+private llc_checks(want: string) -> int =
+    llc_tested([
+        ("main.sysl", "twice(n: int) -> int = n * 2\n\nprint(twice(2))\n"),
+        ("checks.lsysl", "What is checked,\n    which is not much.\n\n    @tests\n\n" +
+            "Doubling four,\n    which gives eight.\n\n    @test(\"twice doubles\")\n" +
+            "    t_twice() = assert_eq(twice(4), " + want + ")\n")])
+
+// The continuation lines would not compile, so a passing run read them as prose; and the test is
+// run, since the same file expecting nine fails.
+@test("llc: a literate @tests file reads the same way")
+llc_a_tests_file()
+    if !twp_ready() then return
+
+    assert_eq(llc_checks("8"), 0)
+    assert(llc_checks("9") != 0, "a test after a blank line is run")
+end llc_a_tests_file
+
+// The test expects nine and would fail if it ran.
+@test("llc: a test written directly under a sentence is not a test")
+llc_a_test_directly_under_a_sentence_is_not_a_test()
+    if !twp_ready() then return
+
+    assert_eq(llc_tested([
+        ("main.sysl", "twice(n: int) -> int = n * 2\n\nprint(twice(2))\n"),
+        ("checks.lsysl", "    @tests\n\nDoubling four:\n    @test(\"twice doubles\")\n" +
+            "    t_twice() = assert_eq(twice(4), 9)\n")]), 0)
+end llc_a_test_directly_under_a_sentence_is_not_a_test
+
+// ---- The reading itself ----
+
+// Which lines of a document the one reading of the format calls program text.
+private llc_lines(text: string) -> string
+    val lines = program_lines(source_of("t.lsysl", text)).unwrap()
+    var out = ""
+
+    for is_code in lines
+        out = out + (if is_code then "c" else "p")
+
+    out
+end llc_lines
+
+@test("llc: tangle and weave are told the same thing about every line")
+llc_the_reading_marks_a_continuation_as_prose()
+    assert_eq(llc_lines("Prose,\n    continued.\n\n    code\nprose\n    continued"), "pppcpp")
+    assert_eq(llc_lines("# H\n    code\nT\n===\n    code\n***\n    code"), "pcppcpc")
+    assert_eq(llc_lines("- item\n\n    under it\n\nprose\n    continued\n\n    code"), "pppppppc")
+end llc_the_reading_marks_a_continuation_as_prose
+
+@test("llc: sysl tangle prints a continuation line as the blank line prose is")
+llc_tangle_blanks_a_continuation()
+    val out = tangle(source_of("t.lsysl", "Prose,\n    print(1)\n\n    print(2)\n")).unwrap()
+
+    assert_eq(from_utf8_unchecked(out.bytes), "\n\n\nprint(2)\n")
+end llc_tangle_blanks_a_continuation

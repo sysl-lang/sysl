@@ -70,7 +70,9 @@ functions.
 ### The four rules
 
 **Four columns is the threshold**, which is Markdown's own, so what a renderer shows as a code block
-is exactly what the compiler reads.
+is exactly what the compiler reads. That includes Markdown's one exception: **an indented line
+directly under a line of a paragraph continues the paragraph**, and is prose
+([below](#an-indented-line-under-a-paragraph-is-prose)).
 
 **Consecutive indented blocks are one block.** A paragraph between two of them ends nothing, so a
 function body may be explained a step at a time: the prose dedents to column zero and the code
@@ -84,6 +86,67 @@ fenced.
 **What is under a bullet is prose.** An indented block inside a list item belongs to that item, so a
 list may hold examples without any of them entering the program. An executable block therefore never
 sits directly under a list; a line of prose separates the two.
+
+### An indented line under a paragraph is prose
+
+**An indented block cannot interrupt a paragraph.** That is Markdown's rule for an indented code
+block, and it is the rule here: a line indented four columns or more is program text only where no
+paragraph is open above it. Directly under a line of a paragraph it is that paragraph's next line,
+however far it is indented, and so is every indented line under it until the paragraph ends.
+
+````text
+The sum of the first terms is
+$$ s = a
+     + \frac{b}{2}
+     + \frac{c}{3} $$
+which the program prints,
+    for whole numbers.
+
+    print(6 + 6 / 2 + 6 / 3)
+````
+
+Lines three, four and six of that file are indented more than four columns and none is compiled:
+each continues the paragraph begun on line one. The program is its last line.
+
+```sysl
+print(6 + 6 / 2 + 6 / 3)
+```
+
+```output
+11
+```
+
+A paragraph is open after a line of ordinary prose, at any indentation under four columns, and
+after a line that continued one. It is **not** open, so an indented line is program text:
+
+- on the first line of the file;
+- after a **blank line**, which is the usual way to write a block and the way to make sure of one;
+- after a **heading** — a line opening with one to six `#` and a space, or a paragraph underlined
+  with `=` or `-`;
+- after a **rule** (`***`, `---`, `___`, with or without spaces between the marks);
+- after the line that **closes a fence**;
+- after another line of program text.
+
+A line of prose directly under program text opens a paragraph, with no blank line needed, and an
+indented line directly under *that* continues it. A quoted line (`>`) is read as what it quotes.
+What is under a bullet stays prose by the rule above, whatever it follows.
+
+**The consequence to remember is that a statement written directly under a sentence does not run.**
+
+````text
+This prints one:
+    print(1)
+
+    print(2)
+````
+
+That file's program is `print(2)`. A renderer shows line two as the rest of the sentence, and the
+compiler reads it the same way; the blank line before `print(2)` is what makes it a block.
+`sysl tangle` shows which lines were read as the program.
+
+**`$$` is not a block of Markdown's**, so a display formula is a paragraph like any other: its
+continuation lines are prose while they follow one another directly, and a blank line inside it ends
+the paragraph, after which an indented line is program text here and a code block in a renderer.
 
 ### Source positions are preserved
 
