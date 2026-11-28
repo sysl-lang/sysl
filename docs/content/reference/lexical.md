@@ -135,10 +135,14 @@ The two halves of a literate system are named for what they do to the source. Ev
 indent, a fence that is never closed — is refused with the same diagnostic, and the program it
 prints is the program a build compiles.
 
-*`weave` is not implemented in this compiler; it reports "is not a command this compiler can carry
-out yet".*
+**`weave` reads it the same way too**: the lines it sets as sysl code are exactly the lines the
+compiler takes as program text, and a file the compiler refuses is not woven. It writes one
+self-contained HTML document for each source — to standard output, to the file `-o` names, or into
+the directory `-o` names when the path holds several — with the code coloured and the mathematics
+(`$…$`, `$$…$$`) typeset.
 
-Both are covered under the [CLI](/getting-started/cli/). Weaving needs no target, no standard module
+Both are covered under the CLI, at [`weave`](/getting-started/cli/#weave) and
+[`tangle`](/getting-started/cli/#tangle). Weaving needs no target, no standard module
 and no library, so a package's documentation can be rendered on a machine that cannot build it.
 
 ## Comments
