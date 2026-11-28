@@ -499,6 +499,87 @@ const_val_run(cx: &Analyzer, name: string, init: TExpr) -> Result[Option[TExpr],
         _ -> Ok(None)
 end const_val_run
 
+// Whether the clauses of a struct hold for a construction of it in a module initializer, every field
+// of which is constant data already (`made`, the fields as their images): the clauses are run over
+// those fields here, so the value is laid down with no check left to make when the program starts.
+//
+// **A construction the clauses do not hold for is refused**, at the construction: its fields are
+// constants, so the trap it would take when the program starts is certain. Clauses that call a
+// function nobody marked `const` are run all the same, and a value they hold for is laid down -- but
+// where they do not hold, such a call keeps its meaning, as one written in the initializer does
+// (`const_val_run`): the storage stays code, and traps when the program starts.
+//
+// **Clauses the compiler cannot run leave the storage code**, filled and checked before the program's
+// statements: ones that reach what holds a value only once the program runs. Why is kept in
+// `last_stop`, for a target that cannot run the initializer either.
+//
+// `written` is false for the zero a declaration with no initializer starts at, which is asked the
+// same question and refused nothing: a zero the clauses do not hold for traps when the program
+// starts, as it always has.
+//
+// `as_written` is the construction before its fields were made their images: a field worked out by a
+// call nobody marked keeps its meaning in the same way, so a value built over one that the clauses
+// do not hold for is left to trap at startup too.
+const_invariant_holds(cx: &Analyzer, name: string, at: Span, as_written: TExpr, made: TExpr, decl: &StructType,
+                      inv_fn: string, written: bool) -> bool
+    val kept = if written then s"'$name' is built from constants, and what keeps it code is the 'invariant' of " +
+                               s"'${decl.name()}', which is checked where the value is made"
+    else s"'$name' starts at its zero, and what keeps it code is the 'invariant' of '${decl.name()}', " +
+         "which a zero is checked against as any other value is"
+
+    if !cx.an.evaluation.ready
+        cx.an.evaluation.last_stop = kept
+        return false
+    end if
+
+    evaluate(cx.an, cx.scope, s"'$name'", TExpr(at, TStructInvCheck(made, decl, inv_fn)), no_fuse_here(cx)) match
+        EvValue(_) -> true
+        EvFail(message, trapped) ->
+            val unmarked = if trapped then clause_unmarked_call(cx.an, inv_fn) else None
+
+            if trapped && unmarked.is_some()
+                cx.an.evaluation.last_stop = s"$kept — the clauses do not hold for it, and they call " +
+                                             s"'${qualified_name(unmarked.unwrap())}', which nobody marked " +
+                                             "'const', so the check is left to trap when the program starts"
+            else if trapped && written && calls_anything(as_written) && !calls_marked(cx.an, as_written)
+                cx.an.evaluation.last_stop = s"$kept — the clauses do not hold for it, and it is built " +
+                                             "over a call nobody marked 'const', so the check is left to " +
+                                             "trap when the program starts"
+            else if trapped && written
+                cx.fault(at, message)
+            else if trapped
+                cx.an.evaluation.last_stop = s"$kept — and the zero does not satisfy it, so the check " +
+                                             "is left to trap when the program starts"
+            else
+                cx.an.evaluation.last_stop = s"$kept — $message"
+            end if
+
+            false
+        EvBroken -> false
+        EvQuiet ->
+            cx.an.evaluation.last_stop = s"$kept — its clauses read something that holds a value only " +
+                                         "once the program runs"
+            false
+end const_invariant_holds
+
+// The first function a struct's clauses call that nobody marked `const`, by the name its declaration
+// was written with.
+private clause_unmarked_call(a: &Analysis, inv_fn: string) -> Option[string]
+    val body = evaluation_body(a, inv_fn)
+
+    if body.is_none() then return None
+
+    var found: Buf[string] = buf()
+    val sink = &found
+    val f = body.unwrap()
+
+    walk_texpr(TExpr(f.span, TBlockExpr(f.body)), expr_walk(true, x -> *x.kind match
+        TCall(called, _, _, _) -> if !a.tables.const_fns.has(called) then sink.push(callee_origin(a, called))
+        _ -> ()))
+
+    if found.is_empty() then None else Some(found[0])
+end clause_unmarked_call
+
 // What an argument the compiler needs while compiling comes to, or `None` where it is not a constant --
 // a variable, a parameter, anything read only when the program runs. Nothing is reported: the form
 // asking says in its own words why it needed one.
