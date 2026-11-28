@@ -963,11 +963,6 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
     TBox(v, _) -> if views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
                                                                     "is put on the heap")
 
-    // A string outlives every frame (`carries_view`), so bytes made into one in place have left the
-    // frame at the point they became one, whatever happens to the string afterwards.
-    TStrView(v) -> if views(p, keeps, w, v).non_empty() then gets_out(p, keeps, w, v,
-        "is made into a string, which outlives the frame")
-
     // A store into a plain local keeps the value in the frame, which is no escape -- but it may keep
     // it past the statement or the scope its storage belongs to (`kept_in_local`). It is met here
     // rather than as a statement, because `if c then keep = …` stores as an `if` branch's value.
@@ -998,10 +993,18 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
         // driven right here.
         val tasked = async_callee(p, keeps, name) && !holds_span(w.driven, e.span)
 
+        // A string in the answer may be laid over the literal's own bytes, which the callee's body
+        // settles.
+        val strung = carries_string(ty)
+
         for i in 0..<args.len()
             if frames && literal_argument(args[i])
-                frame_literal(w, args[i], kept_by(p, keeps, name, i) || async_callee(p, keeps, name),
-                              s"is passed to '$name', which holds on to it")
+                if strung && !kept_by(p, keeps, name, i) && answered_by(keeps, name, i)
+                    frame_literal(w, args[i], true, s"is passed to '$name', whose answer holds on to it")
+                else
+                    frame_literal(w, args[i], kept_by(p, keeps, name, i) || async_callee(p, keeps, name),
+                                  s"is passed to '$name', which holds on to it")
+            end if
 
             if views(p, keeps, w, args[i]).non_empty() && (kept_by(p, keeps, name, i) || tasked)
                 gets_out(p, keeps, w, args[i], s"is passed to '$name', which holds on to it")
@@ -1019,12 +1022,17 @@ private escaping_one(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) 
         val all_borrowed = borrowed_through(texpr_type(recv)) &&
             (task_result(ty).is_none() || holds_span(w.driven, e.span))
         val frames = frames_literals(ty)
+        val strung = carries_string(ty)
 
         for i in 0..<args.len()
-            val borrowed = all_borrowed && !object_declares_kept(keeps.an, texpr_type(recv), slot, i + 1)
+            // **A string is not among what a trait's method is checked to borrow** (`refuse_borrowed`
+            // holds every implementation to its slices only), and which body the call reaches is not
+            // known here, so an argument holding one is kept.
+            val borrowed = all_borrowed && !object_declares_kept(keeps.an, texpr_type(recv), slot, i + 1) &&
+                !carries_string(texpr_type(args[i]))
 
             if frames && literal_argument(args[i])
-                frame_literal(w, args[i], !borrowed,
+                frame_literal(w, args[i], !borrowed || (strung && table_answers(p, keeps, slot, i + 1)),
                               "is passed through a trait object, which may hold on to it")
 
             if !borrowed && views(p, keeps, w, args[i]).non_empty()
@@ -1141,7 +1149,50 @@ literal_argument(e: TExpr) -> bool = *e.kind match
 
 // Whether a call answering `result` lets a literal argument stay in the frame: its answer can carry
 // no view, and it is not a task, which holds its arguments until it is awaited.
-frames_literals(result: Type) -> bool = !carries_view(result) && task_result(result).is_none()
+//
+// A string in the answer is the one view this does not rule out by type: only `str_alias` lays a
+// string over an argument, so the call site asks the callee's summary instead (`answered_by`).
+frames_literals(result: Type) -> bool = !carries_slice(result) && task_result(result).is_none()
+
+// Whether what `name` answers may be made of what its parameter `i` holds. A function whose body is
+// not here may answer with anything it was handed.
+private answered_by(keeps: &KeptParams, name: string, i: usize) -> bool =
+    !keeps.index.has(name) || fpa_answers_from(keeps.fx, name, i)
+
+// Whether any body a call through slot `slot` of a table can reach may answer with its parameter `i`.
+// Which trait the object is of is not asked: every table with such a slot answers, which is more
+// bodies than the call reaches and never fewer.
+private table_answers(p: TProgram, keeps: &KeptParams, slot: int, i: usize) -> bool
+    for vt in p.vtables
+        if slot >= 0 && usize(slot) < vt.slots.len() && answered_by(keeps, vt.slots[usize(slot)].target, i)
+            return true
+
+    false
+end table_answers
+
+// **What a call's answer views where the only view it can carry is a string.** A string views frame
+// storage only where `str_alias` laid it there, so the callee's summary says which arguments its
+// answer can be made of, and a conversion that copies (`from_utf8`, an interpolation) answers with
+// none of them. An answer that carries a slice views whatever any argument does, as it always did.
+private string_answer_views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, name: string,
+                            args: Buf[TExpr]) -> EView
+    var out = no_view()
+
+    for i in 0..<args.len()
+        if answered_by(keeps, name, i) then out = join_views(out, views(p, keeps, w, args[i]))
+
+    out
+end string_answer_views
+
+private table_answer_views(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, slot: int,
+                           args: Buf[TExpr]) -> EView
+    var out = no_view()
+
+    for i in 0..<args.len()
+        if table_answers(p, keeps, slot, i + 1) then out = join_views(out, views(p, keeps, w, args[i]))
+
+    out
+end table_answer_views
 
 // The verdict on one literal argument. A kept one is a buffer, and it is also a site, so that a body
 // with no allocator is told at the literal why it needs one -- exactly as a promoted array is.
@@ -1204,32 +1255,56 @@ end count_span
 
 // Whether a value of this type could carry a view of somebody's elements.
 //
-// **A `string` cannot.** It is three words over bytes in the layout and a *counted heap object* to
-// this analysis: a conversion copies into storage of its own, a literal is static, and nothing else
-// makes one. So a string outlives every frame by construction and there is nothing in it for a frame
-// to own.
-//
-// **`str_alias` is the one form that makes a string over storage it did not allocate, and it keeps
-// the answer true by being an escape site itself** (`escaping_one`): whatever frame storage its bytes
-// view is promoted where the string is made, so the string it yields views nothing a frame owns, and
-// a parameter handed to it is one its function keeps.
-carries_view(t: Type) -> bool = t match
-    Slice(_, _) -> true
-    Array(_, elem, _) -> carries_view(*elem)
-    Struct(d) -> fields_carry_view(d.fields)
-    Enum(d) -> variants_carry_view(d.variants)
+// **A `string` can, because `str_alias` lays one over bytes it did not allocate.** Every other string
+// is a counted heap object or static data -- a conversion copies into storage of its own, a literal
+// is static -- and views nothing a frame owns, so following one finds no root and costs nothing. One
+// made by `str_alias` views what its bytes viewed (`views_value`), and is followed from there exactly
+// as the slice it was made of would be: lent to a callee that only reads it, and an escape where it
+// is returned, stored, boxed or handed to a parameter that keeps it.
+carries_view(t: Type) -> bool = carries(t, true)
+
+// Whether a value of this type could carry a `[]T`, a string apart: what a trait's method is checked
+// to borrow (`refuse_borrowed`), and what a call's answer must not be for a literal argument to be
+// laid in the frame whatever the callee's body says (`frames_literals`).
+carries_slice(t: Type) -> bool = carries(t, false)
+
+// Whether a value of this type holds a string in place.
+carries_string(t: Type) -> bool = t match
+    Str -> true
+    Array(_, elem, _) -> carries_string(*elem)
+    Struct(d) -> fields_carry_string(d.fields)
+    Enum(d) ->
+        for item in d.variants
+            if fields_carry_string(item.fields) then return true
+
+        false
     _ -> false
 
-private fields_carry_view(fields: Buf[(string, Type)]) -> bool
+private fields_carry_string(fields: Buf[(string, Type)]) -> bool
     for item in fields
-        if carries_view(item.1) then return true
+        if carries_string(item.1) then return true
+
+    false
+end fields_carry_string
+
+private carries(t: Type, strings: bool) -> bool = t match
+    Slice(_, _) -> true
+    Str -> strings
+    Array(_, elem, _) -> carries(*elem, strings)
+    Struct(d) -> fields_carry_view(d.fields, strings)
+    Enum(d) -> variants_carry_view(d.variants, strings)
+    _ -> false
+
+private fields_carry_view(fields: Buf[(string, Type)], strings: bool) -> bool
+    for item in fields
+        if carries(item.1, strings) then return true
 
     false
 end fields_carry_view
 
-private variants_carry_view(vs: Buf[EnumVariant]) -> bool
+private variants_carry_view(vs: Buf[EnumVariant], strings: bool) -> bool
     for item in vs
-        if fields_carry_view(item.fields) then return true
+        if fields_carry_view(item.fields, strings) then return true
 
     false
 end variants_carry_view
@@ -1416,8 +1491,17 @@ private views_value(p: TProgram, keeps: &KeptParams, w: &EscapeWalk, e: TExpr) -
         else views(p, keeps, w, base)
 
     TLoad(name, _) -> confined_of(w, name)
-    TCall(_, args, _, _) -> join_views(any_view(p, keeps, w, args), container_bytes(p, keeps, w, e))
-    TVCall(_, _, args, _, _) -> any_view(p, keeps, w, args)
+    TCall(name, args, ty, _) ->
+        val given = if carries_slice(ty) || keeps.an.tables.externs.has(name) then any_view(p, keeps, w, args)
+        else string_answer_views(p, keeps, w, name, args)
+
+        join_views(given, container_bytes(p, keeps, w, e))
+    TVCall(recv, slot, args, ty, _) ->
+        if carries_slice(ty) || !borrowed_through(texpr_type(recv)) then any_view(p, keeps, w, args)
+        else table_answer_views(p, keeps, w, slot, args)
+
+    // Bytes made into a string in place are the same storage: the string views what they did.
+    TStrView(v) -> views(p, keeps, w, v)
     TCallPtr(_, args, _, _) -> any_view(p, keeps, w, args)
     TStructNew(_, args) -> any_view(p, keeps, w, args)
     TStructInvCheck(v, _, _) -> views(p, keeps, w, v)
@@ -2091,7 +2175,7 @@ private refuse_borrowed(a: &Analysis, p: TProgram, keeps: &KeptParams)
             // The receiver is the object itself, which is a box of its own rather than the caller's. A
             // parameter the trait declares `@keeps` may be kept: every call is held to that instead.
             for at in 1..<f.params.len()
-                if !carries_view(f.params[at].1) || !kept_by(p, keeps, slot.target, at) then continue
+                if !carries_slice(f.params[at].1) || !kept_by(p, keeps, slot.target, at) then continue
                 if table_declares_kept(a, vt, int(s), at) then continue
 
                 val pname = f.params[at].0

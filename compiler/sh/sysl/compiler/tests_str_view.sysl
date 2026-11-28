@@ -218,103 +218,57 @@ the_raw_form_takes_exactly_one_value()
 
 // -- EscapePromotionTests ---------------------------------------------------------------------------
 
-// A string outlives every frame, so bytes made into one in place have left the frame where they
-// became one -- even though the string itself is never returned or stored anywhere. The reference
-// says so in an `--explain` note this compiler has no printer for; the same escape site and its
-// reason are read here from the refusal an aligned array earns, and the move itself from the
-// lowering, which is the reference's text.
-@test("a view made into a string in place moves the array, and says why")
+// A string made in place views what its bytes viewed, so it moves the array where the string leaves
+// the frame and nowhere else (the whole table is `tests_sve_string_view_escape`). The escape site
+// and its reason are read here from the refusal an aligned array earns, and the move itself from the
+// lowering.
+@test("a view made into a string in place moves the array where the string leaves the frame")
 a_view_made_into_a_string_in_place_moves_the_array()
     if sv_no_library() then return
 
+    assert_eq(sv_refusal("first() -> string\n" +
+                         "    @align(64)\n" +
+                         "    var buf: [8]u8\n" +
+                         "    val s = str_alias(buf[0..<3])\n" +
+                         "    s\n" +
+                         "end first\n" +
+                         "print(first())\n"),
+              "this view of 'buf' is returned, so the array " +
+              "would move to the heap to outlive the frame — and 'buf' asked to begin on a 64-byte " +
+              "boundary, which is the allocator's to answer there rather than this declaration's. " +
+              "Keep the view inside the frame, or put the boundary on a struct with '@align', " +
+              "which every value of that type carries wherever its storage is")
+
+    // Read and never handed on, the string is over the frame's own bytes: the aligned array stays
+    // where it was declared, and nothing is allocated.
     assert_eq(sv_refusal("first() -> usize\n" +
                          "    @align(64)\n" +
                          "    var buf: [8]u8\n" +
                          "    val s = str_alias(buf[0..<3])\n" +
                          "    s.len\n" +
                          "end first\n" +
-                         "print(first())\n"),
-              "this view of 'buf' is made into a string, which outlives the frame, so the array " +
-              "would move to the heap to outlive the frame — and 'buf' asked to begin on a 64-byte " +
-              "boundary, which is the allocator's to answer there rather than this declaration's. " +
-              "Keep the view inside the frame, or put the boundary on a struct with '@align', " +
-              "which every value of that type carries wherever its storage is")
+                         "print(first())\n"), "")
 
-    assert_eq(sv_lowered("first() -> usize\n" +
-                         "    var buf: [8]u8\n" +
-                         "    val s = str_alias(buf[0..<3])\n" +
-                         "    s.len\n" +
-                         "end first\n" +
-                         "print(first())\n", "first"),
-              "define i64 @first$$sysl() {\n" +
-              "entry:\n" +
-              "  %buf.box = alloca ptr\n" +
-              "  %s.addr = alloca { ptr, ptr, i64 }\n" +
-              "  %t1 = getelementptr i8, ptr null, i64 1\n" +
-              "  %t2 = ptrtoint ptr %t1 to i64\n" +
-              "  %t3 = getelementptr %arc.buf.byte, ptr null, i32 0, i32 4\n" +
-              "  %t4 = ptrtoint ptr %t3 to i64\n" +
-              "  %t5 = call { i64, i1 } @llvm.umul.with.overflow.i64(i64 8, i64 %t2)\n" +
-              "  %t6 = extractvalue { i64, i1 } %t5, 0\n" +
-              "  %t7 = extractvalue { i64, i1 } %t5, 1\n" +
-              "  %t8 = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %t6, i64 %t4)\n" +
-              "  %t9 = extractvalue { i64, i1 } %t8, 0\n" +
-              "  %t10 = extractvalue { i64, i1 } %t8, 1\n" +
-              "  %t11 = or i1 %t7, %t10\n" +
-              "  %t12 = xor i1 %t11, true\n" +
-              "  br i1 %t12, label %size.ok1, label %size.bad2\n" +
-              "size.bad2:\n" +
-              "  call void @sysl.check.20.allocation_size_does_not_fit_in_usize(ptr null)\n" +
-              "  unreachable\n" +
-              "size.ok1:\n" +
-              "  %t13 = call ptr @malloc(i64 %t9)\n" +
-              "  %t14 = icmp ne ptr %t13, null\n" +
-              "  br i1 %t14, label %alloc.ok3, label %alloc.bad4\n" +
-              "alloc.bad4:\n" +
-              "  call void @sysl.check.20.out_of_memory(ptr null)\n" +
-              "  unreachable\n" +
-              "alloc.ok3:\n" +
-              "  store i64 1, ptr %t13\n" +
-              "  %t15 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 1\n" +
-              "  store ptr @arc.drop.plain, ptr %t15\n" +
-              "  %t16 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 2\n" +
-              "  store i64 1, ptr %t16\n" +
-              "  %t17 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 3\n" +
-              "  store i64 8, ptr %t17\n" +
-              "  %t18 = getelementptr %arc.buf.byte, ptr %t13, i32 0, i32 4\n" +
-              "  %buf.addr = getelementptr i8, ptr %t18, i64 0\n" +
-              "  store [8 x i8] zeroinitializer, ptr %buf.addr\n" +
-              "  store ptr %t13, ptr %buf.box\n" +
-              "  %t19 = icmp ule i64 3, 8\n" +
-              "  br i1 %t19, label %bounds.ok5, label %bounds.bad6\n" +
-              "bounds.bad6:\n" +
-              "  call void @sysl.bounds.fail(i32 1, i64 0, i64 3, i64 8, ptr @.loc0)\n" +
-              "  unreachable\n" +
-              "bounds.ok5:\n" +
-              "  %t20 = icmp ule i64 0, 3\n" +
-              "  br i1 %t20, label %bounds.ok7, label %bounds.bad8\n" +
-              "bounds.bad8:\n" +
-              "  call void @sysl.bounds.fail(i32 3, i64 0, i64 3, i64 0, ptr @.loc0)\n" +
-              "  unreachable\n" +
-              "bounds.ok7:\n" +
-              "  %t21 = getelementptr i8, ptr %buf.addr, i64 0\n" +
-              "  %t22 = sub i64 3, 0\n" +
-              "  call void @arc.retain_maybe(ptr %t13)\n" +
-              "  %t23 = insertvalue { ptr, ptr, i64 } zeroinitializer, ptr %t13, 0\n" +
-              "  %t24 = insertvalue { ptr, ptr, i64 } %t23, ptr %t21, 1\n" +
-              "  %t25 = insertvalue { ptr, ptr, i64 } %t24, i64 %t22, 2\n" +
-              "  %t26 = extractvalue { ptr, ptr, i64 } %t25, 0\n" +
-              "  store { ptr, ptr, i64 } %t25, ptr %s.addr\n" +
-              "  %t27 = extractvalue { ptr, ptr, i64 } %t25, 0\n" +
-              "  %t28 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
-              "  %t29 = extractvalue { ptr, ptr, i64 } %t28, 2\n" +
-              "  %t30 = load { ptr, ptr, i64 }, ptr %s.addr\n" +
-              "  %t31 = extractvalue { ptr, ptr, i64 } %t30, 0\n" +
-              "  call void @arc.release_maybe(ptr %t31)\n" +
-              "  %t32 = load ptr, ptr %buf.box\n" +
-              "  call void @arc.release.arr8.byte(ptr %t32)\n" +
-              "  ret i64 %t29\n" +
-              "}\n")
+    val stays = sv_lowered("first() -> usize\n" +
+                           "    var buf: [8]u8\n" +
+                           "    val s = str_alias(buf[0..<3])\n" +
+                           "    s.len\n" +
+                           "end first\n" +
+                           "print(first())\n", "first")
+
+    assert(stays.contains("define i64 @first$$sysl()"))
+    assert(!stays.contains("%buf.box"))
+    assert(!stays.contains("@malloc"))
+
+    val moves = sv_lowered("first() -> string\n" +
+                           "    var buf: [8]u8\n" +
+                           "    val s = str_alias(buf[0..<3])\n" +
+                           "    s\n" +
+                           "end first\n" +
+                           "print(first())\n", "first")
+
+    assert(moves.contains("%buf.box = alloca ptr"))
+    assert(moves.contains("call ptr @malloc("))
 end a_view_made_into_a_string_in_place_moves_the_array
 
 // -- StringRunTests: a string viewed in place over bytes -------------------------------------------
