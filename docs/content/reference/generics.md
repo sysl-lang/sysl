@@ -1192,14 +1192,21 @@ instantiations differ in what `x.area()` compiles to: a direct call in one, an i
 the table in the other. That difference is decided as for any two instantiations, by the type the
 parameter is bound to.
 
-**This works because of object safety.** A trait with a member that cannot be dispatched, such as
-one that mentions `Self` outside its receiver, has no object type *at all*, rather than an object
-missing that member. So the existence of a `&Shape` guarantees that every member of `Shape` is
-reachable through it.
+**This works because of object safety.** A trait that *requires* a member which cannot be
+dispatched, such as one that mentions `Self` outside its receiver, has no object type *at all*,
+rather than an object missing that member. So the existence of a `&Shape` guarantees that every
+member of `Shape` is reachable through it.
 
-**The one exception is a member that declares type parameters of its own**, which is left out of the
-*table* rather than out of the object ([traits](/reference/traits/#object-safety)). A bound requires
-every member, and an object reaches only what its table holds, so an object does not satisfy a bound
+**A member the trait provides is reachable without a slot.** One that declares type parameters of
+its own, or mentions `Self` away from its receiver, is not in the table, and an object reaches it as
+the trait's default body read with `Self` the object
+([traits](/reference/traits/#a-provided-member-is-read-with-self-the-object)). So it takes nothing
+from the bound: an object of a trait with a provided `map` or `fold` meets `[I: It]` exactly as one
+of a trait without them does, and the bounded body may call either.
+
+**The one exception is a *required* member that declares type parameters of its own**, which is left
+out of the *table* rather than out of the object ([traits](/reference/traits/#object-safety)) and has
+no body to be read in its place. A bound requires every member, so an object does not satisfy a bound
 on such a trait. The diagnostic names the reason, since otherwise it would read as a `&Applies`
 failing to implement `Applies`:
 

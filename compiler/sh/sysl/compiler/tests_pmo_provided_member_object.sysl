@@ -1,0 +1,629 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A member a trait PROVIDES leaves the table, not the trait** (`reference/traits.md § Object
+// safety`): one that declares type parameters of its own or names `Self` away from its receiver is
+// reached on an object as the default body read with `Self` the object, and neither stops the object
+// forming nor stops it meeting a bound on the trait. A REQUIRED member of either shape is what it
+// was.
+//
+// Axes: the trait's shape (plain, generic `It[T]`, an associated type fixed by the object, a member
+// of a required trait); the member's shape (own type parameters, a bare arrow, a boxed callable, a
+// bounded parameter, `Self` in the result only, both); its receiver (`self`, `*self`, `&self`); the
+// object (`&T`, `*T`, `&sync T`); where the call is written (the program, a body bounded by the
+// trait made real at the object, another default); what the implementation did (inherited,
+// overrode). Every program runs on the counted heap, so a share an adapter fails to give back is a
+// line on stderr and a failed test.
+//
+// Cells skipped, with the reason: a member's own bound written over `Self` (`F: Fn1[Self::Item, U]`)
+// -- what `Self` means there is another piece of work, so a bare arrow or a generic trait's `T`
+// stands in; a conditional member (`where Self: …`), which does not exist; a provided PROPERTY of
+// either shape, which keeps today's rule, a property being read and not called; the same trait
+// across two modules and a `.syslib`, the lowering being the one an inherited default already takes
+// there.
+
+private pmo_ready() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return false
+    end if
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+    end if
+
+    true
+end pmo_ready
+
+// The program built with the counted heap and run: everything it said, and whether it exited zero.
+private pmo_counted(text: string) -> (string, bool)
+    val root = make_temp_dir("sysl-pmo").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+    force_alloc_counting(true)
+
+    val built = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization,
+                                     Some(s"$root/built"))
+
+    force_alloc_counting(false)
+
+    built match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return (failure_text(why), false)
+        Ok(_) -> ()
+
+    val said = capture(s"$root/built", [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> ("could not be started", false)
+        Ok(o) -> (o.text + o.err.unwrap_or(""), o.status.ok())
+end pmo_counted
+
+// A program that runs clean and says exactly `want`.
+private pmo_says(text: string, want: string)
+    val out = pmo_counted(text)
+
+    assert(out.1, out.0)
+    assert_eq(out.0, want)
+end pmo_says
+
+// A program refused once, with `message`.
+private pmo_refused(text: string, message: string)
+    val out = pmo_counted(text)
+
+    assert(!out.1, out.0)
+    assert(out.0.contains(message), out.0)
+    assert_eq(out.0.count_of("error: "), 1)
+end pmo_refused
+
+// A generic trait whose adapters are provided members: `map` by a bare arrow, `fold` by a boxed
+// callable and a parameter of its own, `chain` by a bounded parameter, and two members a table can
+// hold beside them.
+private pmo_generic() -> string = raw"""
+    trait It[T]
+        next(*self) -> Option[T]
+
+        map[U](self, f: T -> U) -> MapIt[Self, T, U] = MapIt(self, f)
+
+        fold[A](self, init: A, f: &Fn(A, T) -> A) -> A
+            var acc = init
+            var cur = self
+            loop
+                cur.next() match
+                    Some(x) -> acc = f(acc, x)
+                    None -> break
+            acc
+        end fold
+
+        chain[J: It[T]](self, other: J) -> ChainIt[Self, J, T] = ChainIt(self, other, false, None)
+
+        label(self) -> string = "default"
+
+        tagged[U](self, u: U) -> string = "default-tagged"
+
+    struct Count
+        n: int
+        stop: int
+
+    impl It[int] for Count
+        next(*self) -> Option[int]
+            if self.n >= self.stop then return None
+            val v = self.n
+            self.n += 1
+            Some(v)
+
+        override label(self) -> string = "count"
+
+        override tagged[U](self, u: U) -> string = "count-tagged"
+
+    struct MapIt[I, X, U]
+        src: I
+        f: &Fn(X) -> U
+
+    impl[I: It[X], X, U] It[U] for MapIt[I, X, U]
+        next(*self) -> Option[U]
+            self.src.next() match
+                Some(x) -> Some(self.f(x))
+                None -> None
+
+    struct ChainIt[A, B, X]
+        a: A
+        b: B
+        second: bool
+        last: Option[X]
+
+    impl[X, A: It[X], B: It[X]] It[X] for ChainIt[A, B, X]
+        next(*self) -> Option[X]
+            if !self.second
+                self.a.next() match
+                    Some(x) -> return Some(x)
+                    None -> self.second = true
+            self.b.next()
+
+    sum[I: It[int]](it: I) -> int = it.fold(0, (a, x) -> a + x)
+
+    """
+
+// The same with the element as an associated type the object fixes, and members of each receiver.
+private pmo_assoc() -> string = raw"""
+    trait It
+        type Item
+        next(*self) -> Option[Self::Item]
+
+        map[U](self, f: Self::Item -> U) -> MapIt[Self, U] = MapIt(self, f)
+
+        fold[A](self, init: A, f: &Fn(A, Self::Item) -> A) -> A
+            var acc = init
+            var cur = self
+            loop
+                cur.next() match
+                    Some(x) -> acc = f(acc, x)
+                    None -> break
+            acc
+        end fold
+
+        count(self) -> int = self.fold(0, (n, _) -> n + 1)
+
+        drain(*self) -> int
+            var n = 0
+            loop
+                self.next() match
+                    Some(_) -> n += 1
+                    None -> break
+            n
+        end drain
+
+        twice(self) -> (Self, int) = (self, 2)
+
+        tally[U](self, unit: U) -> (int, U) = (self.fold(0, (n, _) -> n + 1), unit)
+
+        drained[U](*self, unit: U) -> (int, U) = (self.drain(), unit)
+
+    struct Count
+        n: int
+        stop: int
+
+    impl It for Count
+        type Item = int
+        next(*self) -> Option[int]
+            if self.n >= self.stop then return None
+            val v = self.n
+            self.n += 1
+            Some(v)
+
+    struct MapIt[I: It, U]
+        src: I
+        f: &Fn(I::Item) -> U
+
+    impl[I: It, U] It for MapIt[I, U]
+        type Item = U
+        next(*self) -> Option[U]
+            self.src.next() match
+                Some(x) -> Some(self.f(x))
+                None -> None
+
+    count_all[I: It](it: I) -> int
+        var n = 0
+        var cur = it
+        loop
+            cur.next() match
+                Some(_) -> n += 1
+                None -> break
+        n
+    end count_all
+
+    pick(doubled: bool) -> &It[Item = int]
+        if doubled then return Count(0, 3).map(x -> x * 2)
+        Count(0, 3)
+
+    """
+
+// -- the object forms, and reaches the member ---------------------------------------------------------
+
+@test("an adapter chain on an erased cursor of a generic trait: map, chain and fold through '&It[int]'")
+pmo_generic_chain()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        main()
+            val o: &It[int] = Count(0, 3)
+            print(o.chain(Count(10, 12)).map(x -> x + 1).fold(0, (a, x) -> a + x))
+        """, "29\n")
+
+@test("the same members through a '*It[int]' write through to the value it points at")
+pmo_generic_raw()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        main()
+            var b = Count(0, 5)
+            val r: *It[int] = &b
+            print(r.map(x -> x + 1).fold(0, (a, x) -> a + x), b.n)
+        """, "15 5\n")
+
+@test("and through a '&sync It[int]', the member's own type argument written")
+pmo_generic_sync()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        main()
+            val s: &sync It[int] = Count(0, 4)
+            print(s.map(x -> x * 3).fold[int](0, (a, x) -> a + x))
+        """, "18\n")
+
+@test("the object meets a bound on its trait, and the bounded body reaches the provided member")
+pmo_object_meets_bound()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        main()
+            val o: &It[int] = Count(0, 4)
+            val two: &It[int] = Count(5, 7)
+            print(sum(o), sum(o), sum(two.chain(two)), sum(Count(0, 3)))
+        """, "6 0 11 3\n")
+
+@test("an override is the concrete type's; through an object the default body runs, and a slotted member still dispatches")
+pmo_override_forgotten()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        main()
+            val c = Count(0, 1)
+            val e: &It[int] = Count(0, 1)
+            print(c.label(), e.label(), c.tagged(1), e.tagged(1))
+        """, "count count count-tagged default-tagged\n")
+
+@test("an associated type the object fixed: 'Self::Item' in a default is the object's")
+pmo_assoc_fixed()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_assoc() + raw"""
+        main()
+            val o: &It[Item = int] = Count(0, 4)
+            val m = o.map(x -> x * 10)
+            print(m.fold(0, (a, x) -> a + x))
+        """, "60\n")
+
+@test("an erased cursor chosen at run time is returned, folded, counted and handed to a bounded function")
+pmo_chosen_at_run_time()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_assoc() + raw"""
+        main()
+            print(pick(true).fold(0, (a, x) -> a + x), pick(false).count())
+            print(count_all(pick(true)), count_all(pick(false).map(x -> x + 1)))
+        """, "6 3\n3 3\n")
+
+@test("a provided member calling another provided member, both off the table")
+pmo_default_calls_default()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_assoc() + raw"""
+        main()
+            var b = Count(0, 5)
+            val r: *It[Item = int] = &b
+            print(r.tally("x").0, b.n)
+        """, "5 5\n")
+
+@test("a provided member a table can hold is still the implementation's, its by-value receiver a copy")
+pmo_slotted_default_dispatches()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_assoc() + raw"""
+        main()
+            var b = Count(0, 5)
+            val r: *It[Item = int] = &b
+            print(r.count(), b.n)
+        """, "5 0\n")
+
+@test("a default naming 'Self' in its result alone hands back the object")
+pmo_self_in_result()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_assoc() + raw"""
+        main()
+            val t = pick(false).twice()
+            print(t.1, t.0.count())
+        """, "2 3\n")
+
+@test("a '*self' default on an object is handed where the object is held, and calls through it")
+pmo_by_pointer_default()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_assoc() + raw"""
+        main()
+            var d: &It[Item = int] = Count(0, 6)
+            print(d.drained(1).0, d.drained(1).0)
+            var b = Count(0, 2)
+            var r: *It[Item = int] = &b
+            print(r.drained("x").0, b.n)
+        """, "6 0\n2 2\n")
+
+@test("a '*self' default on an object with no address is refused")
+pmo_by_pointer_needs_place()
+    if !pmo_ready() then return
+
+    pmo_refused(pmo_assoc() + raw"""
+        main()
+            print(pick(false).drained(1).0)
+        """, "'*self' needs a variable, field, or dereference to point at — this receiver has no address")
+
+@test("a provided member of a REQUIRED trait is reached through the requiring trait's object")
+pmo_through_requirement()
+    if !pmo_ready() then return
+
+    pmo_says(raw"""
+        trait Named
+            name(self) -> string
+
+            shout[P](self, p: P) -> string = self.name() + "!"
+
+        trait It: Named
+            next(*self) -> Option[int]
+
+            pair(self) -> (Self, Self) = (self, self)
+
+            drain(*self) -> int
+                var n = 0
+                loop
+                    self.next() match
+                        Some(_) -> n += 1
+                        None -> break
+                n
+            end drain
+
+            both[U](*self, u: U) -> (int, U) = (self.drain(), u)
+
+        struct Count
+            n: int
+            stop: int
+
+        impl Named for Count
+            name(self) -> string = "count"
+
+        impl It for Count
+            next(*self) -> Option[int]
+                if self.n >= self.stop then return None
+                val v = self.n
+                self.n += 1
+                Some(v)
+
+        reach[T: It](x: T) -> string = x.shout(1)
+
+        twice[T: It](x: T) -> int
+            val p = x.pair()
+            var a = p.0
+            var b = p.1
+            a.drain() + b.drain()
+
+        main()
+            val o: &It = Count(0, 3)
+            print(o.shout(1), reach(o), reach(Count(0, 1)))
+            print(twice(o), twice(Count(0, 2)))
+            var b = Count(0, 4)
+            val r: *It = &b
+            print(r.both("x").0, b.n)
+            var q: &It = Count(0, 2)
+            print(q.both(7).1, q.drain())
+        """, "count! count! count!\n3 4\n4 4\n7 0\n")
+
+@test("a destructor runs once through an erased adapter chain, and nothing is left on the heap")
+pmo_drops_once()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        struct Loud
+            n: int
+
+        impl Drop for Loud
+            drop(*self)
+                print("drop")
+
+        impl It[int] for Loud
+            next(*self) -> Option[int]
+                if self.n == 0 then return None
+                self.n -= 1
+                Some(self.n)
+
+        run()
+            val l: &It[int] = Loud(3)
+            val m = l.map(x -> x + 1).map(x -> x * 2)
+            print(sum(m))
+
+        main()
+            run()
+            print("end")
+        """, "12\ndrop\nend\n")
+
+// -- what is still refused ----------------------------------------------------------------------------
+
+@test("a REQUIRED member naming 'Self' away from its receiver still leaves the trait with no object")
+pmo_required_self_refused()
+    if !pmo_ready() then return
+
+    pmo_refused(raw"""
+        trait Scale
+            scale(self, k: int) -> Self
+
+            twice(self) -> (Self, Self) = (self, self)
+
+        struct P
+            v: int
+
+        impl Scale for P
+            scale(self, k: int) -> P = P(self.v * k)
+
+        main()
+            val o: &Scale = P(1)
+            print(1)
+        """, "'scale' of 'Scale' mentions 'Self' away from its receiver, and an erased value has " +
+             "forgotten which type that is — so there is no '&Scale' to form")
+
+@test("a REQUIRED member with type parameters of its own still keeps the object from a bound")
+pmo_required_generic_bound_refused()
+    if !pmo_ready() then return
+
+    pmo_refused(raw"""
+        trait Applies
+            tag(self) -> int
+            apply[U](self, f: &Fn(int) -> U) -> U
+
+            twice[U](self, u: U) -> (int, U) = (self.tag(), u)
+
+        struct N
+            v: int
+
+        impl Applies for N
+            tag(self) -> int = self.v
+            apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+
+        total[T: Applies](x: T) -> int = x.tag()
+
+        main()
+            val o: &Applies = N(3)
+            print(total(o))
+        """, "a bound promises every member and an erased value reaches only what its table holds, " +
+             "and 'apply' declares type parameters of its own")
+
+@test("and is still not callable on the object, while the provided one beside it is")
+pmo_required_generic_call_refused()
+    if !pmo_ready() then return
+
+    val text = raw"""
+        trait Applies
+            tag(self) -> int
+            apply[U](self, f: &Fn(int) -> U) -> U
+
+            twice[U](self, u: U) -> (int, U) = (self.tag(), u)
+
+        struct N
+            v: int
+
+        impl Applies for N
+            tag(self) -> int = self.v
+            apply[U](self, f: &Fn(int) -> U) -> U = f(self.v)
+
+        main()
+            val o: &Applies = N(3)
+            print(o.twice("x").0)
+        """
+
+    pmo_says(text, "3\n")
+    pmo_refused(text + "    print(o.apply(n -> n + 1))\n",
+                "'apply' of 'Applies' declares type parameters of its own, so it is not a function " +
+                "until a call names them")
+
+@test("a provided '&self' member off the table is refused at the call on an object, and runs on the value")
+pmo_by_reference_default_refused()
+    if !pmo_ready() then return
+
+    val text = raw"""
+        struct Holder[S]
+            s: &S
+
+        trait Kept
+            tag(self) -> int
+
+            keep(&self) -> Holder[Self] = Holder(self)
+
+        struct N
+            v: int
+
+        impl Kept for N
+            tag(self) -> int = self.v
+
+        main()
+            val n: &N = N(3)
+            val o: &Kept = n
+            print(n.keep().s.tag(), o.tag())
+        """
+
+    pmo_says(text, "3 3\n")
+    pmo_refused(text + "    val h = o.keep()\n",
+                "'keep' takes '&self', so it may keep a share of what it is called on, and through a " +
+                "&Kept it is the trait's own body, whose 'self' is the object — a value held in no " +
+                "counted box. Call it on the value before erasing it")
+
+// -- two things the adapters needed that were refused before ------------------------------------------
+
+@test("a projection off an object is the type the object fixed: 'I::Item' where 'I' is '&It[Item = int]'")
+pmo_projection_off_object()
+    if !pmo_ready() then return
+
+    pmo_says(raw"""
+        trait It
+            type Item
+            next(*self) -> Option[Self::Item]
+
+        struct Count
+            n: int
+            stop: int
+
+        impl It for Count
+            type Item = int
+            next(*self) -> Option[int]
+                if self.n >= self.stop then return None
+                val v = self.n
+                self.n += 1
+                Some(v)
+
+        struct MapIt[I, F, U]
+            src: I
+            f: F
+
+        impl[I: It, F: Fn1[I::Item, U], U] It for MapIt[I, F, U]
+            type Item = U
+            next(*self) -> Option[U]
+                self.src.next() match
+                    Some(x) -> Some(self.f(x))
+                    None -> None
+
+        map[I: It, R, G: Fn1[I::Item, R]](it: I, g: G) -> MapIt[I, G, R] = MapIt(it, g)
+
+        sum_all[I: It[Item = int]](it: I) -> int
+            var n = 0
+            var cur = it
+            loop
+                cur.next() match
+                    Some(v) -> n += v
+                    None -> break
+            n
+        end sum_all
+
+        through[I: It[Item = int]](p: *I) -> int
+            var n = 0
+            loop
+                p.next() match
+                    Some(v) -> n += v
+                    None -> break
+            n
+        end through
+
+        main()
+            val o: &It[Item = int] = Count(0, 4)
+            print(sum_all(map(o, x -> x * 2)))
+            var b = Count(0, 3)
+            val r: *It[Item = int] = &b
+            print(sum_all(map(r, x -> x + 1)))
+            var o2: &It[Item = int] = Count(0, 4)
+            print(through(&o2))
+        """, "12\n6\n6\n")
+
+@test("a generic block of a generic trait inherits a default taking a callable over the trait's parameter")
+pmo_inherited_callable_over_trait_parameter()
+    if !pmo_ready() then return
+
+    pmo_says(pmo_generic() + raw"""
+        main()
+            val m: MapIt[Count, int, int] = MapIt(Count(0, 3), x -> x + 1)
+            print(m.fold(0, (a, x) -> a + x), m.map(x -> x * 2).fold(0, (a, x) -> a + x))
+        """, "6 12\n")

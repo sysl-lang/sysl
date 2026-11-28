@@ -940,6 +940,12 @@ private projection_subject(cx: &Analyzer, receiver: Expr) -> Option[Type] = *rec
 call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[Expr],
             expected: Option[Type], via: Buf[string] = no_bound_traits(),
             targs: Buf[Expr] = no_written_members()) -> TExpr
+    // **An object behind one pointer is one level away, the object being the value**: a `p: *I`
+    // whose `I` is a `&It` -- a bounded body made real at an object, or a default's `*self` read
+    // with `Self` the object -- is called through as the bound said it could be.
+    if object_behind_pointer(texpr_type(receiver)) then
+        return call_member(cx, span, auto_deref(cx, receiver), name, args, expected, via, targs)
+
     val rty = receiver_type(texpr_type(receiver))
 
     if rty == Unknown then return bad_expr(span)
@@ -1020,7 +1026,7 @@ call_member(cx: &Analyzer, span: Span, receiver: TExpr, name: string, args: Buf[
         // the table -- so a call on one is an index into that table rather than a name.
         Trait(_, _, _) ->
             if downcast_named(cx, rty, name) then object_downcast(cx, span, receiver, rty, name, args, targs)
-            else call_erased(cx, span, receiver, rty, name, args, expected)
+            else call_erased(cx, span, receiver, rty, name, args, expected, targs)
         // Everything about a weak reference is behind `get()`, including whether there still is one.
         Weak(inner) -> weak_get(cx, span, receiver, *inner, name, args)
         // The operation that stops a substring holding its parent buffer alive: the bytes are copied
@@ -1546,6 +1552,7 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     // member, so a refusal reads `'Box.one'` where a member with none of its own reads the receiver.
     val subject = if cx.an.tables.members.blankets.has(base)
                   then s"'${member_home_shown(cx, base, m.name)}.${source_member_name(m.name)}'"
+                  else if is_object_home(base) then s"'${type_show(rty)}.${source_member_name(m.name)}'"
                   else s"'${qualified_name(base)}.${source_member_name(m.name)}'"
     val shown = generic_member_subject(cx, rty, receiver.is_some(), source_member_name(m.name),
                                        subject)
@@ -1602,6 +1609,23 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
 
     for i in 0..<owner_args.len()
         if i < fd.tparams.len() then seed.push(Binding(fd.tparams[i], owner_args[i]))
+
+    // **And what the trait's own parameters are at those arguments**, for a default copied out of a
+    // generic trait by a generic block: `impl[I: It[X], X, U] It[U] for MapIt[I, X, U]` makes the
+    // trait's `T` this receiver's `U`, and a callable the default takes over `T` is read at it here,
+    // before the instantiation that would otherwise be the first to say so (`self_for`).
+    val of_trait = cx.an.tables.members.selves.get(fd.name)
+
+    if of_trait.is_some()
+        var owners: Buf[Binding] = buf()
+
+        for item in seed
+            owners.push(item)
+
+        for item in of_trait.unwrap()
+            if bound_type(seed, item.name).is_none() then
+                seed.push(Binding(item.name, subst_params(cx.an, item.ty, owners)))
+    end if
 
     // **And what `Self` is at those arguments.** A default body copied out of a trait keeps the
     // trait's spelling, so a bare arrow over a projection leaves the bound it became reading
@@ -1688,8 +1712,8 @@ private call_generic_member(cx: &Analyzer, span: Span, receiver: Option[TExpr], 
     var ts: Buf[TExpr] = buf()
 
     if receiver.is_some() then
-        ts.push(as_read_only(build_receiver(cx, span, m.recv_mode().unwrap(), receiver.unwrap(),
-                                            written, m.marks.relocates),
+        ts.push(as_read_only(receiver_for(cx, span, base, m.recv_mode().unwrap(), receiver.unwrap(),
+                                          written, m.marks.relocates),
                              if params.is_empty() then Unknown else params[0].1))
 
     if receiver.is_some() && m.marks.relocates then check_ref_call(cx, span, receiver.unwrap(), m.name)
@@ -1785,7 +1809,8 @@ private member_subject(cx: &Analyzer, rty: Type, name: string) -> string =
 // member was lowered to.
 private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, base: string,
                         chosen: string, m: MethodDecl, args: Buf[Expr], expected: Option[Type],
-                        written: string, via: Buf[string] = no_bound_traits()) -> TExpr
+                        written: string, via: Buf[string] = no_bound_traits(),
+                        filed_at: Option[(string, Buf[Type])] = None) -> TExpr
     check_member_visible(cx, span, base, chosen, m, via)
 
     if !check_impl_condition(cx, span, rty, base, chosen) then return bad_expr(span)
@@ -1797,7 +1822,10 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
 
     // A frozen buffer's member is the one its count calls for (`frozen_count.sysl`).
     val routed = counted_member(cx, base, chosen, texpr_type(receiver), expected)
-    val fname = if cx.an.tables.members.blankets.has(base) then member_func_at(cx, span, rty, chosen, (base, receiver_args))
+    // `filed_at` is where the member was already found, with the arguments it is made real at -- an
+    // object's default, which no climb from the receiver's own key reaches.
+    val fname = if filed_at.is_some() then member_func_at(cx, span, rty, chosen, filed_at.unwrap())
+                else if cx.an.tables.members.blankets.has(base) then member_func_at(cx, span, rty, chosen, (base, receiver_args))
                 else member_func_name(cx, span, rty, routed)
 
     if fname == "" then return bad_expr(span)
@@ -1835,7 +1863,7 @@ private member_dispatch(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, b
     val mode = if target.is_some() && target.unwrap().recv_mode().is_some()
                then target.unwrap().recv_mode().unwrap() else m.recv_mode().unwrap()
 
-    ts.push(as_read_only(build_receiver(cx, span, mode, receiver, written, m.marks.relocates),
+    ts.push(as_read_only(receiver_for(cx, span, base, mode, receiver, written, m.marks.relocates),
                          if params.is_empty() then Unknown else params[0].1))
 
     // A `@relocates` member may move what a live `ref` stands on, whatever mode its receiver is in.
@@ -2943,7 +2971,9 @@ method_written(cx: &Analyzer, recv: Expr, name: string) -> bool
             return found.is_some() && found.unwrap().2.recv_mode().is_some()
         // `o.is[T]()` and `o.as[T]()`, the two members every trait object offers, are the only ones
         // a list may be written on: a member with type parameters of its own has no slot.
-        Trait(_, _, _) -> return downcast_named(cx, rty, name)
+        Trait(_, _, _) ->
+            return downcast_named(cx, rty, name) ||
+                   object_default(cx.an, trait_bound_of(rty), self_binding(rty), name).is_some()
         Weak(_) -> return false
         _ -> ()
 
@@ -3373,7 +3403,7 @@ private indirection_message(cx: &Analyzer, span: Span, receiver: TExpr, rty: Typ
 
 // A call through a trait object: the slot the member sits in, and the table the value carries.
 private call_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name: string,
-                    args: Buf[Expr], expected: Option[Type]) -> TExpr
+                    args: Buf[Expr], expected: Option[Type], targs: Buf[Expr]) -> TExpr
     // A callable's table and a writer's carry no `Debug` slot, and `debug` on one is answered here.
     if name == "debug" && slotless_debug(trait_bound_of(rty).name) then
         return callable_debug(cx, span, rty, args)
@@ -3381,6 +3411,14 @@ private call_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name:
     val slot = erased_slot(cx, rty, name)
 
     if slot.is_none()
+        // **A member the trait provides and no table holds is its default body, read with `Self`
+        // the object** (`object_defaults.sysl`).
+        val provided = object_default(cx.an, trait_bound_of(rty), self_binding(rty), name)
+
+        if provided.is_some() then
+            return call_object_default(cx, span, receiver, provided.unwrap().0, name, args, expected,
+                                       targs)
+
         // **A member the trait really has, that the table could not hold**, is worth saying so about
         // rather than reporting as a name the trait does not declare: the reader wrote something
         // that exists and reached it the one way that cannot work.
@@ -3404,6 +3442,61 @@ private call_erased(cx: &Analyzer, span: Span, receiver: TExpr, rty: Type, name:
 
     erased_call(cx, span, receiver, rty, slot.unwrap().0, slot.unwrap().2, m, args)
 end call_erased
+
+// The receiver a member filed under `base` is handed. **An object is its own receiver** where the
+// member is a default read with `Self` the object: `self` is the object as it stands, never what it
+// points at, so `*self` is a pointer to where the object is held and `&self` has nothing to be --
+// the object is a value of two words, in no counted box of its own.
+private receiver_for(cx: &Analyzer, span: Span, base: string, mode: RecvMode, tr: TExpr, member: string,
+                     relocates: bool) -> TExpr
+    if !is_object_home(base) then return build_receiver(cx, span, mode, tr, member, relocates)
+
+    mode match
+        ByValue -> tr
+        ByPtr ->
+            if !is_place(tr) then
+                cx.fault(span, "'*self' needs a variable, field, or dereference to point at — this " +
+                         "receiver has no address")
+
+            TExpr(span, TAddrOf(tr, Ptr(texpr_type(tr), false, false)))
+        ByRef(_) ->
+            cx.err(span, s"'$member' takes '&self', so it may keep a share of what it is called on, and " +
+                   s"through a ${type_show(texpr_type(tr))} it is the trait's own body, whose 'self' is " +
+                   "the object — a value held in no counted box. Call it on the value before erasing it")
+end receiver_for
+
+// Whether a type is a pointer to a trait object -- `*(&It)`, `*(*It)`.
+private object_behind_pointer(t: Type) -> bool = t match
+    Ptr(inner, _, _) -> erased(*inner)
+    _ -> false
+
+// `o.map(f)` on an object, where `map` is a member the trait provides and no table holds: the
+// default's lowering for objects made real at `Self` = the object's own type, then at whatever the
+// member's own parameters turn out to be. `from` is the trait that declared the member, at the
+// arguments the object's trait gives it.
+private call_object_default(cx: &Analyzer, span: Span, receiver: TExpr, from: Bound, name: string,
+                            args: Buf[Expr], expected: Option[Type], targs: Buf[Expr]) -> TExpr
+    val obj = texpr_type(receiver)
+    val base = object_home_key(from.name)
+    val decl = member_at(cx.an, base, name)
+    val generic = cx.an.tables.members.generic.get(member_key_of(base, name))
+
+    // A default whose own signature was refused where it was written has no lowering to call.
+    if decl.is_none() || generic.is_none() then return bad_expr(span)
+
+    val owner_args = object_default_args(obj, from)
+
+    if generic.unwrap().tparams.len() > owner_args.len() then
+        return call_generic_member(cx, span, Some(receiver), obj, base, decl.unwrap(), generic.unwrap(),
+                                   owner_args, args, expected, name, targs)
+
+    if !targs.is_empty() then
+        return cx.err(span, s"'$name' is not generic, so it has no type arguments to write — the " +
+                      s"call is '$name(…)'")
+
+    member_dispatch(cx, span, receiver, obj, base, name, decl.unwrap(), args, expected, name,
+                    no_bound_traits(), Some((base, owner_args)))
+end call_object_default
 
 // Whether `o.name` on a trait object is one of the two members the compiler supplies for asking
 // which type the object holds. **A member the trait declares wins**, as a user name beats a special
