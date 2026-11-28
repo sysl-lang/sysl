@@ -5114,6 +5114,140 @@ table.sysl:19:1: 'look' is not borrowed: its answer is a fresh value
 table.sysl:23:1: 'drained' answers a place of 't': t.items.walk()[_].unwrap().value, but its body may write or release what it was handed
 ```
 
+## Asking whether a reference is the only one
+
+**`r.is_unique()` answers `true` when the reference the place `r` holds is the only one to its
+object**: its count is one and no `weak` reference to it is live. The holder may then write the object
+where it lies, since nothing else can see it; where the answer is `false` it copies first. That is
+copy-on-write, and the question is every counted reference's — a `&T`, a `&sync T`, a trait object, a
+`&Frozen[T]` — unless the type declares a member of the name itself, which is then what a call
+reaches. It takes no arguments and no count.
+
+```sysl
+struct Node
+    n: int
+
+val a: &Node = Node(1)
+
+print(a.is_unique())
+
+var b = a
+
+print(a.is_unique(), b.is_unique())
+b = Node(2)
+print(a.is_unique(), b.is_unique())
+```
+
+```output
+true
+false false
+true true
+```
+
+**It is asked of a place that holds a count of its own, never of a lent value.** An argument is lent:
+the callee reads it through the count its caller holds
+([above](#passing-a-reference-to-a-call-usually-costs-nothing)), so inside a `push(self)` the count
+would read one while the caller goes on reading the same object afterwards. So a parameter, and
+anything read through one, is refused:
+
+```sysl
+struct Node
+    n: int
+
+struct Stack
+    top: &Node
+
+    push(self, x: int) -> Stack
+        if self.top.is_unique() then self.top.n = x
+
+        self
+
+var s = Stack(Node(0))
+val t = s.push(1)
+
+print(s.top.n, t.top.n)
+```
+
+```error
+'is_unique' counts the references to an object, and 'self' is a parameter, which is lent — it takes no count, so the reference its caller holds would not be counted. Ask a place that holds a count of its own: a field reached through '*self' or through a pointer to the place, or a 'var' the reference is copied into
+```
+
+The places that may be asked:
+
+- **a local** — a `val`, a `var`, a `ref`, a name a pattern or a `for` bound, a closure's capture —
+  and a field or an element reached from one;
+- **module storage**, and what is reached from it;
+- **anything reached through a `*T` or a view**, at any depth: a field through `*self`, the place a
+  `*&T` parameter points at, an element of a `Buf` or of a `[]&T`. The pointer says where the place
+  is, and the place holds its count whoever was handed the pointer. A helper that descends a tree
+  takes `slot: *&Node` and is handed `&parent.kids[i]`.
+
+A value in no place — a call's answer — is refused too. **Whether a function happens to own its
+parameter changes nothing**: that is read off its body, not its signature. A parameter copied into a
+`var` may be asked there, and the `var` is one more holder beside the caller's.
+
+**The member that writes in place is the one with a `*self` receiver.** A `(self)` member cannot ask,
+so it copies; `v = v.push(x)` through one allocates every time. Below, the first two pushes find the
+leaf held once and write it; `earlier` then holds it too, so the third copies and the fourth writes
+the copy:
+
+```sysl
+struct Leaf
+    items: [4]int
+    n: int
+
+struct Stack
+    top: &Leaf
+
+    push(*self, x: int)
+        if !self.top.is_unique()
+            self.top = Leaf(self.top.items, self.top.n)
+            print("copied")
+
+        self.top.items[self.top.n] = x
+        self.top.n += 1
+
+var s = Stack(Leaf([0; 4], 0))
+
+s.push(1)
+s.push(2)
+
+val earlier = s
+
+s.push(3)
+s.push(4)
+print(s.top.n, earlier.top.n, s.top.items[2], earlier.top.items[2])
+```
+
+```output
+copied
+4 2 3 0
+```
+
+What counts as another holder:
+
+- **Every name that holds the reference**, read again or not, for as long as it is in scope: a second
+  local, a field, an element, a kept closure's capture, a temporary until its statement ends. A local
+  asked about always holds a count of its own, so `var r = self.top` followed by `r.is_unique()`
+  answers `false` — the field and `r` are two.
+- **A `weak` reference** makes the answer `false` for as long as it lives, since `get()` could turn
+  it into a second holder.
+- **A view into the object** — a slice of an array it holds in place — owns a share of it, and makes
+  the answer `false`.
+- **A lent name does not**: an argument a callee is reading, a `ref`, a pointer into the object. A
+  `true` answer says nothing else *holds* the object, which is what makes writing it in place safe
+  for every other holder there could have been.
+
+**For a `&sync T` the count is read with an acquire load, and a `true` answer stays true**: another
+thread can take a share only from a reference it holds, and there is none. A `&sync` reference is
+never lent across threads without a count, and nothing weakens one.
+
+**Where the box lies and how the program was built change nothing.** A box laid
+[in the frame](#a-box-nothing-keeps-is-laid-in-the-frame) or in the object file answers as one on the
+heap does, and stays in the frame when it is asked; a count that would otherwise
+[not be taken](#a-count-that-would-be-taken-and-given-straight-back-is-not-taken) is taken where the
+question could see the difference, so the answer is the same at every optimization level.
+
 ## Edge cases
 
 What a compiler maintainer needs and a program rarely meets:
