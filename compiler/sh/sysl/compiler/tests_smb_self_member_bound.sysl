@@ -1,0 +1,493 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.fs.{remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.Search
+
+// **A `Self` written in a member's own type-parameter bound is the type the member belongs to**
+// (`trait_lookup.sysl`'s `bound_terms`), so a member can relate a parameter of its own to the
+// implementing type: `apply[U, F: Fn1[Self::Item, U]]` takes a callable from the implementing type's
+// `Item`. The bounded trait's own defaults still read `Self` as the parameter the bound is on -- a
+// bare `U: Add` inside a member is `Add[U, U]`.
+//
+// The cells: the bound written inline and in the member's `where`; a callable bound, a bound fixing
+// an associated type (`It[Item = Self::Item]`) and a bound taking `Self` or its projection as a
+// trait argument (`FromIt[Self::Item]`, `Conv[Self]`); a provided member and a required one, the
+// implementation repeating the trait's spelling or writing the type out; a member with a receiver
+// and an associated function; a trait's member, a generic type's own member, an inherent `impl`
+// block's and a generic `impl` block's; a call on a concrete type, through a `[I: It]`, with the list
+// written out, and with the result alone choosing the parameter; a result naming `Self` beside the
+// bounded parameter. Each refusal a wrong argument now earns is pinned, the one that compiled
+// before among them.
+//
+// Not here: an erased `&It` receiver (a provided generic member is not reachable through a trait
+// object), `where Self: Trait` and `where Self::Item: Trait` on a member, and a trait in a `--lib`
+// root, whose bounds are read by the same function in the same terms.
+
+// What a one-file program prints, or what stopped it.
+private smb_ran(text: string) -> string
+    val root = azd_temp("sysl-smb")
+
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end smb_ran
+
+// The program is refused with this message at this line and column of `main.sysl`.
+private smb_refused(text: string, message: string, at: string)
+    val out = smb_ran(text)
+
+    assert(out.index_of(s"error: $message\n").is_some(), s"expected 'error: $message', got: $out")
+    assert(out.index_of(s"main.sysl:$at\n").is_some(), s"expected it at main.sysl:$at, got: $out")
+end smb_refused
+
+private const SmbCount: string = raw"""
+    struct Count
+        n: int
+        stop: int
+
+    impl It for Count
+        type Item = int
+        next(*self) -> Option[int]
+            if self.n >= self.stop then return None
+            val v = self.n
+            self.n += 1
+            Some(v)
+
+    total[I: It[Item = int]](it: I) -> int
+        var cur = it
+        var sum = 0
+        loop
+            cur.next() match
+                Some(x) -> sum += x
+                None -> break
+        sum
+    end total
+
+    """
+
+@test("a callable bound over Self::Item, provided and required, on a type and through a bound")
+smb_callable_bound_inline()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(raw"""
+        trait It
+            type Item
+            next(*self) -> Option[Self::Item]
+
+            apply[U, F: Fn1[Self::Item, U]](self, f: F) -> Option[U]
+                var cur = self
+                cur.next() match
+                    Some(x) -> Some(f(x))
+                    None -> None
+            end apply
+
+            need[U, F: Fn1[Self::Item, U]](self, f: F) -> Option[U]
+
+        struct Count
+            n: int
+
+        impl It for Count
+            type Item = int
+            next(*self) -> Option[int] = Some(self.n)
+
+            need[U, F: Fn1[Self::Item, U]](self, f: F) -> Option[U] = Some(f(self.n + 1))
+
+        struct Words
+            w: string
+
+        impl It for Words
+            type Item = string
+            next(*self) -> Option[string] = Some(self.w)
+
+            need[U, F: Fn1[string, U]](self, f: F) -> Option[U] = Some(f(self.w + "!"))
+
+        through[I: It, U, F: Fn1[I::Item, U]](it: I, f: F) -> U = it.apply(f).unwrap()
+        needed[I: It, U, F: Fn1[I::Item, U]](it: I, f: F) -> U = it.need(f).unwrap()
+
+        main()
+            print(Count(4).apply(x -> x * 10).unwrap())
+            print(Words("ab").apply(s -> s.len).unwrap())
+            print(Count(4).need(x -> x * 10).unwrap())
+            print(Words("ab").need(s -> s.len).unwrap())
+            print(through(Count(5), x -> x + 1))
+            print(through(Words("abc"), s -> s + s))
+            print(needed(Count(5), x -> x + 1))
+            print(needed(Words("abc"), s -> s + s))
+        """), "40\n2\n50\n3\n6\nabcabc\n7\nabc!abc!\n")
+end smb_callable_bound_inline
+
+@test("the same bound written in the member's where clause")
+smb_callable_bound_where()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(raw"""
+        trait It
+            type Item
+            next(*self) -> Option[Self::Item]
+
+            apply[U, F](self, f: F) -> Option[U] where F: Fn1[Self::Item, U]
+                var cur = self
+                cur.next() match
+                    Some(x) -> Some(f(x))
+                    None -> None
+            end apply
+
+            need[U, F](self, f: F) -> Option[U] where F: Fn1[Self::Item, U]
+
+        struct Count
+            n: int
+
+        impl It for Count
+            type Item = int
+            next(*self) -> Option[int] = Some(self.n)
+
+            need[U, F](self, f: F) -> Option[U] where F: Fn1[Self::Item, U] = Some(f(self.n + 1))
+
+        through[I: It, U, F: Fn1[I::Item, U]](it: I, f: F) -> U = it.apply(f).unwrap()
+        needed[I: It, U, F: Fn1[I::Item, U]](it: I, f: F) -> U = it.need(f).unwrap()
+
+        main()
+            print(Count(4).apply(x -> x * 10).unwrap())
+            print(Count(4).need(x -> x * 10).unwrap())
+            print(through(Count(5), x -> x + 1))
+            print(needed(Count(5), x -> x + 1))
+        """), "40\n50\n6\n7\n")
+end smb_callable_bound_where
+
+@test("a result naming Self beside the parameter the bound is on")
+smb_result_names_self_and_the_parameter()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(raw"""
+        trait It
+            type Item
+            next(*self) -> Option[Self::Item]
+
+            map[U, F: Fn1[Self::Item, U]](self, f: F) -> MapIt[Self, F, U] = MapIt(self, f)
+
+        struct MapIt[I, F, U]
+            inner: I
+            f: F
+
+        impl[I: It, U, F: Fn1[I::Item, U]] It for MapIt[I, F, U]
+            type Item = U
+            next(*self) -> Option[U] = self.inner.next() match
+                Some(x) -> Some(self.f(x))
+                None -> None
+
+        """ + SmbCount + raw"""
+        doubled[I: It[Item = int]](it: I) -> int = total(it.map(x -> x * 2))
+
+        main()
+            var m = Count(0, 4).map(x -> x * 10)
+            print(m.next().unwrap(), m.next().unwrap())
+            print(total(Count(0, 4).map(x -> x + 1)))
+            print(total(Count(0, 4).map(x -> x + 1).map(x -> x * 2)))
+            print(doubled(Count(0, 4)))
+        """), "0 10\n10\n20\n12\n")
+end smb_result_names_self_and_the_parameter
+
+private const SmbChain: string = raw"""
+    trait It
+        type Item
+        next(*self) -> Option[Self::Item]
+
+        chain[J: It[Item = Self::Item]](self, other: J) -> Chain[Self, J] = Chain(self, other, false)
+
+    struct Chain[A, B]
+        a: A
+        b: B
+        second: bool
+
+    impl[A: It, B: It[Item = A::Item]] It for Chain[A, B]
+        type Item = A::Item
+        next(*self) -> Option[A::Item]
+            if !self.second
+                self.a.next() match
+                    Some(x) -> return Some(x)
+                    None -> self.second = true
+            self.b.next()
+        end next
+
+    """
+
+@test("a bound fixing the parameter's associated type to Self's")
+smb_bound_fixes_item_to_selfs()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(SmbChain + SmbCount + raw"""
+        twice[I: It[Item = int]](a: I, b: I) -> int = total(a.chain(b))
+
+        main()
+            print(total(Count(0, 3).chain(Count(10, 12))))
+            print(twice(Count(0, 3), Count(5, 7)))
+        """), "24\n14\n")
+end smb_bound_fixes_item_to_selfs
+
+// Read with `Self` as the parameter, `J: It[Item = Self::Item]` said `J`'s `Item` is `J`'s `Item`,
+// which every `J` meets, so this call compiled.
+@test("an argument whose associated type is not Self's is refused")
+smb_other_item_is_refused()
+    if !azd_ready() then return
+
+    smb_refused(raw"""
+        trait It
+            type Item
+            next(*self) -> Option[Self::Item]
+
+            pair[J: It[Item = Self::Item]](self, other: J) -> int = 1
+
+        struct Count
+            n: int
+
+        impl It for Count
+            type Item = int
+            next(*self) -> Option[int] = Some(self.n)
+
+        struct Words
+            w: string
+
+        impl It for Words
+            type Item = string
+            next(*self) -> Option[string] = Some(self.w)
+
+        main()
+            print(Count(1).pair(Words("a")))
+        """, "'Count.pair' requires its type parameter 'J' to implement 'It[Item = int]', which says " +
+             "'Item' is int, and Words supplies string for it — a bound that fixes an associated type " +
+             "is met only by a type that chose the same one", "22:20")
+end smb_other_item_is_refused
+
+@test("a bound taking Self::Item as a trait argument, the result choosing the parameter")
+smb_projection_as_a_trait_argument()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(raw"""
+        import sysl.buf.{Buf, buf}
+        import sysl.container.{List, list}
+
+        trait It
+            type Item
+            next(*self) -> Option[Self::Item]
+
+            collect[C: FromIt[Self::Item]](self) -> C = C.from_it(self)
+
+        trait FromIt[E]
+            from_it[I: It[Item = E]](it: I) -> Self
+
+        impl[T] FromIt[T] for Buf[T]
+            from_it[I: It[Item = T]](it: I) -> Buf[T]
+                var out: Buf[T] = buf()
+                var cur = it
+                loop
+                    cur.next() match
+                        Some(x) -> out.push(x)
+                        None -> break
+                out
+            end from_it
+
+        impl[T] FromIt[T] for List[T]
+            from_it[I: It[Item = T]](it: I) -> List[T]
+                var out: List[T] = list()
+                var cur = it
+                loop
+                    cur.next() match
+                        Some(x) -> out = out.prepend(x)
+                        None -> break
+                out.reverse()
+            end from_it
+
+        struct Count
+            n: int
+            stop: int
+
+        impl It for Count
+            type Item = int
+            next(*self) -> Option[int]
+                if self.n >= self.stop then return None
+                val v = self.n
+                self.n += 1
+                Some(v)
+
+        gathered[I: It[Item = int]](it: I) -> usize
+            val b: Buf[int] = it.collect()
+            b.len()
+        end gathered
+
+        main()
+            val b: Buf[int] = Count(0, 4).collect()
+            val l: List[int] = Count(5, 8).collect()
+            print(b.len(), b[3], l.len(), l.first().unwrap())
+            print(Count(0, 3).collect[Buf[int]]().len())
+            print(gathered(Count(0, 6)))
+        """), "4 3 3 5\n3\n6\n")
+end smb_projection_as_a_trait_argument
+
+@test("a generic type's own member and a generic impl block's member bound by Self")
+smb_generic_type_member()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(raw"""
+        struct Cell[T]
+            v: T
+
+            with[R, F: Fn1[Self, R]](self, f: F) -> R = f(self)
+            same[O: Like[Self]](self, o: O) -> bool = o.like(self)
+
+        trait Like[T]
+            like(self, t: T) -> bool
+
+        impl Like[Cell[int]] for int
+            like(self, t: Cell[int]) -> bool = self == t.v
+
+        trait Extra
+            each[R, F: Fn1[Self, R]](self, f: F) -> R
+
+        impl[T] Extra for Cell[T]
+            each[R, F: Fn1[Self, R]](self, f: F) -> R = f(self)
+
+        main()
+            print(Cell(3).with(c -> c.v + 1))
+            print(Cell("ab").with(c -> c.v.len))
+            print(Cell(3).same(3), Cell(3).same(4))
+            print(Cell(5).each(c -> c.v * 2))
+        """), "4\n2\ntrue false\n10\n")
+end smb_generic_type_member
+
+private const SmbTake: string = raw"""
+    struct Count
+        n: int
+
+    trait Conv[T]
+        conv(self) -> T
+
+    trait Take
+        take[C: Conv[Self]](c: C) -> Self
+
+    impl Take for Count
+        take[C: Conv[Self]](c: C) -> Count = c.conv()
+
+    """
+
+@test("Self in a bound inside an impl's member, with a receiver and without, and an inherent block")
+smb_impl_member()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(SmbTake + raw"""
+        trait Extra
+            each[R, F: Fn1[Self, R]](self, f: F) -> R
+
+        impl Extra for Count
+            each[R, F: Fn1[Self, R]](self, f: F) -> R = f(self)
+
+        impl Count
+            twice[R, F: Fn1[Self, R]](self, f: F) -> R = f(Count(self.n * 2))
+
+        impl Conv[Count] for int
+            conv(self) -> Count = Count(self)
+
+        taken[T: Take, C: Conv[T]](c: C) -> T = T.take(c)
+
+        main()
+            print(Count(4).each(c -> c.n * 2))
+            print(Count(4).twice(c -> c.n + 1))
+            print(Count.take(7).n)
+            val t: Count = taken(9)
+            print(t.n)
+        """), "8\n9\n7\n9\n")
+end smb_impl_member
+
+@test("an argument converting to something other than Self is refused at the call")
+smb_impl_member_refused()
+    if !azd_ready() then return
+
+    smb_refused(SmbTake + raw"""
+        impl Conv[int] for int
+            conv(self) -> int = self
+
+        main()
+            print(Count.take(7).n)
+        """, "'Count.take' requires its type parameter 'C' to implement 'Conv[Count]', but int does " +
+             "not — it implements 'Conv[int]'", "17:17")
+end smb_impl_member_refused
+
+@test("a bare bound inside a member still fills the trait's defaults from its own parameter")
+smb_defaults_read_the_bounded_parameter()
+    if !azd_ready() then return
+
+    assert_eq(smb_ran(raw"""
+        trait Summer
+            base(self) -> int
+
+            sum2[U: Add](self, a: U, b: U) -> U = a + b
+            same[U: Eq](self, a: U, b: U) -> bool = a == b
+
+        struct S
+            v: int
+
+        impl Summer for S
+            base(self) -> int = self.v
+
+        gen[X: Summer](x: X) -> f64 = x.sum2(1.5, 2.0)
+
+        main()
+            print(S(1).sum2(2, 3), S(1).sum2("a", "b"), S(1).same(1.5, 1.5))
+            print(gen(S(2)))
+        """), "5 ab true\n3.5\n")
+end smb_defaults_read_the_bounded_parameter
+
+private const SmbApply: string = raw"""
+    trait It
+        type Item
+        next(*self) -> Option[Self::Item]
+
+        apply[U, F: Fn1[Self::Item, U]](self, f: F) -> Option[U] = None
+
+    struct Count
+        n: int
+
+    impl It for Count
+        type Item = int
+        next(*self) -> Option[int] = Some(self.n)
+
+    """
+
+@test("a callable from another type than Self::Item is refused, said at the implementing type")
+smb_wrong_callable_refused()
+    if !azd_ready() then return
+
+    smb_refused(SmbApply + raw"""
+        main()
+            print(Count(4).apply((s: string) -> 1).is_none())
+        """, "'Count.apply' requires its type parameter 'F' to implement 'Fn1[int, int]', but a closure " +
+             "does not — it implements 'Fn1[string, int]'", "15:20")
+end smb_wrong_callable_refused
+
+@test("the same callable through a bound is refused where the generic is made real")
+smb_wrong_callable_through_a_bound_refused()
+    if !azd_ready() then return
+
+    smb_refused(SmbApply + raw"""
+        bad[I: It](it: I) -> bool = it.apply((s: string) -> 1).is_none()
+
+        main()
+            print(bad(Count(1)))
+        """, "'Count.apply' requires its type parameter 'F' to implement 'Fn1[int, int]', but a closure " +
+             "does not — it implements 'Fn1[string, int]'", "14:32")
+end smb_wrong_callable_through_a_bound_refused
