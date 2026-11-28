@@ -3244,9 +3244,10 @@ depends on exactly the erased type) and when every member:
 - **has a receiver.** An associated function has nothing to dispatch on. A property does have one, by
   value and unwritten, so a trait requiring a property is as safe to erase as one requiring a
   method.
-- **mentions `Self` only in that receiver.** A second `Self` would have to be the *same* erased type
-  as the first, which is exactly what an object does not record, and a `Self` result has no known
-  size to return.
+- **mentions `Self` only in that receiver, where the trait leaves the member to the implementation.**
+  A second `Self` would have to be the *same* erased type as the first, which is exactly what an
+  object does not record, and a `Self` result has no known size to return. A member the trait
+  *provides* is another matter, [described below](#a-provided-member-is-read-with-self-the-object).
 - **does not take `&self`, for a `*Trait` only.** `&self` requires its receiver inside a box, and a
   raw object points directly at a value. A `&Trait` carries a box, so it accepts such a member.
 - **takes no `...`.** A call to a variadic names the callee's *whole* function type, because that is
@@ -3329,7 +3330,8 @@ print(reach(N(4)))
 
 Of the three ways to reach that member, only one is closed. On the value it is an ordinary call; a
 bound solves the member's own parameters at the instantiation, as `reach` does; the object cannot
-reach it, because it dispatches through a table:
+reach it, because it dispatches through a table and `apply` is **required** — the trait left its
+body to an implementation the object has forgotten:
 
 ```sysl
 trait Applies
@@ -3352,21 +3354,96 @@ print(o.apply(n -> s"<${n}>"))
 'apply' of 'Applies' declares type parameters of its own, so it is not a function until a call names them
 ```
 
-**The consequence for bounds**: an object does not satisfy a bound on such a trait, because a bound
-requires every member and the object reaches only its table
+**The consequence for bounds**: an object does not satisfy a bound on a trait that *requires* such a
+member, because a bound requires every member and the object has no way to reach that one
 ([generics](/reference/generics/#a-trait-object-satisfies-a-bound-on-the-trait-it-dispatches-through)).
 That is the one exception to an otherwise universal rule, and it is described there.
-
-**This is what lets a trait carry a `map`.** A member choosing its own result type is what makes
-[`sysl.seq`](/library/seq/) possible (`map[U]` names `U` at the call and nowhere else), and the cost
-is a member no object dispatches, borne only by traits that declare one.
 
 **A bare-arrow callable is the same case in different syntax**, and the most common one in traits.
 `f: T -> U` is shorthand for a type parameter bounded by `Fn(T) -> U`
 ([types](/reference/types/#function-types)), so a member written that way declares a type parameter
-and loses its slot. `sysl.seq` makes that trade deliberately: nothing is boxed at any call into it,
-and `&Sequence[int]` dispatches none of its members. The boxed form keeps the slot, so a trait meant
-to be erased uses it.
+and has no slot. The boxed form keeps the slot, so a *required* member meant to be called on an
+object uses it.
+
+#### A provided member is read with `Self` the object
+
+A member the trait **provides** — one with a default body — needs no slot at all. Its body is the
+trait's own, written against nothing but what the trait declares, and an object answers all of that
+through its table. So a provided member that declares type parameters of its own, or mentions `Self`
+away from its receiver, **leaves the table and stops nothing**: the object still forms, still meets a
+bound on the trait, and a call of the member on it is the default body read with `Self` standing for
+the object's own type. What the body asks of `self` dispatches through the table as any call on an
+object does.
+
+```sysl
+trait It[T]
+    next(*self) -> Option[T]
+
+    map[U](self, f: T -> U) -> Mapped[Self, T, U] = Mapped(self, f)
+
+    fold[A](self, init: A, f: &Fn(A, T) -> A) -> A
+        var acc = init
+        var cur = self
+        loop
+            cur.next() match
+                Some(x) -> acc = f(acc, x)
+                None -> break
+        acc
+    end fold
+
+struct Count
+    n: int
+    stop: int
+
+impl It[int] for Count
+    next(*self) -> Option[int]
+        if self.n >= self.stop then return None
+        val v = self.n
+        self.n += 1
+        Some(v)
+
+struct Mapped[I, X, U]
+    src: I
+    f: &Fn(X) -> U
+
+impl[I: It[X], X, U] It[U] for Mapped[I, X, U]
+    next(*self) -> Option[U]
+        self.src.next() match
+            Some(x) -> Some(self.f(x))
+            None -> None
+
+total[I: It[int]](it: I) -> int = it.fold(0, (a, x) -> a + x)
+
+pick(wide: bool) -> &It[int]
+    if wide then return Count(0, 5)
+    Count(0, 3)
+
+print(pick(false).map(x -> x * 10).fold(0, (a, x) -> a + x))
+print(total(pick(true)))
+```
+
+```output
+30
+10
+```
+
+`pick(false).map(…)` is a `Mapped[&It[int], int, int]`: `Self` in the result is the object, held by
+value as two words, and its `next` reaches the cursor behind it through the table. `total` takes the
+object where it takes a `Count`, because nothing in the bound is out of the object's reach.
+
+**The receiver is the object itself, in the mode the member wrote.** `self` is the object as it
+stands; `*self` is a pointer to where the object is held, so the call needs a place and a call
+through it reaches the object; `&self` asks for a counted box of its own, which an object — a value —
+is not in, so such a member is called on the value before it is erased.
+
+**Through an object it is always the trait's body.** An `impl` that overrides such a member is used
+wherever the concrete type is known, and an object has forgotten which type that is, so a call
+through one runs the default — an override may be faster than the default, and must not mean
+something else.
+
+**This is what lets a trait carry a `map`.** A member choosing its own result type is what makes
+[`sysl.seq`](/library/seq/) possible (`map[U]` names `U` at the call and nowhere else), and it costs
+an erased value nothing: the adapter is built around the object.
 
 ### Forming and using one
 

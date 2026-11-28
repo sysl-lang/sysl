@@ -803,9 +803,10 @@ slotted_members(a: &Analysis, b: Bound, self_bind: Buf[Binding]) -> Buf[(Bound, 
     val all = trait_members(a, b, self_bind)
     val dbg = library_key("Debug")
     var shown = b.name == dbg || slotless_debug(b.name)
+    val settled = closure_assocs(a, trait_closure(a, b, self_bind))
 
     for item in all
-        if item.1.tparams.is_empty() then out.push(item)
+        if item.1.tparams.is_empty() && !off_table_default(item.1, settled) then out.push(item)
         if item.0.name == dbg then shown = true
 
     if !shown
@@ -825,16 +826,32 @@ end slotted_members
 // writer's table would put a `Debug` of every sink into every program that writes to one.
 slotless_debug(name: string) -> bool = fn_is_call(name) || name == library_key("Writer")
 
-// Whether a trait has a member no table can hold, which is what stops an **object** standing at a
-// bound on it: the members a bound licenses would then be more than the table can reach.
+// Whether a trait has a member an object cannot reach at all, which is what stops an **object**
+// standing at a bound on it: the members a bound licenses would then be more than the object answers.
+// That is a REQUIRED member declaring type parameters of its own -- no slot can hold it and there is
+// no body to read in its place. A provided one is reached as its default body (`off_table_default`).
 has_unslotted_member(a: &Analysis, b: Bound) -> bool
     val all = trait_members(a, b, buf())
 
     for item in all
-        if !item.1.tparams.is_empty() then return true
+        if unreachable_erased(item.1) then return true
 
     false
 end has_unslotted_member
+
+// A member with type parameters of its own and no body: nothing an object could call.
+unreachable_erased(m: MethodDecl) -> bool = !m.tparams.is_empty() && !off_table_default(m, buf())
+
+// The provided member of that name an object reaches as its default body, with the bound of the
+// trait that declared it as the object's own arguments read it.
+object_default(a: &Analysis, b: Bound, self_bind: Buf[Binding], name: string) -> Option[(Bound, MethodDecl)]
+    val settled = closure_assocs(a, trait_closure(a, b, self_bind))
+
+    for item in trait_members(a, b, self_bind)
+        if item.1.name == name && off_table_default(item.1, settled) then return Some(item)
+
+    None
+end object_default
 
 // -- whether a type implements a trait --------------------------------------------------------------
 
@@ -1602,7 +1619,7 @@ private erased_shortfall(a: &Analysis, tr: Bound, t: Type) -> Option[string]
     val all = trait_members(a, tr, buf())
 
     for item in all
-        if !item.1.tparams.is_empty()
+        if unreachable_erased(item.1)
             return Some("a bound promises every member and an erased value reaches only what its " +
                         s"table holds, and '${item.1.name}' declares type parameters of its " +
                         "own, so it has no slot to be reached through. Call it on the value before " +
