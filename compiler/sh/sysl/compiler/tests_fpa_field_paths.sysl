@@ -665,19 +665,36 @@ private fpa_with_library_after(head: string, text: string) -> Option[&Fpa]
     Some(fpa_analyze(done.an, program_of(done, "").funcs))
 end fpa_with_library_after
 
-@test("bytes made into a string in place are kept: a string outlives every frame")
+@test("bytes made into a string in place are answered, and kept only where the string is")
 fpa_str_alias_keeps()
-    val got = fpa_with_library_after("import sysl.raw.str_alias\n\n",
+    val got = fpa_with_library_after("import sysl.raw.{str_alias, str_cast}\n\n",
+                                     "var held_text = \"\"\n\n" +
                                      "view(b: []u8) -> string = str_alias(b)\n\nhand_on(b: []u8) -> string = view(b)\n\n" +
+                                     "stash(b: []u8)\n    held_text = str_alias(b)\n\n" +
+                                     "reads(s: string) -> usize = s.len\n\n" +
+                                     "stows(s: string)\n    held_text = s\n\n" +
+                                     "cuts(s: string)\n    held_text = s[0..<1]\n\n" +
+                                     "joins(s: string)\n    held_text = s + \"!\"\n\n" +
+                                     "copies(b: []u8) -> string = str_cast(b)\n\n" +
                                      "main()\n    var a: [2]u8 = [111, 107]\n    spare = int(view(a[..]).len)\n")
 
     if got.is_none() then return
 
     val fx = got.unwrap()
 
-    assert_eq(fpa_kept_text(fx, "view", 0), "ε")
-    assert_eq(fpa_kept_text(fx, "hand_on", 0), "ε")
-    assert(fpa_lets_out_whole(fx, "view", 0))
+    assert_eq(fpa_kept_text(fx, "view", 0), "")
+    assert_eq(fpa_kept_text(fx, "hand_on", 0), "")
+    assert(!fpa_lets_out_whole(fx, "view", 0))
+    assert(fpa_answers_from(fx, "view", 0))
+    assert(fpa_answers_from(fx, "hand_on", 0))
+    assert(fpa_lets_out_whole(fx, "stash", 0))
+    assert(!fpa_lets_out_whole(fx, "reads", 0))
+    assert(!fpa_answers_from(fx, "reads", 0))
+    assert(fpa_lets_out_whole(fx, "stows", 0))
+    assert(fpa_lets_out_whole(fx, "cuts", 0))
+    assert(!fpa_lets_out_whole(fx, "joins", 0))
+    assert(!fpa_lets_out_whole(fx, "copies", 0))
+    assert(!fpa_answers_from(fx, "copies", 0))
 
 @test("a call through a '&Fn' answers with an argument only where its answer's type can hold it")
 fpa_m35_callable()

@@ -1,0 +1,650 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A string laid over bytes with `str_alias` is a view of them, and is followed as one**
+// (`reference/strings.md § A string that shares a buffer`, `escape.sysl`'s `carries_view`): lent to a
+// callee whose body only reads it, and an escape -- a promotion of the array, or a refusal where
+// there is nothing to move it into -- where the string is returned, stored, boxed, captured, or
+// handed to a parameter that keeps it.
+//
+// The table is callee shape by verdict, every accepted cell beside the one that must not be:
+//
+// | the callee                              | lent (array stays)   | kept (array moves)            |
+// |-----------------------------------------|----------------------|-------------------------------|
+// | reads `.len` / walks `.bytes` / compares| `acc_len/walk/same`  | `ref_store` (a field)         |
+// | answers the string                      | `acc_gives` (read)   | `ref_gives`, `ref_ret`        |
+// | a buffer                                |                      | `ref_push`, `ref_stdpush`     |
+// | a closure                               |                      | `ref_later`, `ref_closure`    |
+// | hands it on                             | `acc_onward`         | `ref_onward`                  |
+// | generic                                 | `acc_pick`           | `ref_pick`                    |
+// | a method                                | `acc_method`         | `ref_method`                  |
+// | calls itself                            | `acc_rec`            | `ref_rec`                     |
+// | the standard library's                  | `acc_std`            | `ref_stdpush`                 |
+// | made of a `[]u8` parameter one frame up | `acc_over`           | `ref_over`                    |
+// | a cut of it                             | `acc_local`          | `ref_cut`, `ref_local`        |
+// | interpolated (a copy)                   | `acc_join`           |                               |
+// | its `.bytes`                            | `acc_walk`           | `ref_bytes`                   |
+// | in a struct / an `Option`               | `acc_some`           | `ref_field`, `ref_some`       |
+// | a local of an outer block               | `acc_block`          | `ref_block`                   |
+// | module storage                          |                      | `ref_global`                  |
+// | no body in sight: a trait object, `&Fn` |                      | `ref_table`, `ref_fn`         |
+//
+// each under `@no_alloc` and without, and the run at the default level and optimized.
+//
+// Skipped: an `extern` handed a string -- a `string` is not a type C has, so no `extern` takes one;
+// a string crossing a thread -- a `&sync Fn` may not capture a `string` at all.
+
+private var sve_library_cache: Buf[Program] = buf()
+private var sve_library_read: bool = false
+
+private sve_library() -> Buf[Program]
+    if sve_library_read then return sve_library_cache
+
+    sve_library_read = true
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, host_target()) match
+            Err(_) -> ()
+            Ok(units) -> sve_library_cache = units
+
+    sve_library_cache
+end sve_library
+
+private sve_no_library() -> bool
+    if sve_library().is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end sve_no_library
+
+// The arrays the program's bodies move to the heap, in the order the bodies are written, or
+// `refused: ` and the first refusal.
+private sve_moved(text: string) -> string
+    val parsed = parse(source_of("test.sysl", text))
+
+    if !parsed.ok() then return "refused: " + parsed.report.at(0).message
+
+    var units: Buf[Program] = buf()
+
+    for item in sve_library()
+        units.push(item)
+
+    units.push(parsed.program)
+
+    val done = analyze_bodies(units, host_target())
+
+    if !done.reported.is_empty() then return "refused: " + done.reported[0].diag.message
+
+    val moved = post_analysis_checks(done.an, program_of(done, ""), buf())
+    val said = errors_of(done.an.diagnostics())
+
+    if !said.is_empty() then return "refused: " + said[0].diag.message
+
+    var out = ""
+
+    for item in moved.by_func
+        for name in item.1
+            if name.starts_with("acc_") || name.starts_with("ref_")
+                out = if out == "" then name else out + " " + name
+
+    out
+end sve_moved
+
+// What a program prints, built and run at the level named.
+private sve_ran(text: string, level: string) -> string
+    val root = make_temp_dir("sysl-sve").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(s"$root/main.sysl", None, None, level, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end sve_ran
+
+// The callees of the table. `mark` is written above each function that reads and allocates nothing,
+// so one text serves with `@no_alloc` and without.
+private sve_callees(mark: string) -> string = s"""
+    import sysl.raw.str_alias
+    import sysl.buf.{Buf, buf}
+
+    struct Holder
+        s: string
+
+    var kept_text = ""
+
+    $mark
+    reads(s: string) -> usize = s.len
+
+    $mark
+    walks(s: string) -> usize
+        var n: usize = 0
+
+        for c in s.bytes
+            if c == 104 then n += 1
+
+        n
+    end walks
+
+    $mark
+    same(s: string) -> bool = s == "h" || s.starts_with("x")
+
+    stores(h: &Holder, s: string) = h.s = s
+
+    $mark
+    gives(s: string) -> string = s
+
+    pushes(xs: Buf[string], s: string) = xs.push(s)
+
+    later(s: string) -> &Fn() -> usize = () -> s.len
+
+    onward_keep(h: &Holder, s: string) = stores(h, s)
+
+    $mark
+    onward_read(s: string) -> usize = reads(s) + walks(s)
+
+    $mark
+    pick[T](x: T, y: T) -> T = x
+
+    $mark
+    count_down(s: string, n: int) -> usize = if n == 0 then s.len else count_down(s, n - 1)
+
+    sink_down(h: &Holder, s: string, n: int)
+        if n == 0 then h.s = s else sink_down(h, s, n - 1)
+
+    cuts(s: string) = kept_text = s[0..<1]
+
+    $mark
+    over(b: []u8) -> usize = reads(str_alias(b))
+
+    over_keep(b: []u8) = kept_text = str_alias(b)
+
+    trait Reader
+        look(self, s: string) -> usize
+
+    struct Plain
+        n: usize
+
+        $mark
+        add(self, s: string) -> usize = self.n + s.len
+
+    impl Reader for Plain
+        look(self, s: string) -> usize = s.len
+
+    struct Shelf
+        s: string
+
+        hold(*self, s: string) = self.s = s
+
+    over_hold(sh: *Shelf, b: []u8) = sh.s = str_alias(b)
+
+    cut_hold(sh: *Shelf, s: string) = sh.s = s[0..<1]
+
+    apply(f: &Fn(string) -> usize, s: string) -> usize = f(s)
+
+    """
+
+// The frames that only lend the string: every array stays where it was declared.
+private sve_lent(mark: string) -> string = s"""
+    $mark
+    acc_len() -> usize
+        var acc_len_a: [8]u8
+        reads(str_alias(acc_len_a[0..<1]))
+    end acc_len
+
+    $mark
+    acc_walk() -> usize
+        var acc_walk_a: [8]u8
+        acc_walk_a[0] = 104
+        walks(str_alias(acc_walk_a[0..<1]))
+    end acc_walk
+
+    $mark
+    acc_same() -> bool
+        var acc_same_a: [8]u8
+        acc_same_a[0] = 104
+        same(str_alias(acc_same_a[0..<1]))
+    end acc_same
+
+    $mark
+    acc_gives() -> usize
+        var acc_gives_a: [8]u8
+        gives(str_alias(acc_gives_a[0..<1])).len
+    end acc_gives
+
+    $mark
+    acc_onward() -> usize
+        var acc_onward_a: [8]u8
+        acc_onward_a[0] = 104
+        onward_read(str_alias(acc_onward_a[0..<1]))
+    end acc_onward
+
+    $mark
+    acc_pick() -> usize
+        var acc_pick_a: [8]u8
+        pick(str_alias(acc_pick_a[0..<1]), "z").len
+    end acc_pick
+
+    $mark
+    acc_rec() -> usize
+        var acc_rec_a: [8]u8
+        count_down(str_alias(acc_rec_a[0..<1]), 3)
+    end acc_rec
+
+    $mark
+    acc_over() -> usize
+        var acc_over_a: [8]u8
+        over(acc_over_a[0..<1])
+    end acc_over
+
+    $mark
+    acc_local() -> usize
+        var acc_local_a: [8]u8
+        val s = str_alias(acc_local_a[0..<2])
+        val t = s[0..<1]
+        t.len + s.len
+    end acc_local
+
+    $mark
+    acc_std() -> bool
+        var acc_std_a: [8]u8
+        acc_std_a[1] = 122
+        val s = str_alias(acc_std_a[0..<2])
+        s.contains("q") || s.ends_with("z")
+    end acc_std
+
+    $mark
+    acc_method() -> usize
+        var acc_method_a: [8]u8
+        Plain(1).add(str_alias(acc_method_a[0..<1]))
+    end acc_method
+
+    $mark
+    acc_block() -> usize
+        var n: usize = 0
+
+        for i in 0..<3
+            var acc_block_a: [8]u8
+            val s = str_alias(acc_block_a[0..<2])
+            n += s.len + usize(i)
+
+        n
+    end acc_block
+
+    $mark
+    acc_some() -> usize
+        var acc_some_a: [8]u8
+        val o = Some(str_alias(acc_some_a[0..<2]))
+
+        o match
+            Some(s) -> s.len
+            None -> 0
+    end acc_some
+
+    """
+
+// Interpolating copies the bytes, so the array stays; the copy is an allocation of its own, which
+// keeps this frame out of the `@no_alloc` text.
+private sve_join() -> string = raw"""
+    joins(s: string) = kept_text = s"$s!"
+
+    acc_join()
+        var acc_join_a: [8]u8
+        acc_join_a[0] = 104
+        acc_join_a[1] = 105
+        joins(str_alias(acc_join_a[0..<2]))
+    end acc_join
+
+    """
+
+private sve_lent_calls() -> string = raw"""
+    print(acc_len(), acc_walk(), acc_same(), acc_gives(), acc_onward(), acc_pick(), acc_rec())
+    print(acc_over(), acc_local(), acc_std(), acc_method(), acc_block(), acc_some())
+    """
+
+// The frames whose string outlives them, in the order `sve_kept_names` lists their arrays.
+private sve_kept() -> string = raw"""
+    ref_store(h: &Holder)
+        var ref_store_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        stores(h, str_alias(ref_store_a[0..<2]))
+    end ref_store
+
+    ref_gives() -> string
+        var ref_gives_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        gives(str_alias(ref_gives_a[0..<2]))
+    end ref_gives
+
+    ref_ret() -> string
+        var ref_ret_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        str_alias(ref_ret_a[0..<2])
+    end ref_ret
+
+    ref_push(xs: Buf[string])
+        var ref_push_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        pushes(xs, str_alias(ref_push_a[0..<2]))
+    end ref_push
+
+    ref_stdpush(xs: Buf[string])
+        var ref_stdpush_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        xs.push(str_alias(ref_stdpush_a[0..<2]))
+    end ref_stdpush
+
+    ref_later() -> &Fn() -> usize
+        var ref_later_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        later(str_alias(ref_later_a[0..<2]))
+    end ref_later
+
+    ref_closure() -> &Fn() -> string
+        var ref_closure_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        val s = str_alias(ref_closure_a[0..<2])
+        () -> s
+    end ref_closure
+
+    ref_onward(h: &Holder)
+        var ref_onward_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        onward_keep(h, str_alias(ref_onward_a[0..<2]))
+    end ref_onward
+
+    ref_pick() -> string
+        var ref_pick_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        pick(str_alias(ref_pick_a[0..<2]), "z")
+    end ref_pick
+
+    ref_method(sh: *Shelf)
+        var ref_method_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        sh.hold(str_alias(ref_method_a[0..<2]))
+    end ref_method
+
+    ref_rec(h: &Holder)
+        var ref_rec_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        sink_down(h, str_alias(ref_rec_a[0..<2]), 3)
+    end ref_rec
+
+    ref_over()
+        var ref_over_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        over_keep(ref_over_a[0..<2])
+    end ref_over
+
+    ref_cut()
+        var ref_cut_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        cuts(str_alias(ref_cut_a[0..<2]))
+    end ref_cut
+
+    ref_local() -> string
+        var ref_local_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        val s = str_alias(ref_local_a[0..<2])
+        val t = s[0..<1]
+        t
+    end ref_local
+
+    ref_bytes() -> []const u8
+        var ref_bytes_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        val s = str_alias(ref_bytes_a[0..<2])
+        s.bytes
+    end ref_bytes
+
+    ref_field() -> Holder
+        var ref_field_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        Holder(str_alias(ref_field_a[0..<2]))
+    end ref_field
+
+    ref_some() -> Option[string]
+        var ref_some_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        Some(str_alias(ref_some_a[0..<2]))
+    end ref_some
+
+    ref_block() -> string
+        var keep = ""
+
+        for i in 0..<3
+            var ref_block_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+            keep = str_alias(ref_block_a[0..<2])
+
+        keep
+    end ref_block
+
+    ref_global()
+        var ref_global_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        kept_text = str_alias(ref_global_a[0..<2])
+    end ref_global
+
+    ref_table(r: &Reader) -> usize
+        var ref_table_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        r.look(str_alias(ref_table_a[0..<2]))
+    end ref_table
+
+    ref_fn() -> usize
+        var ref_fn_a: [8]u8 = [111, 107, 0, 0, 0, 0, 0, 0]
+        apply(s -> s.len, str_alias(ref_fn_a[0..<2]))
+    end ref_fn
+
+    // Frames as deep as the ones that returned, written over: a string left pointing into one of
+    // them reads these bytes instead of its own.
+    deeper(n: int) -> int
+        var pad: [64]u8 = [33; 64]
+        if n == 0 then int(pad[0]) else deeper(n - 1) + int(pad[1]) - 33
+    end deeper
+
+    val h1: &Holder = Holder("")
+    val h2: &Holder = Holder("")
+    val h3: &Holder = Holder("")
+    var xs: Buf[string] = buf()
+    var shelf = Shelf("")
+
+    ref_store(h1)
+    ref_onward(h2)
+    ref_rec(h3)
+    ref_push(xs)
+    ref_stdpush(xs)
+    ref_method(&shelf)
+
+    val given = ref_gives()
+    val made = ref_ret()
+    val count = ref_later()
+    val again = ref_closure()
+    val picked = ref_pick()
+    val cut = ref_local()
+    val octets = ref_bytes()
+    val field = ref_field()
+    val opt = ref_some()
+    val blocked = ref_block()
+
+    print(deeper(8), h1.s, h2.s, h3.s, xs[0], xs[1], shelf.s)
+    print(given, made, count(), again(), picked, cut, octets.len, octets[0], field.s, opt.unwrap(), blocked)
+    ref_over()
+    print(deeper(8), kept_text)
+    ref_cut()
+    print(deeper(8), kept_text)
+    ref_global()
+    print(deeper(8), kept_text, ref_table(Plain(1)), ref_fn())
+    """
+
+private sve_kept_names() -> []string =
+    ["ref_store_a", "ref_gives_a", "ref_ret_a", "ref_push_a", "ref_stdpush_a", "ref_later_a",
+     "ref_closure_a", "ref_onward_a", "ref_pick_a", "ref_method_a", "ref_rec_a", "ref_over_a",
+     "ref_cut_a", "ref_local_a", "ref_bytes_a", "ref_field_a", "ref_some_a", "ref_block_a",
+     "ref_global_a", "ref_table_a", "ref_fn_a"]
+
+// How many names a list written with single spaces holds.
+private sve_count(names: string) -> usize
+    if names == "" then return 0
+
+    var n: usize = 1
+
+    for c in names.bytes
+        if c == 32 then n += 1
+
+    n
+end sve_count
+
+private sve_kept_prints() -> string =
+    "33 ok ok ok ok ok ok\n" +
+    "ok ok 2 ok ok o 2 111 ok ok ok\n" +
+    "33 ok\n" +
+    "33 o\n" +
+    "33 ok 2 2\n"
+
+// One frame of the kept half under `@no_alloc`, with what it is refused for: `how` is the escape,
+// in the words the report of a promotion uses.
+private sve_no_alloc_refusal(frame: string, params: string, body: string, call: string, how: string)
+    if sve_no_library() then return
+
+    val name = s"ref_${frame}_a"
+
+    assert_eq(sve_moved(sve_callees("") + s"@no_alloc\nref_$frame($params)\n    var $name: [8]u8\n$body\n\n$call\n"),
+              s"refused: this view of '$name' $how, so the array would move to the heap to outlive " +
+              s"the frame — and 'ref_$frame' declared '@no_alloc', so there is nothing to move it " +
+              "into. Keep the view inside the frame, or take the storage from a caller as a '[]T' " +
+              "parameter, which is already wherever its owner put it")
+end sve_no_alloc_refusal
+
+@test("sve a string over the frame's bytes lent to callees that only read it moves no array")
+sve_lent_moves_nothing()
+    if sve_no_library() then return
+
+    assert_eq(sve_moved(sve_callees("") + sve_lent("") + sve_join() + sve_lent_calls() + "acc_join()\n"), "")
+end sve_lent_moves_nothing
+
+@test("sve the same frames are accepted under '@no_alloc', the callees too")
+sve_lent_is_no_alloc()
+    if sve_no_library() then return
+
+    assert_eq(sve_moved(sve_callees("@no_alloc") + sve_lent("@no_alloc") + sve_lent_calls()), "")
+end sve_lent_is_no_alloc
+
+@test("sve every frame whose string outlives it moves its array, and no other")
+sve_kept_moves_each()
+    if sve_no_library() then return
+
+    val moved = sve_moved(sve_callees("") + sve_lent("") + sve_kept())
+
+    for name in sve_kept_names()
+        assert(s" $moved ".contains(s" $name "), s"'$name' is not among: $moved")
+
+    assert(sve_count(moved) == sve_kept_names().len, moved)
+end sve_kept_moves_each
+
+@test("sve under '@no_alloc' a kept string is refused where it is kept")
+sve_kept_is_refused_no_alloc()
+    val holder = "val h: &Holder = Holder(\"\")\n"
+
+    sve_no_alloc_refusal("stow", "sh: *Shelf", "    val s = str_alias(ref_stow_a[0..<1])\n    sh.s = s",
+                         "var shelf = Shelf(\"\")\nref_stow(&shelf)", "is stored somewhere the frame does not own")
+    sve_no_alloc_refusal("store", "h: &Holder", "    stores(h, str_alias(ref_store_a[0..<1]))",
+                         holder + "ref_store(h)", "is passed to 'stores', which holds on to it")
+    sve_no_alloc_refusal("onward", "h: &Holder", "    onward_keep(h, str_alias(ref_onward_a[0..<1]))",
+                         holder + "ref_onward(h)", "is passed to 'onward_keep', which holds on to it")
+    sve_no_alloc_refusal("rec", "h: &Holder", "    sink_down(h, str_alias(ref_rec_a[0..<1]), 3)",
+                         holder + "ref_rec(h)", "is passed to 'sink_down', which holds on to it")
+    val shelf = "var shelf = Shelf(\"\")\n"
+
+    sve_no_alloc_refusal("over", "sh: *Shelf", "    over_hold(sh, ref_over_a[0..<1])", shelf + "ref_over(&shelf)",
+                         "is passed to 'over_hold', which holds on to it")
+    sve_no_alloc_refusal("cut", "sh: *Shelf", "    cut_hold(sh, str_alias(ref_cut_a[0..<1]))",
+                         shelf + "ref_cut(&shelf)", "is passed to 'cut_hold', which holds on to it")
+    sve_no_alloc_refusal("table", "r: &Reader", "    r.look(str_alias(ref_table_a[0..<1]))",
+                         "ref_table(Plain(1))", "is passed through a trait object, which may hold on to it")
+end sve_kept_is_refused_no_alloc
+
+@test("sve a returned string is refused under '@no_alloc' as a returned view is")
+sve_returned_is_refused_no_alloc()
+    if sve_no_library() then return
+
+    assert_eq(sve_moved(sve_callees("") + "@no_alloc\nref_out() -> string\n    var ref_out_a: [8]u8\n" +
+                        "    str_alias(ref_out_a[0..<1])\n"),
+              "refused: this view of 'ref_out_a' is returned, so the array would move to the heap to " +
+              "outlive the frame — and 'ref_out' declared '@no_alloc', so there is nothing to move it " +
+              "into. Keep the view inside the frame, or take the storage from a caller as a '[]T' " +
+              "parameter, which is already wherever its owner put it")
+end sve_returned_is_refused_no_alloc
+
+@test("sve the lent frames read their own bytes, at the default level and optimized")
+sve_lent_runs()
+    if sve_no_library() || !clang_available() then return
+
+    val text = sve_callees("") + sve_lent("") + sve_join() + sve_lent_calls() + "acc_join()\nprint(kept_text)\n"
+    val want = "1 1 true 1 2 1 1\n1 3 true 2 9 2\nhi!\n"
+
+    assert_eq(sve_ran(text, DefaultOptimization), want)
+    assert_eq(sve_ran(text, "3"), want)
+end sve_lent_runs
+
+@test("sve the kept strings outlive their frames, at the default level and optimized")
+sve_kept_runs()
+    if sve_no_library() || !clang_available() then return
+
+    val text = sve_callees("") + sve_kept()
+
+    assert_eq(sve_ran(text, DefaultOptimization), sve_kept_prints())
+    assert_eq(sve_ran(text, "3"), sve_kept_prints())
+end sve_kept_runs
+
+// A literal written where a `[]u8` is expected is laid in the caller's frame when the callee keeps
+// no view of it and its answer can carry none out. A string in the answer can, where the callee laid
+// it over the literal: the callee's summary says which.
+@test("sve a literal argument is framed unless the string answered is laid over it")
+sve_literal_argument()
+    if sve_no_library() then return
+
+    val head = "import sysl.raw.{str_alias, str_cast}\n\n" +
+               "over(b: []u8) -> string = str_alias(b)\n\n" +
+               "copy(b: []u8) -> string = str_cast(b)\n\n" +
+               "size(b: []u8) -> usize = b.len\n\n"
+
+    assert_eq(sve_moved(head + "@no_alloc\nf() -> usize = size([104, 105])\n\nprint(f())\n"), "")
+    assert(sve_moved(head + "@no_alloc\nf() -> usize = over([104, 105]).len\n\nprint(f())\n")
+               .contains("is passed to 'over', whose answer holds on to it"))
+end sve_literal_argument
+
+@test("sve a string answered over a literal's bytes outlives the call that made it")
+sve_literal_argument_runs()
+    if sve_no_library() || !clang_available() then return
+
+    val text = "import sysl.raw.str_alias\n\n" +
+               "over(b: []u8) -> string = str_alias(b)\n\n" +
+               "deeper(n: int) -> int\n" +
+               "    var pad: [64]u8 = [33; 64]\n" +
+               "    if n == 0 then int(pad[0]) else deeper(n - 1) + int(pad[1]) - 33\n\n" +
+               "made() -> string = over([111, 107])\n\n" +
+               "val s = made()\n" +
+               "print(deeper(8), s)\n"
+
+    assert_eq(sve_ran(text, DefaultOptimization), "33 ok\n")
+    assert_eq(sve_ran(text, "3"), "33 ok\n")
+end sve_literal_argument_runs
+
+// A conversion that copies answers with none of its argument, so the array a copy was read from
+// stays in its frame when the copy leaves -- which is every integer and float formatted through a
+// buffer on the stack.
+@test("sve a copy made of the frame's bytes leaves the array where it is")
+sve_copy_leaves_the_array()
+    if sve_no_library() then return
+
+    assert_eq(sve_moved("import sysl.raw.str_cast\nimport sysl.text.{from_utf8, from_utf8_unchecked}\n\n" +
+                        "acc_cast() -> string\n    var acc_cast_a: [8]u8\n    str_cast(acc_cast_a[0..<2])\n\n" +
+                        "acc_checked() -> string\n    var acc_checked_a: [8]u8\n" +
+                        "    from_utf8(acc_checked_a[0..<2]).unwrap_or(\"\")\n\n" +
+                        "acc_trusted() -> string\n    var acc_trusted_a: [8]u8\n" +
+                        "    from_utf8_unchecked(acc_trusted_a[0..<2])\n\n" +
+                        "print(acc_cast(), acc_checked(), acc_trusted())\n"), "")
+end sve_copy_leaves_the_array

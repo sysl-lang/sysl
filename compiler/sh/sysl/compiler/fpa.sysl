@@ -1208,8 +1208,11 @@ private deref_step(fb: &FBody, t: Type) -> FStep = t match
         None -> step(fb, "*", "")
 
 // Whether a value of this type can hold an address: what a body passes around that is followed at all.
-// A string is not followed -- it outlives every frame -- nor is an integer, whatever it was made from.
+// **A string is followed as the view of bytes it is**: one made by `str_alias` lies over storage it
+// does not own, so where a function puts a string it was handed is where those bytes are still read.
+// An integer is not followed, whatever it was made from.
 fpa_holds(fx: &Fpa, t: Type) -> bool = t match
+    Str -> true
     Ptr(inner, _, _) -> !is_opaque_struct_t(*inner)
     Trait(_, _, _) -> true
     Abstract(_, _) -> true
@@ -1365,6 +1368,10 @@ private types_reached(t: Type, in_place: bool, seen: *Map[string, bool], names: 
             Slice(elem, _) ->
                 name_type(seen, names, s"addr:${type_show(*elem)}")
                 work.push(*elem)
+
+            // A string is a view of bytes: `str_alias` lays one over a `[]u8` and `.bytes` reads one
+            // back as a `[]const u8`, so the two hold each other's storage.
+            Str -> name_type(seen, names, s"addr:${type_show(byte_type())}")
             Ref(inner, _) ->
                 if !in_place then work.push(*inner)
             Weak(inner) ->
@@ -1960,12 +1967,31 @@ private eval_kind(fb: &FBody, e: TExpr) -> Buf[FAtom] = *e.kind match
         eval(fb, task)
     TFuncAddr(_, _, _) -> buf()
 
-    // Bytes made into a string in place have left the call: a string outlives every frame
-    // (`escape.sysl`'s `carries_view`), so what they view is kept, and the string holds nothing to
-    // follow.
-    TStrView(v) ->
-        keep(fb, eval(fb, v))
+    // Bytes made into a string in place are the same storage under another type, so the string is
+    // made of what the bytes were, and is kept only where the string is.
+    TStrView(v) -> eval(fb, v)
+
+    // `str(s)` of a string is that string; of anything else it is a new one.
+    TStr(x) ->
+        val v = eval(fb, x)
+
+        if is_str_t(texpr_type(x)) then v else buf()
+
+    // A string these build is bytes of its own, made of nothing it was built from.
+    TFromBytes(v) ->
+        eval(fb, v)
         buf()
+    TFormat(_, _, _) -> built_string(fb, e)
+    TRender(_, _, _, _) -> built_string(fb, e)
+    TBinary(_, _, _, ty) ->
+        if is_str_t(ty) then return built_string(fb, e)
+
+        var out: Buf[FAtom] = buf()
+
+        for c in texpr_children(e)
+            join_into(&out, eval(fb, c))
+
+        out
     _ ->
         var out: Buf[FAtom] = buf()
 
@@ -1978,6 +2004,18 @@ end eval_kind
 private is_slice_t(t: Type) -> bool = t match
     Slice(_, _) -> true
     _ -> false
+
+private is_str_t(t: Type) -> bool = t match
+    Str -> true
+    _ -> false
+
+// The operands of a form that builds a new string, walked for what they do, with nothing answered.
+private built_string(fb: &FBody, e: TExpr) -> Buf[FAtom]
+    for c in texpr_children(e)
+        eval(fb, c)
+
+    buf()
+end built_string
 
 private single(a: FAtom) -> Buf[FAtom]
     var out: Buf[FAtom] = buf()
@@ -2660,6 +2698,19 @@ fpa_answers(fx: &Fpa, name: string, i: usize) -> bool
 
     false
 end fpa_answers
+
+// Whether what `name` answers can be made of anything parameter `i` holds, wherever in the answer it
+// sits -- what the escape analysis asks of a call whose answer holds a string (`escape.sysl`'s
+// `answered_by`). A function with no summary may answer with anything.
+fpa_answers_from(fx: &Fpa, name: string, i: usize) -> bool
+    val fi = fx.index.get(name)
+
+    if fi.is_none() then return true
+
+    val sum = fx.sums[fi.unwrap()]
+
+    i < sum.answers.len() && !sum.answers[i].is_empty()
+end fpa_answers_from
 
 // Whether `name` answers parameter `i` only from inside a heap object it made.
 fpa_answers_boxed(fx: &Fpa, name: string, i: usize) -> bool
