@@ -3005,7 +3005,13 @@ private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type
 
     if from.is_none() then return None
 
-    if pointerish then return address_image(t, inner, from.unwrap(), to, m)
+    if pointerish
+        val retyped = if is_pointerish(texpr_type(inner)) then retyped_address(t, from.unwrap(), to) else None
+
+        if retyped.is_some() then return retyped
+
+        return address_image(t, inner, from.unwrap(), to, m)
+    end if
 
     if is_fixed(to) then return fixed_image(t, from.unwrap(), to)
 
@@ -3013,6 +3019,20 @@ private cast_image(cx: &Analyzer, name: string, t: TExpr, inner: TExpr, to: Type
 
     scalar_image(TExpr(t.span, TCast(from.unwrap(), to)), m)
 end cast_image
+
+// **A pointer read at another pointer type is the same word**: `c"…"` or `&storage` where a
+// `*nonnull T` is wanted is typed as a conversion of the address (`expr_coerce.sysl`), and the
+// conversion changes what the type promises, never the bits. So the image is the address itself --
+// the relocation the linker fills in, or the device address's number -- at the type converted to
+// where the node carries one.
+private retyped_address(t: TExpr, from: TExpr, to: Type) -> Option[TExpr] = *from.kind match
+    TCStrLit(_) -> Some(from)
+    TFuncAddr(_, _, _) -> Some(from)
+    TAddrOf(place, _) -> Some(TExpr(t.span, TAddrOf(place, to)))
+    TCast(number, _) -> *number.kind match
+        TIntLit(_, _) -> Some(TExpr(t.span, TCast(number, to)))
+        _ -> None
+    _ -> None
 
 // **An address read as an integer of exactly the machine's word is constant data**: `usize(&f)`, and
 // `u32(usize(&f))` on a 32-bit target, are C's `(uint32_t)(uintptr_t)&f` -- a word the linker fills in

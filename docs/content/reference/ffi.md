@@ -1391,6 +1391,12 @@ print(count_rows(u64(1) << 61))
 before
 ```
 
+**A [variadic export](#a-variadic-export) answers the same way.** It has no thunk, so its definition
+counts itself in where C calls it, and each of its returns answers the value where an allocation
+was refused. Called from sysl by name it is outside the boundary like any other export's function, in whichever
+package it is defined; those are the only two ways in, since a variadic function's address cannot be
+taken.
+
 **A build with no such export is lowered exactly as before**, byte for byte. A build with one pays
 only in what an answering export can reach. After each call that can reach an allocation there is a
 load of the word and a branch. Around each call into C, the word is saved, zeroed and put back. Each
@@ -1832,7 +1838,9 @@ which would trap where it ran — so it is left to run, and trap, as it would ha
 
 **A `c"…"` literal is constant data**: it is the address of the literal's bytes in read-only data,
 a relocation like `&files[1]`. C's `char *tzname[2] = {"UTC", "UTC"};` is therefore written as it
-reads, bare, in an array or in a struct constructor, exported or not:
+reads, bare, in an array or in a struct constructor, exported or not. It is the same data where a
+[`*nonnull u8`](/reference/memory/#nonnull-t-a-pointer-that-is-never-null) is wanted, the type
+promising what an address already is:
 
 ```sysl build=c target=thumbv7em-freestanding
 module mylib
@@ -1842,6 +1850,11 @@ var tzname: [2]*u8 = [c"UTC", c"UTC"]
 
 @export("zone")
 val zone: *u8 = c"UTC"
+
+val names: [2]*nonnull u8 = [c"UTC", c"GMT"]
+
+@export
+second_name() -> *nonnull u8 = names[1]
 ```
 
 **Four more things are constant data, all at any depth:**

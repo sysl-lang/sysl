@@ -1,0 +1,300 @@
+module sh.sysl.compiler
+@tests
+
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **A `c"…"` literal where a `*nonnull T` is wanted is constant data**, as it is where a `*T` is
+// wanted: the literal is typed as a conversion of its address to the never-null pointer, and that
+// conversion changes what the type promises and none of the bits, so the storage is still the one
+// relocation the linker fills in. A freestanding archive may therefore read a module `val` or `var`
+// holding one -- alone, in an array, in a struct, behind another `val` -- with nothing run to fill it.
+//
+// The helpers are `tests_sdt_static_data.sysl`'s, which are private to that file.
+
+private nnd_no_library(t: Target) -> bool
+    if nnd_library_for(t).is_empty()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    false
+end nnd_no_library
+
+private nnd_library_for(t: Target) -> Buf[Program]
+    var out: Buf[Program] = buf()
+
+    std_root() match
+        Err(_) -> ()
+        Ok(root) -> std_units(root, t) match
+            Err(_) -> ()
+            Ok(units) -> out = units
+
+    out
+end nnd_library_for
+
+// The library's own complaints are not what a question about a program is asking.
+private nnd_first_of(said: Buf[Placed]) -> string
+    for item in said
+        if !item.src.name.starts_with("library/") then return item.diag.message
+
+    ""
+end nnd_first_of
+
+// A freestanding archive as `build-c` makes one: the first thing the compilation had to say, or the
+// LLVM text it lowered to.
+private nnd_freestanding(text: string) -> string
+    val t = target_named("thumbv6m-freestanding").unwrap()
+    var units = nnd_library_for(t)
+    val parsed = parse(source_of("main.sysl", text), t)
+
+    if !parsed.ok() then return parsed.report.at(0).message
+
+    units.push(parsed.program)
+
+    val done = analyze_produced(units, t, buf(), false)
+    val early = nnd_first_of(done.reported)
+
+    if early != "" then return early
+
+    val whole = program_of(done, done.main_module) with { entry_point = false, c_artifact = true }
+    var own: Buf[string] = buf()
+
+    own.push("")
+
+    val pr = post_analysis_checks(done.an, whole, own)
+    val late = nnd_first_of(done.an.diagnostics())
+
+    if late != "" then return late
+
+    ir_print_module(codegen_with_gaps(prune(strip_tests(whole), own), t, pr).0)
+end nnd_freestanding
+
+private nnd_skip_freestanding() -> bool = nnd_no_library(target_named("thumbv6m-freestanding").unwrap())
+
+// The archive was built and nothing was written to run before `main` to fill its storage.
+private nnd_nothing_runs(out: string)
+    assert(!out.contains("module_init"), out)
+    assert(!out.contains("llvm.global_ctors"), out)
+    assert(!out.contains("is exported and reaches"), out)
+end nnd_nothing_runs
+
+private val nnd_main: string = "\n@export(\"main\")\nmain_entry() -> int = "
+
+// The refusal a freestanding archive gives storage an initializer has to fill.
+private nnd_refusal(names: string) -> string =
+    s"'main_entry' is exported and reaches $names, which is module storage an initializer fills " +
+    "before the program's own statements run"
+
+// guards: a c"…" literal as a *nonnull u8 is constant data in a module val
+@test("a 'val' of a never-null pointer over a C string literal is constant data for a freestanding archive")
+nnd_a_val_is_laid_down()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("val X: *nonnull u8 = c\"hello\"\n" + nnd_main + "int(X[0])\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@X = private constant ptr @.str"), out)
+    assert(out.contains("c\"hello\\00\""), out)
+end nnd_a_val_is_laid_down
+
+// guards: the plain pointer the never-null one is compared with is the same data
+@test("the same 'val' as a pointer that may be null is the same constant")
+nnd_the_plain_pointer_is_the_same_data()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("val X: *u8 = c\"hello\"\n" + nnd_main + "int(X[0])\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@X = private constant ptr @.str"), out)
+end nnd_the_plain_pointer_is_the_same_data
+
+// guards: a var, a private val and a read-only never-null pointer are data too
+@test("a 'var', a private 'val' and a '*const nonnull u8' over a C string literal are constant data")
+nnd_var_private_and_const_are_laid_down()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("var V: *nonnull u8 = c\"var\"\n" +
+                               "private val P: *nonnull u8 = c\"private\"\n" +
+                               "val K: *const nonnull u8 = c\"konst\"\n" +
+                               nnd_main + "int(V[0]) + int(P[0]) + int(K[0])\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@V = private global ptr @.str"), out)
+    assert(out.contains("@P = private constant ptr @.str"), out)
+    assert(out.contains("@K = private constant ptr @.str"), out)
+end nnd_var_private_and_const_are_laid_down
+
+// guards: an exported val keeps its C name and is data
+@test("an exported 'val' of a never-null pointer over a C string literal is constant data under its C name")
+nnd_an_exported_val_is_laid_down()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("@export(\"zone\")\nval zone: *nonnull u8 = c\"UTC\"\n" + nnd_main + "int(zone[0])\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@zone = constant ptr @.str") || out.contains("@zone = dso_local constant ptr @.str"), out)
+end nnd_an_exported_val_is_laid_down
+
+// guards: an array and a struct holding such pointers are data
+@test("an array and a struct of never-null pointers over C string literals are constant data")
+nnd_an_array_and_a_struct_are_laid_down()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("struct Named\n    name: *nonnull u8\n    n: int\n\n" +
+                               "val A: [2]*nonnull u8 = [c\"one\", c\"two\"]\n" +
+                               "val N: Named = Named(c\"named\", 3)\n" +
+                               "val F: [2]*nonnull u8 = [c\"fill\"; 2]\n" +
+                               nnd_main + "int(A[1][0]) + int(N.name[0]) + N.n + int(F[1][0])\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@A = private constant [2 x ptr] [ptr @.str"), out)
+    assert(out.contains("@N = private constant %struct.Named { ptr @.str"), out)
+    assert(out.contains("@F = private constant [2 x ptr] [ptr @.str"), out)
+end nnd_an_array_and_a_struct_are_laid_down
+
+// guards: a val read by another val's initializer is the literal, never-null or not
+@test("a 'val' reading a never-null 'val' over a C string literal is the same relocation, at either pointer type")
+nnd_a_val_read_by_another_is_laid_down()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("val X: *nonnull u8 = c\"hello\"\n" +
+                               "val Y: *nonnull u8 = X\n" +
+                               "val Z: *u8 = X\n" +
+                               "val T: [2]*nonnull u8 = [X, Y]\n" +
+                               nnd_main + "int(Y[0]) + int(Z[0]) + int(T[1][0])\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@Y = private constant ptr @.str"), out)
+    assert(out.contains("@Z = private constant ptr @.str"), out)
+    assert(out.contains("@T = private constant [2 x ptr] [ptr @.str"), out)
+end nnd_a_val_read_by_another_is_laid_down
+
+// guards: the never-null addresses that were data already still are
+@test("the address of storage, of an element, a device address and an address as a word stay constant data as never-null pointers")
+nnd_other_never_null_addresses_stay_data()
+    if nnd_skip_freestanding() then return
+
+    val out = nnd_freestanding("import sysl.raw.ptr_cast\n\n" +
+                               "var G: int = 7\nvar T: [3]int = [1, 2, 3]\n\n" +
+                               "val Q: *nonnull int = &G\n" +
+                               "val E: *nonnull int = &T[2]\n" +
+                               "val W: usize = usize(Q)\n" +
+                               "val D: *nonnull u32 = ptr_cast(0x4000_C000)\n" +
+                               nnd_main + "*Q + *E + int(W) + int(usize(D))\n")
+
+    nnd_nothing_runs(out)
+    assert(out.contains("@Q = private constant ptr @G\n"), out)
+    assert(out.contains("@E = private constant ptr getelementptr inbounds (i32, ptr @T, i32 2)\n"), out)
+    assert(out.contains("@W = private constant i32 ptrtoint (ptr @G to i32)\n"), out)
+    assert(out.contains("@D = private constant ptr inttoptr (i32 1073790976 to ptr)\n"), out)
+end nnd_other_never_null_addresses_stay_data
+
+// guards: a C string literal is bytes, so a pointer to another element type is still refused
+@test("a C string literal is a pointer to bytes, and a '*nonnull i8' does not take one")
+nnd_another_element_type_is_refused()
+    if nnd_skip_freestanding() then return
+
+    assert_eq(nnd_freestanding("val S: *nonnull i8 = c\"signed\"\n" + nnd_main + "int(S[0])\n"),
+              "cannot initialize 'S': declared *nonnull i8 but the value is *byte")
+    assert_eq(nnd_freestanding("val S: *i8 = c\"signed\"\n" + nnd_main + "int(S[0])\n"),
+              "cannot initialize 'S': declared *i8 but the value is *byte")
+end nnd_another_element_type_is_refused
+
+// A choice between two literals, and a literal carried by a variant, are code at either pointer
+// type: the never-null pointer is treated exactly as the plain one is.
+// guards: what is not data for *u8 is not data for *nonnull u8, with the same words
+@test("a choice between C string literals and a variant carrying one stay code, for a never-null pointer as for a plain one")
+nnd_what_stays_code_is_the_same_for_both()
+    if nnd_skip_freestanding() then return
+
+    for ty in ["*u8", "*nonnull u8"]
+        val chosen = nnd_freestanding("const WIDE: bool = true\n\n" +
+                                      s"val C: $ty = if WIDE then c\"wide\" else c\"thin\"\n" +
+                                      nnd_main + "int(C[0])\n")
+
+        assert(chosen.starts_with(nnd_refusal("'C'")), chosen)
+        assert(chosen.contains("'C' is worked out by 'if WIDE then c\"wide\" else c\"thin\"', which is not a " +
+                               "value the compiler can write down"), chosen)
+
+        val matched = nnd_freestanding("const PICK: int = 2\n\n" +
+                                       s"val M: $ty = PICK match\n    1 -> c\"one\"\n    _ -> c\"other\"\n" +
+                                       nnd_main + "int(M[0])\n")
+
+        assert(matched.starts_with(nnd_refusal("'M'")), matched)
+
+        val carried = nnd_freestanding(s"val O: Option[$ty] = Some(c\"some\")\n" +
+                                       nnd_main + "if O.is_some() then 1 else 0\n")
+
+        assert(carried.starts_with(nnd_refusal("'O'")), carried)
+        assert(carried.contains("'O' is worked out by 'Some(c\"some\")', which is not a value the compiler " +
+                                "can write down"), carried)
+    end for
+end nnd_what_stays_code_is_the_same_for_both
+
+// -- what the program reads -------------------------------------------------------------------------
+
+private nnd_skipped() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end nnd_skipped
+
+// What a project of these files prints when it is built and run on this machine.
+private nnd_prints(files: []const (string, string)) -> string
+    val root = make_temp_dir("sysl-nonnull-literal-data").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+        val slash = at.last_index_of("/")
+
+        if slash.is_some() then make_dir_all(at[0..<slash.unwrap()]).unwrap()
+
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return s"did not build: ${failure_text(why)}"
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end nnd_prints
+
+// guards: a hosted program reads the bytes through the never-null pointers, from another module
+@test("a hosted program reads the literals through never-null pointers another module declares")
+nnd_a_hosted_program_reads_them_from_another_module()
+    if nnd_skipped() then return
+
+    val defs = "module m\n\nstruct Named\n    name: *nonnull u8\n    n: int\n\n" +
+               "val X: *nonnull u8 = c\"hello\"\n" +
+               "val A: [2]*nonnull u8 = [c\"one\", c\"two\"]\n" +
+               "val N: Named = Named(c\"named\", 3)\n" +
+               "val Y: *nonnull u8 = X\n" +
+               "var V: *nonnull u8 = c\"var\"\n" +
+               "private val P: *nonnull u8 = c\"private\"\n\n" +
+               "hidden() -> u8 = P[2]\n"
+
+    val main = "import m\n\nprint(m.X[0], m.X[4], m.X[5])\nprint(m.A[0][0], m.A[1][1])\n" +
+               "print(m.N.name[0], m.N.n)\nprint(m.Y[1])\nprint(m.V[0])\nm.V = m.X\nprint(m.V[0])\n" +
+               "print(m.hidden())\n"
+
+    assert_eq(nnd_prints([("m/defs.sysl", defs), ("main.sysl", main)]),
+              "104 111 0\n111 119\n110 3\n101\n118\n104\n105\n")
+end nnd_a_hosted_program_reads_them_from_another_module
