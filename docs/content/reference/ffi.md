@@ -2668,7 +2668,70 @@ They have to agree: this one returns int, where 'wall_us' returns long
 ```
 
 An export whose symbol no `extern` names is compared with nothing — it is a definition C calls, and
-its signature is whatever it says.
+its signature is whatever it says. Where several `extern`s name the symbol — two modules each
+declaring `strlen` — the export is held to every one of them.
+
+**Whether a pointer may be null is the one thing the two need not say alike.** A declaration may be
+*looser* than the definition about what it passes, and may promise *less* than the definition about
+what it gets back — never the reverse:
+
+| position | `extern` says `*T`, `@export` says `*nonnull T` | `extern` says `*nonnull T`, `@export` says `*T` |
+|---|---|---|
+| parameter | accepted — a null passed through the declaration meets the export's entry check | accepted — the declaration passes less than the export takes |
+| result | accepted — the declaration expects a null the export never gives | **refused** — the declaration promises a pointer the export does not |
+
+So a definition of a C library's function can say what it requires — `strlen(s: *nonnull u8)` —
+while an older declaration of the same symbol elsewhere in the program, the standard library's
+included, still says `*u8`. The parameter is safe to loosen because of
+[the entry check](#a-pointer-c-never-makes-null): a call through the looser declaration is a call of
+the symbol, as a C caller's is, and a null stops there, in a debug build and a release build alike.
+The report words the caller as C, whichever language made the call:
+
+```sysl
+extern "app_first" first_of(p: *int) -> int
+
+@export("app_first")
+first(p: *nonnull int) -> int = *p
+
+var seven = 7
+var absent: *int = null
+
+print(first_of(&seven))
+print(first_of(absent))
+```
+
+```output trap
+7
+```
+
+An export marked [`@unchecked`](#a-pointer-c-never-makes-null) has dropped that check for every
+caller of the symbol, a looser declaration's among them, and the null reaches its body as a C
+caller's would.
+
+The one refused cell is a declaration answering `*nonnull T` — which the caller then reads without a
+test — over a definition that may answer null:
+
+```sysl
+extern "app_find" find(p: *int) -> *nonnull int
+
+@export("app_find")
+find_or_null(p: *int) -> *int = p
+
+var seven = 7
+
+print(*find(&seven))
+```
+
+```error
+They have to agree: this one returns *int, which may be null, where 'find' returns *nonnull int, which never is — the declaration promises its callers more than this definition gives. A declaration may promise less than its definition, never more: return *nonnull int here, or declare 'find' as returning *int
+```
+
+The same table holds for `*const T` beside `*const nonnull T` and for a `*extern` function pointer
+beside its `*nonnull` form. **Only the pointer handed over is loosened.** What it points at is
+compared exactly, as every other difference is: `**T` beside `**nonnull T`, a struct whose field is
+a `*nonnull T` beside one whose field is a `*T`, `*const T` beside `*T`, and an
+`Option[*nonnull T]` beside a `*T` are each two types here, and refused. The header the export
+publishes spells the pointer `T *` whichever way the declarations say it.
 
 ### Where the declaration is compiled is where the seam is decided
 
