@@ -31,20 +31,28 @@ self_binding(t: Type) -> Buf[Binding]
     out
 end self_binding
 
-// The terms a bound written on the parameter `tp` is read under: `subst`, with `Self` standing for
-// `self_ty`, the type the bound asks something of. That holds whether `Self` was written in the bound
-// or arrives from one of the trait's defaults, so a bare `U: Add` is `Add[U, U]`. **`Self` goes
-// FIRST**, a substitution answering with the first binding of a name: an enclosing `Self` -- the
-// trait's, around a default body, or the receiver's, at a copied default's call -- would otherwise
-// answer instead and turn the bound into `Add[Self]`.
+// The terms a bound's **written** arguments are read under, the bound standing on a parameter whose
+// argument is `on`. **A `Self` the bound writes is the enclosing one** -- the trait's, around a
+// member it declares, or the receiver's, at a call of that member -- so a member's own parameter can
+// be related to the type the member belongs to: `apply[U, F: Fn1[Self::Item, U]]` asks for a
+// callable from the implementing type's `Item`, not from `F`'s. A substitution answers with the
+// first binding of a name, so the enclosing `Self` is found before the one appended here. Where
+// nothing encloses the bound -- a free function's, a type's, an `impl` header's -- `Self` has only
+// the parameter itself to mean.
 //
-// **A bound the bare-arrow sugar added is the exception.** Its arguments were written in a parameter
-// list, where `Self` is the receiver's type, so an enclosing `Self` keeps answering there.
-bound_terms(subst: Buf[Binding], tp: string, self_ty: Type) -> Buf[Binding] =
-    if is_call_bound(tp) then joined_bindings(subst, self_binding(self_ty))
-    else joined_bindings(self_binding(self_ty), subst)
+// What the bounded **trait's own defaults** say `Self` is, is a different question with a different
+// answer -- always `on` -- and `bound_on` is what keeps the two apart.
+bound_terms(subst: Buf[Binding], on: Type) -> Buf[Binding] = joined_bindings(subst, self_binding(on))
 
-// Two substitutions, the second winning where they name the same thing.
+// One bound written on a parameter, resolved at that parameter's argument `on`. The arguments the
+// bound wrote are read under `bound_terms`; the ones it left to the trait's defaults are filled with
+// `Self` standing for `on`, a bound constraining what it is written on -- a bare `U: Add` is
+// `Add[U, U]` wherever it is written, inside a trait's member included.
+bound_on(a: &Analysis, scope: Scope, b: BoundRef, subst: Buf[Binding], on: Type) -> Bound =
+    resolve_bound(a, scope, b.span, b, bound_terms(subst, on), Some(on))
+
+// Two substitutions, the first winning where they name the same thing, as a substitution answers
+// with the first binding of a name.
 joined_bindings(outer: Buf[Binding], inner: Buf[Binding]) -> Buf[Binding]
     var out: Buf[Binding] = buf()
 
@@ -338,7 +346,12 @@ end builtin_shape_member
 // the trait's own arguments, a required trait's under its declared name, and -- where the trait has no
 // parameters and exactly one associated type -- by a lone bare argument. The same check holds the
 // names to what the trait declares.
-resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Binding]) -> Bound
+//
+// `on` is the type the bound is written on, where the caller keeps that apart from the `Self` its
+// written arguments are read under (`bound_on`): the trait's defaults are filled from it. Without
+// one the defaults read the substitution's own `Self`.
+resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Binding],
+              on: Option[Type] = None) -> Bound
     val key = lookup_trait_key(a, scope, b.name)
 
     if key.is_none() then return plain_bound(b.name, resolve_list(a, scope, b.args, subst))
@@ -401,7 +414,8 @@ resolve_bound(a: &Analysis, scope: Scope, span: Span, b: BoundRef, subst: Buf[Bi
 
     check_trait_arity_at(a, scope, span, b.name, decl, written)
 
-    val args = trait_args_with_defaults(a, scope, span, key.unwrap(), decl, written, subst)
+    val args = trait_args_with_defaults(a, scope, span, key.unwrap(), decl, written,
+                                        if on.is_some() then self_binding(on.unwrap()) else subst)
 
     check_trait_arg_bounds(a, scope, span, key.unwrap(), decl, args)
 
@@ -1150,7 +1164,7 @@ blanket_condition_met(a: &Analysis, ti: TraitImpl, t: Type) -> bool
                 if nb.name == ti.tparams[0]
                     for j in 0..<nb.bounds.len()
                         val b = nb.bounds[j]
-                        val tr = resolve_bound(a, ti.scope, b.span, b, bound_terms(terms, nb.name, t))
+                        val tr = bound_on(a, ti.scope, b, terms, t)
 
                         if !bound_promises(a, own, tr, t) then return false
 
@@ -1397,7 +1411,7 @@ unmet_condition_of(a: &Analysis, ti: TraitImpl, subst: Buf[Binding]) -> Option[(
         if arg.is_some()
             for j in 0..<nb.bounds.len()
                 val b = nb.bounds[j]
-                val tr = resolve_bound(a, ti.scope, b.span, b, bound_terms(subst, nb.name, arg.unwrap()))
+                val tr = bound_on(a, ti.scope, b, subst, arg.unwrap())
 
                 if !satisfies(a, tr, arg.unwrap()) then return Some((arg.unwrap(), tr))
 

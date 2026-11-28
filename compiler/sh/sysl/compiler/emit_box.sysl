@@ -944,6 +944,102 @@ gen_into_raw(e: *Emit, value: TExpr, ptr_ty: Type) -> Val
     box_payload_addr(e, v, ref_ty)
 end gen_into_raw
 
+// `r.is_unique()` -- whether the reference a place holds is the only one to its object: its strong
+// count is one, and no weak reference could be made into a second.
+//
+// **The count is loaded straight through the reference, and that load is what keeps the count
+// exact.** A retain is cancelled against its release only where nothing between can look at a count
+// (`arc_cover.sysl`'s `count_blind`), and a frame box's shares are counted by the compiler only where
+// no load goes through the box (`frame_counts.sysl`); this load is neither blind nor followed, so
+// every share the body holds is in the word it reads.
+//
+// **A `&sync T`'s count is read with an acquire load**: it pairs with the release decrement another
+// domain gave its share back with, so a count of one seen here is seen after everything that domain
+// wrote. Nothing can raise it again, since only a holder can take a share and this is the only one.
+// Nothing weakens a `&sync T`, so its weak count is not asked.
+//
+// **A box laid in a frame or in the object file answers as one on the heap does**: a compact one
+// starts one past `frame_mark` in a frame and at a quarter of the word's range in a module `val`'s
+// image (`emit_static.sysl`'s `box_const`), a full one at one -- with `frame_weak_mark` for its weak
+// count in a frame -- and each of those is the box's first share alone. A null reference, which zeroed storage holds, is the only one to nothing
+// and answers `false`.
+gen_is_unique(e: *Emit, value: TExpr) -> Val
+    val word = word_lty(e)
+    val v = gen_expr(e, value)
+
+    val ref_ty = underlying(texpr_type(value))
+    var inner = ref_ty
+    var sync = false
+
+    ref_ty match
+        Ref(i, s) ->
+            inner = *i
+            sync = s
+        _ -> return gap_at(e, "'is_unique' of a value that is not a counted reference")
+
+    val p = if is_trait(inner) then erased_box(e, v) else v
+    val slot = alloca(e, fresh_reg(e), l_i1())
+    val live_l = fresh_label(e, "unique.live")
+    val end_l = fresh_label(e, "unique.end")
+    val absent = fresh_reg(e)
+
+    emit(e, InStore(l_i1(), VInt(from_int(0)), slot, AccPlain, None))
+    emit(e, InIntCmp(absent, IEq, LPtr, p, VNull))
+    emit_term(e, InCondBr(absent, end_l, live_l))
+    emit_label(e, live_l)
+
+    val strong = fresh_reg(e)
+
+    if sync then emit(e, InLoad(strong, word, p, AccAtomic(OrdAcquire), Some(int(e.word_bits / 8))))
+    else emit(e, InLoad(strong, word, p, AccPlain, None))
+
+    val one = fresh_reg(e)
+
+    emit(e, InIntCmp(one, IEq, word, strong, VInt(from_int(1))))
+
+    var sole = one
+
+    if !is_trait(inner) && is_compact(e, inner)
+        val framed = fresh_reg(e)
+        val laid = fresh_reg(e)
+        val either = fresh_reg(e)
+        val any = fresh_reg(e)
+
+        emit(e, InIntCmp(framed, IEq, word, strong, VInt(from_int(frame_mark(e) + 1))))
+        emit(e, InIntCmp(laid, IEq, word, strong, VInt(from_int(long(1) << long(e.word_bits - 2)))))
+        emit(e, InBin(either, OpOr, l_i1(), one, framed))
+        emit(e, InBin(any, OpOr, l_i1(), either, laid))
+        sole = any
+    elif !sync
+        val at = fresh_reg(e)
+        val others = fresh_reg(e)
+        val unweakened = fresh_reg(e)
+        val framed = fresh_reg(e)
+        val either = fresh_reg(e)
+        val both = fresh_reg(e)
+
+        var idx: Buf[IrArg] = buf()
+
+        idx.push(ir_arg(l_i32(), VInt(from_int(2))))
+        emit(e, InGep(at, word, p, idx))
+        emit(e, InLoad(others, word, at, AccPlain, None))
+        emit(e, InIntCmp(unweakened, IEq, word, others, VInt(from_int(1))))
+        emit(e, InIntCmp(framed, IEq, word, others, VInt(from_int(frame_weak_mark()))))
+        emit(e, InBin(either, OpOr, l_i1(), unweakened, framed))
+        emit(e, InBin(both, OpAnd, l_i1(), one, either))
+        sole = both
+    end if
+
+    emit(e, InStore(l_i1(), sole, slot, AccPlain, None))
+    emit_term(e, InBr(end_l))
+    emit_label(e, end_l)
+
+    val r = fresh_reg(e)
+
+    emit(e, InLoad(r, l_i1(), slot, AccPlain, None))
+    r
+end gen_is_unique
+
 // `from_raw(p)` -- the box a payload address `into_raw` answered sits in: the header lies a fixed
 // distance before the payload, the same distance `box_payload_addr` steps forward, whichever header
 // the payload's box has. **The distance is the box type's own**, read off the payload field's address
