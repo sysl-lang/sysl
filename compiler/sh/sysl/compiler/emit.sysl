@@ -589,12 +589,14 @@ struct Emit
     // function such an export can reach, and `oom_whole` says every function is among them (the
     // standard module's artifact for such a build). `oom_here` says the body being written is one,
     // `oom_quiet` counts the ways out being laid inside it, where no test of the state is made, and
-    // `oom_named` says the module reads the state word.
+    // `oom_named` says the module reads the state word. `oom_entry` says the body is a variadic
+    // export's, which is its own boundary and whose returns are laid as a thunk's.
     oom_scope: Set[string]
     oom_whole: bool
     oom_here: bool
     oom_quiet: int
     oom_named: bool
+    oom_entry: bool
 
     // **A write an `invariant` re-check follows gives up its old value only once the clause has
     // held** (`emit_expr.sysl`'s `gen_recheck`, `gen_multi_assign`): the value it lets go of may run
@@ -838,7 +840,7 @@ emitter_for(t: Target, destructors: Buf[(string, string, bool)]) -> Emit
           buf(), buf(), false, false, false, false, buf(), map(), map(), set(), map(), buf(), map(), buf(), map(),
           held_args_none(), PeelNone, set(), false, false, map(), map(), map(), no_stack_boxes(), buf(), buf(),
           None, buf(), set(), set(), buf(), map(), set(), map(), map(), set(), set(), set(),
-          set(), false, false, 0, false, false, false, buf(), set(), set())
+          set(), false, false, 0, false, false, false, false, buf(), set(), set())
 end emitter_for
 
 // -- what a body could not say --------------------------------------------------------------------
@@ -929,6 +931,7 @@ start_function(e: *Emit)
     e.drop_flags = map()
     e.oom_here = false
     e.oom_quiet = 0
+    e.oom_entry = false
 end start_function
 
 // A register nothing else in this function uses.
@@ -1394,6 +1397,9 @@ end fill_byte
 // is what makes the labels it names reachable.
 emit_term(e: *Emit, i: Inst)
     if !e.terminated
+        // A variadic export answering out of memory returns as a thunk would (`oom_boundary.sysl`).
+        if oom_entry_return(e, i) then return
+
         e.current_end = Some(i)
         e.terminated = true
 
