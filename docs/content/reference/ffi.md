@@ -2004,6 +2004,14 @@ while compiling: a value it admits is laid down, and one it does not is refused 
 (*"200 is not a value 'Age' admits"*). A `where` predicate is a function, so storage behind one stays
 code, filled and checked before the program's statements.
 
+**A struct with an `invariant` is constant data when its fields are and its clauses hold.** The
+clauses are run while compiling over the fields the construction names, so `var sink = Sink([0; 16],
+0, 16)` over a `Sink` with `invariant len <= cap` is laid down with no check left for startup; a
+construction the clauses do not hold for is refused, and clauses that cannot be run — they read a
+module `var` — leave the storage code. Storage that starts at a zero its clauses hold for is zeroed
+storage. [Struct invariants](/reference/errors/#a-module-value-built-from-constants-is-checked-while-compiling)
+has the rules.
+
 #### The one case with nowhere to fill
 
 **A freestanding target has no loader.** Nothing walks `.init_array` on bare metal unless the image's

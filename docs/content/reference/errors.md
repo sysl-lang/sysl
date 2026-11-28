@@ -2380,7 +2380,9 @@ below), so writing a view's element requires no check on the struct holding the 
 The zero value is an implicit construction. `Window`'s zero has `lo` and `hi` both `0`, which
 satisfies `lo <= hi` but would immediately break `lo < hi`, and a struct that started out invalid
 would be a value no write had ever checked. The check is on a constant, so where the zero value
-satisfies the clause it costs nothing.
+satisfies the clause it costs nothing: module storage that starts at such a zero is plain zeroed
+storage, with nothing run to fill or check it. A zero the clause does not hold for traps when the
+program starts.
 
 As a result, **a sequence of writes that ends in a valid state but passes through an invalid one
 traps at the step that broke the invariant.** There is no "mid-update" mode.
@@ -2409,6 +2411,80 @@ print(w.lo, w.hi)
 This matters when the two writes cross: `w.lo = 12` followed by `w.hi = 14` traps at the first
 write, because 12 is briefly above the 10 still in `hi`. `w.lo, w.hi = 12, 14` does not, and the
 two writes take a struct that was valid before to one that is valid after.
+
+### A module value built from constants is checked while compiling
+
+**A module `val` or `var` constructed from constants has its clauses run by the compiler**, over
+the fields the construction names. Where they hold, the value is
+[constant data](/reference/ffi/#what-constant-data-is): the object file carries it, no check is left
+for the program's start, and an archive for a bare machine — which has no loader to run an
+initializer — may read it. This holds at any depth, for a struct inside an array, inside another
+struct, or as a variant's payload, and for a generic struct at each type it is made at:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+struct Sink
+    buf: [16]u8
+    len: u32
+    cap: u32
+    invariant len <= cap
+
+var sink = Sink([0; 16], 0, 16)
+val full: [2]Sink = [Sink([1; 16], 16, 16), Sink([2; 16], 8, 16)]
+
+@export
+room() -> u32 = sink.cap - sink.len + full[1].len
+```
+
+**Where the clauses do not hold, the construction is refused.** Its fields are constants, so the
+trap it would take when the program starts is certain, and it is reported where the value is
+written, with the clause and the fields:
+
+```sysl
+struct Sink
+    len: u32
+    cap: u32
+    invariant len <= cap
+
+val sink = Sink(17, 16)
+
+main()
+    print(sink.len)
+```
+
+```error
+'sink' traps while it is being compiled: the 'invariant' of 'Sink' does not hold for Sink(17, 16): clause 'len <= cap' at main.sysl:4:15 (main.sysl:6:12)
+```
+
+The clauses are run as any [call in an initializer](/reference/ffi/#what-constant-data-is) is: a
+function they call needs no `const` mark, only a body that holds nothing but what exists while
+compiling. Clauses that read a module `var`, or call a function that does, cannot be run, so the
+storage stays code — filled, and checked, before the program's own statements — and a bare-metal
+archive's refusal of it says the invariant is why:
+
+```sysl build=c target=thumbv7em-freestanding
+module mylib
+
+var limit: u32 = 16
+
+struct Sink
+    len: u32
+    invariant len <= limit
+
+val sink = Sink(3)
+
+@export
+used() -> u32 = sink.len
+```
+
+```error
+'sink' is built from constants, and what keeps it code is the 'invariant' of 'mylib.Sink', which is checked where the value is made — 'sink' cannot be computed while compiling: 'mylib.limit' is filled when the program runs
+```
+
+Two cases keep the meaning they had. A construction whose clauses call a function nobody marked
+`const`, and do not hold, is not refused: the call keeps its meaning, and the program traps when it
+starts. And a construction in a function body is checked when it runs, constants or not.
 
 ### What a write replaces is released after the check
 

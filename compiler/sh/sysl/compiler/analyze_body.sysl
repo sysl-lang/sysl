@@ -2132,6 +2132,18 @@ private laid_storage(cx: &Analyzer, typed: StorageTyped) -> TVal
     val writable = typed.writable
     var init = typed.init
 
+    // **A zero whose structs' clauses all hold for it is the zero**: the checks it came with
+    // (`checked_zero`) are run here, and storage they hold for starts as any other zeroed storage
+    // does, with nothing to run.
+    cx.an.evaluation.last_stop = ""
+
+    if init.is_some() && zero_holds(cx, d.name, init.unwrap())
+        init = None
+    else if cx.an.evaluation.last_stop != ""
+        // Why the zero's checks were left to the program's start.
+        cx.an.evaluation.val_stops.put(typed.key, cx.an.evaluation.last_stop)
+    end if
+
     // An initializer that is constant data but not yet written as literals is written as them, so
     // the object file carries it and nothing runs to fill it in.
     //
@@ -2541,6 +2553,30 @@ private is_zero_expr(e: TExpr) -> bool = *e.kind match
     TZero(_) -> true
     _ -> false
 
+// Whether an initializer is the zero of a type whose structs carry clauses, as `checked_zero` writes
+// it -- each struct's check of its own zero, then the zero -- with every one of those clauses run
+// here and holding.
+private zero_holds(cx: &Analyzer, name: string, init: TExpr) -> bool
+    val b = *init.kind match
+        TBlockExpr(block) -> block
+        _ -> return false
+
+    if b.result.is_none() || !is_zero_expr(b.result.unwrap()) then return false
+
+    for s in b.stmts
+        val check = s match
+            TExprStmt(e) -> e
+            _ -> return false
+
+        *check.kind match
+            TStructInvCheck(value, decl, inv_fn) ->
+                if !is_zero_expr(value) then return false
+                if !const_invariant_holds(cx, name, check.span, value, value, decl, inv_fn, false) then return false
+            _ -> return false
+
+    true
+end zero_holds
+
 // The boundary a declaration asked its storage to start on, where it asked for one.
 private storage_align(cx: &Analyzer, d: ValueDecl) -> Option[usize]
     if d.align.is_none() then return None
@@ -2674,6 +2710,14 @@ private static_image(cx: &Analyzer, name: string, t: TExpr) -> Option[TExpr] = *
         if bits_rewritten(decl) && any_linked_word(parts.unwrap()) then return None
 
         Some(TExpr(t.span, TStructNew(decl, parts.unwrap())))
+    // A struct with an `invariant`, made from constants, is the same data once its clauses have been
+    // run over them here and hold (`const_invariant_holds`): nothing is left to check at startup.
+    TStructInvCheck(value, decl, inv_fn) ->
+        val made = static_image(cx, name, value)
+
+        if made.is_none() then return None
+
+        if const_invariant_holds(cx, name, t.span, value, made.unwrap(), decl, inv_fn, true) then made else None
     // A box written out is laid down as one, as a box a `const` call answers is (`builds_box`).
     TBox(value, ty) -> static_image(cx, name, value).map(x -> TExpr(t.span, TBox(x, ty)))
     TCast(inner, to) -> cast_image(cx, name, t, inner, to)
@@ -3124,6 +3168,7 @@ private unfolded_part(cx: &Analyzer, name: string, t: TExpr) -> TExpr = *t.kind 
     TCast(inner, _) -> part_within(cx, name, inner, t)
     TConstrainedCheck(value, _) -> part_within(cx, name, value, t)
     TErase(operand, _, _) -> part_within(cx, name, operand, t)
+    TStructInvCheck(value, _, _) -> part_within(cx, name, value, t)
     _ -> t
 
 private first_unfolded(cx: &Analyzer, name: string, xs: Buf[TExpr], whole: TExpr) -> TExpr
