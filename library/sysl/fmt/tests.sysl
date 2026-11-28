@@ -200,3 +200,104 @@ wide_flags()
     assert_eq(format_int(i128(m >> 1), 128, "%+d", 0, -1), "+170141183460469231731687303715884105727")
     assert_eq(format_int(-170141183460469231731687303715884105727, 128, "%42d", 0, -1),
               "  -170141183460469231731687303715884105727")
+
+// Past 128 bits a value crosses at its own type, to `format_int_wide`. Each string here was worked
+// out apart from the renderer: 2^255 is an 8 over sixty-three zeros in hexadecimal and a 1 over
+// eighty-five zeros in octal (255 = 3 * 85), and the decimals are the powers of two themselves.
+
+@test("format_int_wide reads every bit of a u256, in every base")
+wide_int_every_base()
+    val top = (u256(1) << 255) + 0xabc
+
+    assert_eq(format_int_wide(top, "%x", 0, -1), "8000000000000000000000000000000000000000000000000000000000000abc")
+    assert_eq(format_int_wide(top, "%X", 0, -1), "8000000000000000000000000000000000000000000000000000000000000ABC")
+    assert_eq(format_int_wide(top, "%d", 0, -1),
+              "57896044618658097711785492504343953926634992332820282019728792003956564822716")
+    assert_eq(format_int_wide(top, "%u", 0, -1), top.to_string())
+    assert_eq(format_int_wide(top, "%o", 0, -1),
+              "10000000000000000000000000000000000000000000000000000000000000000000000000000000005274")
+    assert_eq(format_int_wide(top, "%b", 0, -1).len, 256)
+    assert_eq(format_int_wide(u256::Max, "%x", 0, -1), "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    assert_eq(format_int_wide(u256::Max, "%d", 0, -1), u256::Max.to_string())
+
+@test("format_int_wide keeps a sign, the most negative value's too, and reads it unsigned at its width")
+wide_int_signed()
+    val low = -(i256(1) << 200)
+
+    assert_eq(format_int_wide(low, "%d", 0, -1), "-1606938044258990275541962092341162602522202993782792835301376")
+    assert_eq(format_int_wide(low, "%x", 0, -1), "ffffffffffffff00000000000000000000000000000000000000000000000000")
+    assert_eq(format_int_wide(i256::Min, "%d", 0, -1), i256::Min.to_string())
+    assert_eq(format_int_wide(i256::Min, "%x", 0, -1), "8000000000000000000000000000000000000000000000000000000000000000")
+    assert_eq(format_int_wide(i256(-1), "%x", 0, -1), "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    assert_eq(format_int_wide(i256(-1), "%d", 0, -1), "-1")
+    assert_eq(format_int_wide(i256::Max, "%+d", 0, -1), "+" + i256::Max.to_string())
+    assert_eq(format_int_wide(i512::Min, "%i", 0, -1), i512::Min.to_string())
+
+@test("format_int_wide reads a negative value at a width its storage is wider than")
+wide_int_odd_width()
+    assert_eq(format_int_wide(i200(-1), "%x", 0, -1), "ffffffffffffffffffffffffffffffffffffffffffffffffff")
+    assert_eq(format_int_wide(i200::Min, "%x", 0, -1), "80000000000000000000000000000000000000000000000000")
+    assert_eq(format_int_wide(i129(-1), "%b", 0, -1).len, 129)
+    assert_eq(format_int_wide(i129::Min, "%x", 0, -1), "100000000000000000000000000000000")
+    assert_eq(format_int_wide(u129::Max, "%x", 0, -1), "1ffffffffffffffffffffffffffffffff")
+    assert_eq(format_int_wide(u129::Max, "%d", 0, -1), "680564733841876926926749214863536422911")
+
+@test("format_int_wide keeps a zero inside a decimal, and a value whose low 128 bits are zero")
+wide_int_inner_zeros()
+    val ten45: u256 = 1000000000000000000000000000000000000000000000
+
+    assert_eq(format_int_wide(ten45, "%d", 0, -1), "1000000000000000000000000000000000000000000000")
+    assert_eq(format_int_wide(ten45 + 1, "%d", 0, -1), "1000000000000000000000000000000000000000000001")
+    assert_eq(format_int_wide(ten45 * 1000000000 + 5, "%d", 0, -1),
+              "1000000000000000000000000000000000000000000000000000005")
+    assert_eq(format_int_wide(u256(1) << 128, "%x", 0, -1), "100000000000000000000000000000000")
+    assert_eq(format_int_wide(u256(1) << 128, "%d", 0, -1), "340282366920938463463374607431768211456")
+    assert_eq(format_int_wide(u256(1) << 192, "%o", 0, -1),
+              "10000000000000000000000000000000000000000000000000000000000000000")
+
+@test("format_int_wide takes the flags, widths and precisions format_int does")
+wide_int_flags()
+    for spec in ["%d", "%5d", "%-8d", "%+d", "% d", "%08d", "%.5d", "%.0d", "%+08d", "%08.3d", "%x", "%#x",
+                 "%#010X", "%-#12x", "%12.6x", "%#.0x", "%o", "%#o", "%#.0o", "%b", "%#012b", "%u", "%+x"]
+        for n in [0, 7, 255, 123456789, 2147483647]
+            assert_eq(format_int_wide(u256(n), spec, 0, -1), format_int(i128(n), 32, spec, 0, -1))
+            assert_eq(format_int_wide(i512(n), spec, 0, -1), format_int(i128(n), 32, spec, 0, -1))
+
+    for spec in ["%d", "%5d", "%-8d", "%+d", "% d", "%08d", "%.5d", "%+08d", "%08.3d", "%i"]
+        for n in [-1, -7, -123456789]
+            assert_eq(format_int_wide(i256(n), spec, 0, -1), format_int(i128(n), 32, spec, 0, -1))
+
+    assert_eq(format_int_wide(u256(42), "%*d", 5, -1), "   42")
+    assert_eq(format_int_wide(u256(42), "%*d", -5, -1), "42   ")
+    assert_eq(format_int_wide(u256(42), "%.*d", 0, 4), "0042")
+    assert_eq(format_int_wide(u256(42), "%0.*d", 0, -3), "42")
+    assert_eq(format_int_wide(u256(1) << 128, "%#040x", 0, -1), "0x00000100000000000000000000000000000000")
+    assert_eq(format_int_wide(-(i256(1) << 128), "%045d", 0, -1), "-00000340282366920938463463374607431768211456")
+
+@test("hex, binary and octal read every bit of an integer wider than 128 bits")
+radix_wide()
+    val top = (u256(1) << 255) + 0xabc
+
+    assert_eq(hex(top), "8000000000000000000000000000000000000000000000000000000000000abc")
+    assert_eq(hex(top, 0, true), "8000000000000000000000000000000000000000000000000000000000000ABC")
+    assert_eq(hex(u256(0xab), 66), "0000000000000000000000000000000000000000000000000000000000000000ab")
+    assert_eq(hex(i256(-1)), "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    assert_eq(hex(i200(-1)), "ffffffffffffffffffffffffffffffffffffffffffffffffff")
+    assert_eq(octal(u256(1) << 192), "10000000000000000000000000000000000000000000000000000000000000000")
+    assert_eq(binary(top).len, 256)
+    assert_eq(binary(u512(5), 8), "00000101")
+    assert_eq(hex(top), f"$top%x")
+
+@test("hex, binary and octal read a negative value at its type's width, not its storage's")
+radix_odd_width()
+    val d: i100 = -(1 << 98)
+
+    assert_eq(hex(i24(-1)), "ffffff")
+    assert_eq(hex(i24(-1)), f"${i24(-1)}%x")
+    assert_eq(binary(i12(-1)), "111111111111")
+    assert_eq(octal(i24(-1)), "77777777")
+    assert_eq(hex(d), "c000000000000000000000000")
+    assert_eq(hex(i7(-1)), "7f")
+    assert_eq(hex(u12(4095)), "fff")
+    assert_eq(hex(i128(-1)), "ffffffffffffffffffffffffffffffff")
+    assert_eq(hex(isize(-1)).len, sizeof(isize) * 2)

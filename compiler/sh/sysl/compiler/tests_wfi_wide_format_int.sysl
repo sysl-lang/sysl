@@ -1,0 +1,426 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+import sysl.text.{replace_all, Search}
+
+// An integer wider than 128 bits under a format specifier (`reference/strings.md § Format
+// specifiers`): `${n}%x` over a `u256`, `${n}%d` over an `i1024`. Every conversion reads every bit of
+// the value, at every width, as `to_string` does.
+//
+// The finding this closes: such a hole printed the value's low 128 bits and said nothing --
+// `(1 << 255) + 0xabc` under `%x` was `abc`, and under `%d` it was `2748`.
+//
+// **Nothing here is checked against the renderer under test.** A decimal is held to `to_string`,
+// which divides the value at its own width; a hexadecimal, an octal and a binary to digits shifted
+// out of an `i2048`; and a small value in a wide type to what the same specifier renders for a
+// `long`, which `tests_fmi_format_int.sysl` holds to C's `snprintf`.
+
+// The program built with overflow checks (`debug`) or without them, as a release is, and run.
+private wfi_ran(text: string, debug: bool) -> string
+    val root = make_temp_dir("sysl-wfi").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    val exe = s"$root/built"
+    val was = overflow_checks()
+
+    use_overflow_checks(debug)
+
+    val made = build_native_program(s"$root/main.sysl", None, None, DefaultOptimization, Some(exe))
+
+    use_overflow_checks(was)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return failure_text(why)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end wfi_ran
+
+private wfi_can_run() -> bool
+    if xvr_no_library() then return false
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return false
+
+    true
+end wfi_can_run
+
+// What every generated program starts with: the tally, and the renderings worked out another way.
+private const WfiPrelude: string = raw"""
+    var bad = 0
+
+    chk(got: string, want: string, what: string)
+        if got != want
+            bad += 1
+
+            if bad <= 4 then print(what + ": got [" + got + "] wanted [" + want + "]")
+
+    // The digits of a non-negative `v`, `shift` bits to a digit, shifted out of it.
+    digits_of(v: i2048, shift: int, upper: bool) -> string
+        if v == 0 then return "0"
+
+        val set = if upper then "0123456789ABCDEF" else "0123456789abcdef"
+        val mask = (i2048(1) << shift) - 1
+        var out = ""
+        var rest = v
+
+        while rest > 0
+            val d = usize(rest & mask)
+
+            out = set[d..<d + 1] + out
+            rest = rest >> shift
+
+        out
+
+    fill(c: string, n: int) -> string
+        var out = ""
+        var k = 0
+
+        while k < n
+            out = out + c
+            k += 1
+
+        out
+
+    // A decimal with zeros between its sign and its digits, until there are `n` digits.
+    digits_to(s: string, n: int) -> string
+        val neg = s.starts_with("-")
+        val body = if neg then s[1..<s.len] else s
+
+        (if neg then "-" else "") + fill("0", n - int(body.len)) + body
+
+    """
+
+// One type's checks of a value that takes all of its bits: `TY` is the type and `BITS` its width.
+private const WfiBig: string = raw"""
+    big_TY(v: TY, what: string)
+        val wide = i2048(v)
+        val u = if wide < 0 then wide + (i2048(1) << BITS) else wide
+        val neg = wide < 0
+        val dec = v.to_string()
+        val hex = digits_of(u, 4, false)
+        val oct = digits_of(u, 3, false)
+        val bin = digits_of(u, 1, false)
+        val w = 333
+        val p = 320
+
+        chk(f"${v}%d", dec, what + " TY %d")
+        chk(f"${v}%i", dec, what + " TY %i")
+        chk(f"${v}%u", u.to_string(), what + " TY %u")
+        chk(f"${v}%x", hex, what + " TY %x")
+        chk(f"${v}%X", digits_of(u, 4, true), what + " TY %X")
+        chk(f"${v}%o", oct, what + " TY %o")
+        chk(f"${v}%b", bin, what + " TY %b")
+        chk(f"${v}%#x", (if u == 0 then "" else "0x") + hex, what + " TY %#x")
+        chk(f"${v}%#X", (if u == 0 then "" else "0X") + digits_of(u, 4, true), what + " TY %#X")
+        chk(f"${v}%#b", (if u == 0 then "" else "0b") + bin, what + " TY %#b")
+        chk(f"${v}%#o", (if u == 0 then "" else "0") + oct, what + " TY %#o")
+        chk(f"${v}%+d", (if neg then "" else "+") + dec, what + " TY %+d")
+        chk(f"${v}% d", (if neg then "" else " ") + dec, what + " TY % d")
+        chk(f"${v}%.400d", digits_to(dec, 400), what + " TY %.400d")
+        chk(f"${v}%0400d", digits_to(dec, if neg then 399 else 400), what + " TY %0400d")
+        chk(f"${v}%+0400d", (if neg then "" else "+") + digits_to(dec, 399), what + " TY %+0400d")
+        chk(f"${v}%400d", fill(" ", 400 - int(dec.len)) + dec, what + " TY %400d")
+        chk(f"${v}%-400d|", dec + fill(" ", 400 - int(dec.len)) + "|", what + " TY %-400d")
+        chk(f"${v}%1100x", fill(" ", 1100 - int(hex.len)) + hex, what + " TY %1100x")
+        chk(f"${v}%-1100b|", bin + fill(" ", 1100 - int(bin.len)) + "|", what + " TY %-1100b")
+        chk(f"${v}%01100b", fill("0", 1100 - int(bin.len)) + bin, what + " TY %01100b")
+        chk(f"${v}%.500o", fill("0", 500 - int(oct.len)) + oct, what + " TY %.500o")
+        chk(f"${v}%${w}.${p}x", fill(" ", w - p) + fill("0", p - int(hex.len)) + hex, what + " TY %*.*x")
+        chk(f"${v}%${-w}x|", hex + fill(" ", w - int(hex.len)) + "|", what + " TY %-*x")
+
+    """
+
+private wfi_line(indent: string, ty: string, spec: string) -> string =
+    indent + "chk(f\"${v}" + spec + "\", f\"${r}" + spec + "\", what + \" " + ty + " " + spec + "\")\n"
+
+// One type's checks of a value a `long` holds too, `r`: the wide type renders it as the `long` does.
+// An unsigned conversion of a negative value reads it at its width, so only a non-negative one is
+// compared there.
+private wfi_small(ty: string) -> string
+    val signed = ["%d", "%i", "%5d", "%-8d|", "%+d", "% d", "%08d", "%.5d", "%.0d", "%+08d", "%-+8d|",
+                  "% 08d", "%08.3d", "%30d", "%030d", "%.30d", "%-030d|", "%+.0d"]
+    val unsigned = ["%u", "%x", "%X", "%#x", "%#X", "%#010x", "%-#12x|", "%12.6x", "%#.0x", "%.0x",
+                    "%o", "%#o", "%#.0o", "%08o", "%#.3o", "%b", "%#b", "%#012b", "%.9b", "%30X",
+                    "%+x", "% x", "%025u", "%#030X"]
+    var t = "small_" + ty + "(v: " + ty + ", r: long, what: string)\n"
+
+    for spec in signed
+        t = t + wfi_line("    ", ty, spec)
+
+    t = t + "\n    if r >= 0\n"
+
+    for spec in unsigned
+        t = t + wfi_line("        ", ty, spec)
+
+    t + "\n"
+end wfi_small
+
+// The program for one width, signed and unsigned: every conversion and flag over the values that
+// find a renderer reading less than the whole value -- the extremes, a value whose low 128 bits are
+// all zero, one bit above a low word, a decimal with a run of zeros inside it, and the small ones.
+private wfi_program(bits: int) -> string
+    var t = WfiPrelude
+
+    for signed in [false, true]
+        val ty = (if signed then "i" else "u") + bits.to_string()
+
+        t = t + replace_all(replace_all(WfiBig, "TY", ty), "BITS", bits.to_string()) + wfi_small(ty)
+
+    for signed in [false, true]
+        val ty = (if signed then "i" else "u") + bits.to_string()
+        val top = if signed then bits - 2 else bits - 1
+        var bigs: Buf[string] = buf()
+
+        bigs.push(ty + "::Max")
+        bigs.push(ty + "::Min")
+        bigs.push("one << " + top.to_string())
+        bigs.push("(one << " + top.to_string() + ") + 0xabc")
+        bigs.push("(one << " + (bits - 3).to_string() + ") - 1")
+        bigs.push("(one << 127) + (one << 64)")
+        bigs.push("ten27")
+        bigs.push("ten27 + 1")
+        bigs.push("ten27 * 1000000000 * 100 + 7")
+        bigs.push("one * 0xabc")
+        bigs.push("one - 1")
+
+        if signed
+            bigs.push("-(one << " + top.to_string() + ")")
+            bigs.push("-(one << " + top.to_string() + ") - 0xabc")
+            bigs.push("-one")
+            bigs.push("-ten27")
+            bigs.push(ty + "::Min + 1")
+        end if
+
+        t = t + "check_" + ty + "()\n    val one: " + ty + " = 1\n    val ten27: " + ty +
+            " = 1000000000000000000000000000\n"
+
+        for b in bigs.view()
+            t = t + "    big_" + ty + "(" + b + ", \"" + b + "\")\n"
+
+        for s in ["0", "7", "255", "1234567890123456789", "-7", "-1234567890123456789", "-1"]
+            if signed || !s.starts_with("-") then
+                t = t + "    small_" + ty + "(" + s + ", " + s + ", \"" + s + "\")\n"
+
+        t = t + "\n"
+    end for
+
+    t + "check_u" + bits.to_string() + "()\ncheck_i" + bits.to_string() + "()\n" +
+        "print(\"mismatches \" + bad.to_string())\n"
+end wfi_program
+
+private wfi_width(bits: int, debug: bool)
+    if !wfi_can_run() then return
+
+    assert_eq(wfi_ran(wfi_program(bits), debug), "mismatches 0\n")
+
+// -- the finding ------------------------------------------------------------------------------------
+
+@test("the reduction: a u256 with its top bit set prints every digit under %x and %d")
+wfi_the_reduction()
+    if !wfi_can_run() then return
+
+    val program = raw"""
+        main(args: []string)
+            val wide: u256 = (1 << 255) + 0xabc
+            val mid: u128 = (1 << 100) + 0xabc
+            val low: i256 = -(1 << 200)
+
+            print(f"${mid}%x ${wide}%x")
+            print(f"${wide}%d")
+            print(wide)
+            print(f"${wide}%o")
+            print(f"${wide}%b".len)
+            print(f"${low}%d")
+        """
+
+    assert_eq(wfi_ran(program, true),
+              "10000000000000000000000abc 8000000000000000000000000000000000000000000000000000000000000abc\n" +
+              "57896044618658097711785492504343953926634992332820282019728792003956564822716\n" +
+              "57896044618658097711785492504343953926634992332820282019728792003956564822716\n" +
+              "10000000000000000000000000000000000000000000000000000000000000000000000000000000005274\n" +
+              "256\n" +
+              "-1606938044258990275541962092341162602522202993782792835301376\n")
+end wfi_the_reduction
+
+// -- every width, every conversion, every flag --------------------------------------------------------
+
+@test("a 129-bit integer, one bit past the carrier a narrower one crosses at, renders every bit")
+wfi_width_129()
+    wfi_width(129, true)
+
+@test("a 200-bit integer, a width no storage size matches, reads a negative value at 200 bits")
+wfi_width_200()
+    wfi_width(200, true)
+
+@test("a 256-bit integer renders every bit under every conversion and flag")
+wfi_width_256()
+    wfi_width(256, true)
+
+@test("a 512-bit integer renders every bit under every conversion and flag")
+wfi_width_512()
+    wfi_width(512, true)
+
+@test("a 1024-bit integer renders every bit under every conversion and flag")
+wfi_width_1024()
+    wfi_width(1024, true)
+
+@test("built as a release, a 200-bit and a 256-bit integer render as the debug build's do")
+wfi_release()
+    wfi_width(200, false)
+    wfi_width(256, false)
+
+// -- where the value comes from ---------------------------------------------------------------------
+
+@test("a wide integer out of a field, an element, a call, a parameter and a loop renders whole")
+wfi_sources()
+    if !wfi_can_run() then return
+
+    val program = raw"""
+        struct Pair
+            a: u256
+            b: i512
+
+        top() -> u256 = u256(0xf) << 252
+
+        shown(x: u256) -> string = f"${x}%x"
+
+        main(args: []string)
+            val p = Pair(top() + 1, -(i512(1) << 300))
+            val xs: [2]u256 = [top(), 5]
+            var k: u256 = 1
+
+            for _ in 0..<130
+                k = k * 2
+
+            print(f"${p.a}%X")
+            print(f"${p.b}%d")
+            print(f"${xs[0]}%#x ${xs[1]}%04x")
+            print(f"${top() + 2}%x")
+            print(shown(k))
+            print(f"[${k}%45d] [${k}%-45d]")
+            print(s"${k}")
+        """
+
+    assert_eq(wfi_ran(program, true),
+              "F000000000000000000000000000000000000000000000000000000000000001\n" +
+              "-2037035976334486086268445688409378161051468393665936250636140449354381299763336706183397376\n" +
+              "0xf000000000000000000000000000000000000000000000000000000000000000 0005\n" +
+              "f000000000000000000000000000000000000000000000000000000000000002\n" +
+              "400000000000000000000000000000000\n" +
+              "[     1361129467683753853853498429727072845824] [1361129467683753853853498429727072845824     ]\n" +
+              "1361129467683753853853498429727072845824\n")
+end wfi_sources
+
+@test("a constant wide integer under a specifier, in a body and in a module val, renders whole")
+wfi_constants()
+    if !wfi_can_run() then return
+
+    val program = raw"""
+        val K: u256 = 0xdeadbeef00000000000000000000000000000000000000000000000000000001
+        val Text: string = f"${K}%x"
+
+        main(args: []string)
+            print(Text)
+            print(f"${K}%d")
+            print(f"${u256(1) << 128}%x")
+            print(f"${i256(-1)}%x")
+        """
+
+    assert_eq(wfi_ran(program, true),
+              "deadbeef00000000000000000000000000000000000000000000000000000001\n" +
+              "100720434702924942364018397558880508427273416251376888068364465368051161759745\n" +
+              "100000000000000000000000000000000\n" +
+              "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n")
+end wfi_constants
+
+// -- what was right before stays as it was ------------------------------------------------------------
+
+@test("an integer of 128 bits or fewer renders exactly as it did, at 127, 128 and the odd widths")
+wfi_narrow_unchanged()
+    if !wfi_can_run() then return
+
+    val program = raw"""
+        main(args: []string)
+            val m: u128 = 340282366920938463463374607431768211455
+            val lo: i128 = -170141183460469231731687303715884105727 - 1
+            val a: u127 = (1 << 126) + 0xabc
+            val b: i24 = -1
+            val c: u12 = 4095
+            val d: i100 = -(1 << 98)
+
+            print(f"$m%d $m%x $m%#o")
+            print(f"$lo%d $lo%x")
+            print(f"$a%x $a%d")
+            print(f"$b%x $b%d $b%o $b%b")
+            print(f"$c%x $c%05d $c%#b")
+            print(f"$d%x $d%d")
+            print(f"${-42}%06d ${255}%#010X ${7}%.3d ${0}%.0d|")
+        """
+
+    assert_eq(wfi_ran(program, true),
+              "340282366920938463463374607431768211455 ffffffffffffffffffffffffffffffff " +
+              "03777777777777777777777777777777777777777777\n" +
+              "-170141183460469231731687303715884105728 80000000000000000000000000000000\n" +
+              "40000000000000000000000000000abc 85070591730234615865843651857942055612\n" +
+              "ffffff -1 77777777 111111111111111111111111\n" +
+              "fff 04095 0b111111111111\n" +
+              "c000000000000000000000000 -316912650057057350374175801344\n" +
+              "-00042 0X000000FF 007 |\n")
+end wfi_narrow_unchanged
+
+// -- a bare target ------------------------------------------------------------------------------------
+
+// Three renderings and no more: the smallest board's allocator is two kilobytes that are never
+// handed back, and each of these strings is built from a few shorter ones.
+private const WfiBoardBody: string = raw"""
+    var wrong = 0
+    val one: u129 = 1
+    val top = (one << 128) + 0xabc
+    val low: i129 = -(i129(1) << 127) - 1
+    val odd: i200 = -1
+
+    if f"${top}%x" != "100000000000000000000000000000abc" then wrong += 1
+    if f"${low}%d" != "-170141183460469231731687303715884105729" then wrong += 1
+    if f"${odd}%o" != "3777777777777777777777777777777777777777777777777777777777777777777" then wrong += 1
+    w.write("wfi ".bytes)
+    wrong.display(w, FormatSpec(0, -1, false))
+    w.write(" done".bytes)
+    """
+
+@test("on every QEMU board a wide integer under a specifier renders what the host renders")
+wfi_on_the_boards()
+    var bad: Buf[string] = buf()
+    var ran: usize = 0
+
+    for b in qemu_boards()
+        var files: Buf[(string, string)] = buf()
+
+        files.push(("p.sysl", "import board.*\n\nval w = console()\n\n" + WfiBoardBody))
+        files.push(("board/board.sysl", qemu_board_module(b)))
+        ran += 1
+
+        qemu_boot(b, files) match
+            Err(why) -> bad.push(s"${b.name}: $why")
+            Ok(r) ->
+                if !r.status.ok() || !r.out.contains("wfi 0 done") then
+                    bad.push(s"${b.name} (${b.target}): ${qemu_said(b, r)}")
+    end for
+
+    assert(ran > 0, "no board was booted")
+    assert(bad.is_empty(), joined(bad, "\n"))
+end wfi_on_the_boards

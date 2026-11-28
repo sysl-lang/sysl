@@ -844,6 +844,26 @@ print(f"[${n}%+05d] [${n}%x] [${n}%#o] [${255}%#b] [${42}%-6u]")
 [-0006] [fa] [0372] [0b11111111] [42    ]
 ```
 
+**An integer of any width renders whole.** Every conversion reads every bit of the value, a `u256`
+or an `i1024` as much as a `u8`, and `%d` prints what `to_string` does:
+
+```sysl
+val wide: u256 = (1 << 255) + 0xabc
+val low: i256 = -(1 << 200)
+
+print(f"${wide}%x")
+print(f"${wide}%d")
+print(f"${low}%d")
+print(f"[${low}%#x]")
+```
+
+```output
+8000000000000000000000000000000000000000000000000000000000000abc
+57896044618658097711785492504343953926634992332820282019728792003956564822716
+-1606938044258990275541962092341162602522202993782792835301376
+[0xffffffffffffff00000000000000000000000000000000000000000000000000]
+```
+
 ```sysl
 val name = "zoë"
 val cut = 2
@@ -856,7 +876,7 @@ print(f"[${name}%-6s] [${name}%6s] [${name}%.${cut}s] [${name}%-8.${cut}s]")
 ```
 
 **Every conversion is rendered by sysl itself**, flag for flag as C renders it — an integer by
-`sysl.fmt.format_int`, a string by `sysl.fmt.format_str`, a float by
+`sysl.fmt.format_int` (`format_int_wide` above 128 bits), a string by `sysl.fmt.format_str`, a float by
 [`format_real`](/library/fmt/#floats), whose digits are the exact value's, rounded half to even at
 whatever precision is asked, and a fixed-point value by `format_fixed`, from its raw integer and
 equally exactly — so a specifier works the same on a target with no C library. An

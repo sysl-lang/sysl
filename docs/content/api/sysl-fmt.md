@@ -14,7 +14,7 @@ rendering itself through `Display` is handed the `FormatSpec` the same count mak
 
 ## Index
 
-[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`fixed_scratch_len`](#fixed_scratch_len) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_fixed_wide`](#format_fixed_wide) [`format_int`](#format_int) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`real_digits`](#real_digits) [`real_digits`](#real_digits-1) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_fixed_wide`](#write_fixed_wide) [`write_real`](#write_real) [`FormatError`](#formaterror) [`RealDigits`](#realdigits) [`RealKind`](#realkind) [Display for FormatError](#display-for-formaterror)
+[`f128_scratch_len`](#f128_scratch_len) [`float_scratch_len`](#float_scratch_len) [`binary`](#binary) [`fixed_scratch_len`](#fixed_scratch_len) [`format_bf16_plain`](#format_bf16_plain) [`format_count`](#format_count) [`format_f128`](#format_f128) [`format_f128_plain`](#format_f128_plain) [`format_f128_shortest`](#format_f128_shortest) [`format_f16_plain`](#format_f16_plain) [`format_f32`](#format_f32) [`format_f32_plain`](#format_f32_plain) [`format_fixed`](#format_fixed) [`format_fixed_wide`](#format_fixed_wide) [`format_int`](#format_int) [`format_int_wide`](#format_int_wide) [`format_real`](#format_real) [`format_real_plain`](#format_real_plain) [`format_spec_of`](#format_spec_of) [`format_str`](#format_str) [`hex`](#hex) [`octal`](#octal) [`real_digits`](#real_digits) [`real_digits`](#real_digits-1) [`shortest`](#shortest) [`shortest`](#shortest-1) [`shortest`](#shortest-2) [`write_f128`](#write_f128) [`write_f32`](#write_f32) [`write_fixed`](#write_fixed) [`write_fixed_wide`](#write_fixed_wide) [`write_real`](#write_real) [`FormatError`](#formaterror) [`RealDigits`](#realdigits) [`RealKind`](#realkind) [Display for FormatError](#display-for-formaterror)
 
 ## Constants
 
@@ -182,6 +182,20 @@ zero on an octal and `0x`, `0X` or `0b` on a non-zero hexadecimal or binary. A s
 (`d`, `i`) keeps the value's sign, and an unsigned one (`u`, `o`, `x`, `X`, `b`) reads the value at
 its own width, so `%x` of an `i32 -1` is `ffffffff` and of a `u8 255` is `ff`.
 
+### `format_int_wide`
+
+```sysl
+format_int_wide[T: Integer](n: T, spec: string, width: int, precision: int) -> string
+```
+
+`format_int` for an integer wider than 128 bits, which has no `i128` to cross at and so crosses
+at its own type: `${n}%x` over a `u256`, `${n}%d` over an `i1024`. The rendering is `format_int`'s,
+flag for flag, and every bit of the value is read: a signed conversion keeps the sign, the most
+negative value of the width included, and an unsigned one reads a negative value as its two's
+complement at the width of `T`. The working storage is sized by the type and lives on the stack:
+the value is taken apart into 32-bit limbs once, and the digits come out of those in `u64`
+arithmetic.
+
 ### `format_real`
 
 ```sysl
@@ -251,7 +265,8 @@ An integer in base sixteen, as the string `f"$v%x"` makes, for code that wants t
 writing an `f"…"`. `width` is a minimum count of digits, padded with zeros on the left, and `upper`
 picks `A`-`F`. A negative value reads at its own width, two's complement, so `hex(i8(-1))` is
 `"ff"` and `hex(-1)` (an `int`) is `"ffffffff"`. There is no `0x` prefix. Every integer
-width is exact, `u128` and `i128` included, with no C library and no 128-bit division.
+width is exact, a `u256` or an `i1024` as much as a `u8`, with no C library and no 128-bit
+division.
 
 ### `octal`
 

@@ -2378,7 +2378,8 @@ end format_call
 
 // **An integer under a specifier is rendered by the library's `format_int`, never by C's
 // `snprintf`**, so `${n}%08x` means the same on a target with no C library as on a hosted one. The
-// value crosses at `i128`, which holds any integer up to 64 bits exactly, beside the width of the
+// value crosses at `i128`, which holds any integer up to 128 bits (a `u128` as its two's
+// complement), beside the width of the
 // type it came from, which an unsigned conversion reads it at; the specifier crosses as written, and
 // a `*` in it reads the width or the precision handed over beside it.
 private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: string,
@@ -2398,6 +2399,16 @@ private int_format_call(cx: &Analyzer, span: Span, v: TExpr, ty: Type, spec: str
     val written = if unsigned && bits == 128 && decimal then spec[0..<spec.bytes.len - 1] + "u" else spec
 
     var lead: Buf[TExpr] = buf()
+
+    // An integer wider than 128 bits has no `i128` to cross at: the cast would keep its low 128 bits
+    // and print those. It crosses at its own width and signedness, to the renderer generic over it.
+    if bits > 128 && library_key(cx, "format_int_wide").is_some()
+        val own = Integer(bits, !unsigned, false, None)
+
+        lead.push(if type_eq(ty, own) then v else TExpr(span, TCast(v, own)))
+
+        return library_format_call(cx, span, "format_int_wide", lead, spec, counts)
+    end if
 
     lead.push(TExpr(span, TCast(v, Integer(128, true, false, None))))
     lead.push(TExpr(span, TIntLit(from_int(long(bits)), int_type())))
@@ -2478,7 +2489,7 @@ private library_format_call(cx: &Analyzer, span: Span, renderer: string, lead: B
     if stars.1 then args.push(counts[next])
     else args.push(TExpr(span, TIntLit(from_int(-1), int_type())))
 
-    if renderer == "format_fixed_wide"
+    if renderer == "format_fixed_wide" || renderer == "format_int_wide"
         var targs: Buf[Type] = buf()
 
         targs.push(texpr_type(args[0]))

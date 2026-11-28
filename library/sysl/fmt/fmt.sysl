@@ -31,65 +31,9 @@ import sysl.{Integer, Big, FloatField, FloatValue, f32_value, fixed_value, quad_
  * its own width, so `%x` of an `i32 -1` is `ffffffff` and of a `u8 255` is `ff`.
  */
 format_int(n: i128, bits: int, spec: string, width: int, precision: int) -> string
-    val b = spec.bytes
-    val last = b.len - 1
-    val conv = b[last]
-    var i: usize = 1
-    var left = false
-    var plus = false
-    var space = false
-    var zero = false
-    var alt = false
-
-    while i < last && is_flag(b[i])
-        if b[i] == u8('-') then left = true
-        if b[i] == u8('+') then plus = true
-        if b[i] == u8(' ') then space = true
-        if b[i] == u8('0') then zero = true
-        if b[i] == u8('#') then alt = true
-
-        i += 1
-
-    var w = 0
-
-    if i < last && b[i] == u8('*')
-        w = width
-        i += 1
-    else
-        while i < last && is_digit(b[i])
-            w = w * 10 + int(b[i] - u8('0'))
-            i += 1
-    end if
-
-    if w < 0
-        left = true
-        w = -w
-    end if
-
-    var p = -1
-
-    if i < last && b[i] == u8('.')
-        i += 1
-
-        if i < last && b[i] == u8('*')
-            p = if precision < 0 then -1 else precision
-        else
-            p = 0
-
-            while i < last && is_digit(b[i])
-                p = p * 10 + int(b[i] - u8('0'))
-                i += 1
-        end if
-    end if
-
-    val signed = conv == u8('d') || conv == u8('i')
-    val upper = conv == u8('X')
-    val base: u32 = if conv == u8('o') then 8
-    else if conv == u8('x') || conv == u8('X') then 16
-    else if conv == u8('b') then 2
-    else 10
-
-    val negative = signed && n < 0
+    val f = int_field(spec, width, precision)
+    val base = int_base(f.conv)
+    val negative = int_signed(f.conv) && n < 0
     val mag = magnitude(n, bits, negative)
 
     // The digits, written from the end of room for the longest: a hundred and twenty-eight binary ones.
@@ -97,13 +41,13 @@ format_int(n: i128, bits: int, spec: string, width: int, precision: int) -> stri
     var at: usize = 128
     var rest = mag
 
-    if !(mag == 0 && p == 0)
+    if !(mag == 0 && f.prec == 0)
         loop
             // Base ten divides; the others shift and mask, so no 128-bit division is called.
             val shift = if base == 16 then 4 else if base == 8 then 3 else 1
             val next = if base == 10 then tenth(rest) else rest >> shift
             val d = if base == 10 then u8(rest - next * 10) else u8(rest - (next << shift))
-            val ten = if upper then u8('A') else u8('a')
+            val ten = if f.conv == u8('X') then u8('A') else u8('a')
 
             at -= 1
             digits[at] = if d < 10 then u8('0') + d else ten + d - 10
@@ -112,39 +56,259 @@ format_int(n: i128, bits: int, spec: string, width: int, precision: int) -> stri
             if rest == 0 then break
     end if
 
-    val count = int(128 - at)
-    var zeros = if p > count then p - count else 0
+    int_laid(f, negative, mag != 0, digits[at..])
+end format_int
 
-    if alt && base == 8 && zeros == 0 && (count == 0 || digits[at] != u8('0')) then zeros = 1
+/** `format_int` for an integer wider than 128 bits, which has no `i128` to cross at and so crosses
+ * at its own type: `${n}%x` over a `u256`, `${n}%d` over an `i1024`. The rendering is `format_int`'s,
+ * flag for flag, and every bit of the value is read: a signed conversion keeps the sign, the most
+ * negative value of the width included, and an unsigned one reads a negative value as its two's
+ * complement at the width of `T`. The working storage is sized by the type and lives on the stack:
+ * the value is taken apart into 32-bit limbs once, and the digits come out of those in `u64`
+ * arithmetic.
+ */
+format_int_wide[T: Integer](n: T, spec: string, width: int, precision: int) -> string
+    var limbs: [sizeof(T) / 4 + 2]u32
+    var digits: [sizeof(T) * 8 + 16]u8
+    val f = int_field(spec, width, precision)
+    val zero: T = 0
+    val negative = int_signed(f.conv) && n < zero
+    var count = limbs_of(n, limbs[..])
+
+    if n < zero && !negative
+        val top = limbs_of(T::Max, limbs[..])
+        val bits = (top - 1) * 32 + bits_of(limbs[top - 1]) + 1
+
+        count = complement(limbs[..], limbs_of(n, limbs[..]), bits)
+    end if
+
+    val at = limb_digits(limbs[0..<count], f, digits[..])
+
+    int_laid(f, negative, count != 0, digits[at..])
+end format_int_wide
+
+// An integer specifier's flags, width and precision. A negative width left-justifies at its
+// magnitude and a negative precision is as though none was written, which is `-1` here.
+private struct IntField
+    conv: u8
+    width: int
+    prec: int
+    left: bool
+    plus: bool
+    space: bool
+    zero: bool
+    alt: bool
+
+private int_field(spec: string, width: int, precision: int) -> IntField
+    val b = spec.bytes
+    val last = b.len - 1
+    var f = IntField(b[last], 0, -1, false, false, false, false, false)
+    var i: usize = 1
+
+    while i < last && is_flag(b[i])
+        if b[i] == u8('-') then f.left = true
+        if b[i] == u8('+') then f.plus = true
+        if b[i] == u8(' ') then f.space = true
+        if b[i] == u8('0') then f.zero = true
+        if b[i] == u8('#') then f.alt = true
+
+        i += 1
+
+    if i < last && b[i] == u8('*')
+        f.width = width
+        i += 1
+    else
+        while i < last && is_digit(b[i])
+            f.width = f.width * 10 + int(b[i] - u8('0'))
+            i += 1
+    end if
+
+    if f.width < 0
+        f.left = true
+        f.width = -f.width
+    end if
+
+    if i < last && b[i] == u8('.')
+        i += 1
+
+        if i < last && b[i] == u8('*')
+            f.prec = if precision < 0 then -1 else precision
+        else
+            f.prec = 0
+
+            while i < last && is_digit(b[i])
+                f.prec = f.prec * 10 + int(b[i] - u8('0'))
+                i += 1
+        end if
+    end if
+
+    f
+end int_field
+
+private int_signed(conv: u8) -> bool = conv == u8('d') || conv == u8('i')
+
+private int_base(conv: u8) -> u32 =
+    if conv == u8('o') then 8
+    else if conv == u8('x') || conv == u8('X') then 16
+    else if conv == u8('b') then 2
+    else 10
+
+// The field around an integer's digits: the sign and the base's prefix, the zeros a precision or a
+// `0` flag asks for, and the padding to the width. `digits` is the magnitude's, empty for a zero
+// under a precision of zero, and `nonzero` says whether the magnitude is.
+private int_laid(f: IntField, negative: bool, nonzero: bool, digits: []const u8) -> string
+    val base = int_base(f.conv)
+    val count = int(digits.len)
+    var zeros = if f.prec > count then f.prec - count else 0
+
+    if f.alt && base == 8 && zeros == 0 && (count == 0 || digits[0] != u8('0')) then zeros = 1
 
     // The sign and the base's prefix, which zeros pad after and spaces pad before.
     var head: [3]u8 = [0; 3]
     var h: usize = 0
 
-    if negative || (signed && (plus || space))
-        head[0] = if negative then u8('-') else if plus then u8('+') else u8(' ')
+    if negative || (int_signed(f.conv) && (f.plus || f.space))
+        head[0] = if negative then u8('-') else if f.plus then u8('+') else u8(' ')
         h = 1
     end if
 
-    if alt && mag != 0 && (base == 16 || base == 2)
+    if f.alt && nonzero && (base == 16 || base == 2)
         head[h] = u8('0')
-        head[h + 1] = if base == 2 then u8('b') else conv
+        head[h + 1] = if base == 2 then u8('b') else f.conv
         h += 2
     end if
 
     val body = int(h) + zeros + count
-    var pad = if w > body then w - body else 0
+    var pad = if f.width > body then f.width - body else 0
 
-    if zero && !left && p < 0
+    if f.zero && !f.left && f.prec < 0
         zeros += pad
         pad = 0
     end if
 
-    val field = from_utf8_unchecked(head[0..<h]) + run_of("0", zeros) +
-        from_utf8_unchecked(digits[at..])
+    val field = from_utf8_unchecked(head[0..<h]) + run_of("0", zeros) + from_utf8_unchecked(digits)
 
-    if left then field + run_of(" ", pad) else run_of(" ", pad) + field
-end format_int
+    if f.left then field + run_of(" ", pad) else run_of(" ", pad) + field
+end int_laid
+
+// The magnitude of `n` as 32-bit limbs, least significant first, and how many of them there are:
+// none for zero. The sign stays on until the last moment, as `Display` for an integer keeps it, so
+// the most negative value of a width needs no wider type to negate into.
+private limbs_of[T: Integer](n: T, limbs: []u32) -> usize
+    val zero: T = 0
+    val two: T = 2
+    var base: T = 1
+
+    for _ in 0..<32
+        base = base * two
+
+    val neg = n < zero
+    var rest = n
+    var count: usize = 0
+
+    while rest != zero
+        val q = rest / base
+        val r = rest - q * base
+
+        limbs[count] = if neg then u32(zero - r) else u32(r)
+        count += 1
+        rest = q
+
+    count
+end limbs_of
+
+// The two's complement, at `bits` bits, of the magnitude in the first `count` limbs: what an
+// unsigned conversion reads a negative value as. Answers how many limbs the result takes.
+private complement(limbs: []u32, count: usize, bits: usize) -> usize
+    val words = (bits + 31) / 32
+    var carry: u64 = 1
+
+    for k in 0..<words
+        val limb = if k < count then limbs[k] else 0
+        val sum = u64(0xffffffff - limb) + carry
+
+        limbs[k] = u32(sum & 0xffffffff)
+        carry = sum >> 32
+
+    if bits % 32 != 0 then limbs[words - 1] = limbs[words - 1] & ((u32(1) << (bits % 32)) - 1)
+
+    var left = words
+
+    while left > 0 && limbs[left - 1] == 0
+        left -= 1
+
+    left
+end complement
+
+// The digits of the magnitude in `limbs` under `f`'s conversion, written to the end of `digits`;
+// answers where they start. A zero is one `0`, or nothing under a precision of zero. Base ten
+// divides the limbs by 10^9 in place, nine digits a pass; the other bases read the bits.
+private limb_digits(limbs: []u32, f: IntField, digits: []u8) -> usize
+    var at = digits.len
+
+    if limbs.len == 0
+        if f.prec != 0
+            at -= 1
+            digits[at] = u8('0')
+        end if
+
+        return at
+    end if
+
+    val base = int_base(f.conv)
+
+    if base == 10
+        var left = limbs.len
+
+        while left > 0
+            var r: u64 = 0
+            var k = left
+
+            while k > 0
+                k -= 1
+
+                val cur = (r << 32) | u64(limbs[k])
+
+                limbs[k] = u32(cur / 1000000000)
+                r = cur % 1000000000
+
+            while left > 0 && limbs[left - 1] == 0
+                left -= 1
+
+            // Every pass but the last one writes all nine of its digits, zeros included.
+            var d = 0
+
+            while r > 0 || (left > 0 && d < 9)
+                at -= 1
+                digits[at] = u8('0') + u8(r % 10)
+                r /= 10
+                d += 1
+
+        return at
+    end if
+
+    val shift: usize = if base == 16 then 4 else if base == 8 then 3 else 1
+    val top = (limbs.len - 1) * 32 + bits_of(limbs[limbs.len - 1])
+    val ten = if f.conv == u8('X') then u8('A') else u8('a')
+    var bit: usize = 0
+
+    while bit < top
+        var d: u8 = 0
+        var weight: u8 = 1
+
+        for j in 0..<shift
+            val k = bit + j
+
+            if k < top && ((limbs[k / 32] >> (k % 32)) & 1) != 0 then d += weight
+
+            weight *= 2
+
+        at -= 1
+        digits[at] = if d < 10 then u8('0') + d else ten + d - 10
+        bit += shift
+
+    at
+end limb_digits
 
 /** A float rendered through a printf specifier, written here rather than handed to C's `snprintf`,
  * so a target with no C library formats `${x}%.3f` exactly as a hosted one does -- and a hosted one
@@ -612,7 +776,8 @@ end float_field
  * writing an `f"…"`. `width` is a minimum count of digits, padded with zeros on the left, and `upper`
  * picks `A`-`F`. A negative value reads at its own width, two's complement, so `hex(i8(-1))` is
  * `"ff"` and `hex(-1)` (an `int`) is `"ffffffff"`. There is no `0x` prefix. Every integer
- * width is exact, `u128` and `i128` included, with no C library and no 128-bit division.
+ * width is exact, a `u256` or an `i1024` as much as a `u8`, with no C library and no 128-bit
+ * division.
  */
 hex[T: Integer](v: T, width: int = 0, upper: bool = false) -> string =
     radix(v, if upper then "X" else "x", width)
@@ -628,7 +793,22 @@ binary[T: Integer](v: T, width: int = 0) -> string = radix(v, "b", width)
 octal[T: Integer](v: T, width: int = 0) -> string = radix(v, "o", width)
 
 private radix[T: Integer](v: T, conv: string, width: int) -> string =
-    format_int(i128.wrap(v), int(sizeof(T)) * 8, radix_spec(conv, width), 0, -1)
+    if sizeof(T) > 16 then format_int_wide(v, radix_spec(conv, width), 0, -1)
+    else format_int(i128.wrap(v), width_of[T](), radix_spec(conv, width), 0, -1)
+
+// How many bits an integer type of 128 or fewer has, counted from its largest value: an `i24` is
+// stored in four bytes and has twenty-four, which is the width its negative values read at.
+private width_of[T: Integer]() -> int
+    val zero: T = 0
+    var top = u128.wrap(T::Max)
+    var bits = if T::Min < zero then 1 else 0
+
+    while top != 0
+        top = top >> 1
+        bits += 1
+
+    bits
+end width_of
 
 // The specifier for one conversion letter and a minimum digit count: `%x`, or `%012x` for twelve.
 private radix_spec(conv: string, width: int) -> string =

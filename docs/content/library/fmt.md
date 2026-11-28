@@ -102,6 +102,27 @@ ffffffffffffffffffffffffffffffff
 80000000000000000000000000000000
 ```
 
+**So is every width above 128 bits, and every width between the storage sizes.** A `u256` or an
+`i1024` crosses at its own type, to `format_int_wide`, and a negative `i24` reads at twenty-four bits
+though it is stored in thirty-two:
+
+```sysl
+import sysl.fmt.{hex, octal}
+
+val wide: u256 = (1 << 255) + 0xabc
+val odd: i24 = -1
+
+print(hex(wide))
+print(f"$wide%d")
+print(hex(odd), octal(odd), hex(i200(-1)))
+```
+
+```output
+8000000000000000000000000000000000000000000000000000000000000abc
+57896044618658097711785492504343953926634992332820282019728792003956564822716
+ffffff 77777777 ffffffffffffffffffffffffffffffffffffffffffffffffff
+```
+
 **A width never truncates** — `hex(u32(0x12345), 2)` is `12345` — and a width of zero or less asks for
 no padding.
 
