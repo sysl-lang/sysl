@@ -1,0 +1,258 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.text.Search
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// A field's array length computed from the type's value parameters (`kids: [B + 1]Child`,
+// `reference/generics.md § What may be written with N`): accepted, compared at the definition by the
+// form a struct's value argument is compared by, and folded by each instance.
+//
+// The axes: the operation (`+`, `*`, `-`, `/`, a comparison under `if`, a `const` call, a `match`),
+// the holder (a struct's field, an enum's payload, a field of arrays of arrays, a field beside a
+// wrapper struct taking the same argument), the element (a scalar, the type's own `T`, a `&T` with
+// a `Drop`, another generic type over the same parameter), what the definition compares (one form
+// spelled two ways, two forms, a form against a wrapper's), what an instance folds to (a count, zero,
+// below zero), the cap (degree, in a field), the parameter (one, two, defaulted), the file the type
+// is declared in, and what is still refused (a signature, a body's local, a `match`).
+//
+// Cells skipped: a `.syslib` and codegen units (a form is never emitted -- an instance's length is a
+// number), bare metal (the same: nothing new is emitted, and `tests_ilb_`'s board build holds such a
+// field), and a vector's lane count in a field (`<(N * 2)>f32`, which no refusal ever reached there).
+
+private fcl_skip() -> bool
+    if std_root().is_err()
+        print("skipped: the standard module's source is not on this machine")
+        return true
+
+    if !clang_available()
+        print("skipped: there is no clang on this machine")
+        return true
+
+    false
+end fcl_skip
+
+// What the program PRINTS, or what the build had to say about it. `files` are (path, text) beside
+// `main.sysl`.
+private fcl_ran(main: string, files: []const (string, string) = []) -> string
+    val root = make_temp_dir("sysl-fcl").unwrap()
+
+    make_dir_all(root).unwrap()
+    write_text(root + "/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(root + "/main.sysl", main).unwrap()
+
+    for f in files
+        val slash = f.0.index_of("/").unwrap()
+
+        make_dir_all(root + "/" + f.0[0..<slash]).unwrap()
+        write_text(root + "/" + f.0, f.1).unwrap()
+    end for
+
+    val exe = root + "/built"
+
+    build_native_program(root, None, None, DefaultOptimization, Some(exe)) match
+        Err(why) ->
+            val said = failure_text(why)
+
+            remove_dir_all(root).unwrap_or(())
+            return said
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> "the program that was built could not be run"
+        Ok(out) -> out.text
+end fcl_ran
+
+private fcl_said(said: string, message: string)
+    assert(said.index_of(s"error: $message").is_some(), s"expected 'error: $message', got: $said")
+
+@test("a field's length computed from a value parameter is that many elements at each instance")
+fcl_sum_in_a_field()
+    if fcl_skip() then return
+
+    assert_eq(fcl_ran(raw"""
+        struct Direct[const B: usize]
+            kids: [B + 1]int
+        val d: Direct[3] = Direct([0; 4])
+        val e: Direct[0] = Direct([7])
+        print(d.kids.len, e.kids.len, e.kids[0], sizeof(Direct[3]) == 4 * sizeof(int))
+        """), "4 1 7 true\n")
+
+@test("every ring operation, a division and a two-armed if size a field")
+fcl_operations()
+    if fcl_skip() then return
+
+    assert_eq(fcl_ran(raw"""
+        const double(n: usize) -> usize = n * 2
+        struct Shapes[const N: usize, const M: usize]
+            sum: [N + M]u8
+            product: [N * M]u8
+            less: [N - 1]u8
+            ratio: [N / M]u8
+            exact: [(2 * N + 4) / 2]u8
+            chosen: [if N > 2 then N else 2]u8
+            called: [double(N)]u8
+            rows: [N][M + 1]u8
+        impl[const N: usize, const M: usize] Shapes[N, M]
+            lens(self) -> string =
+                s"${self.sum.len} ${self.product.len} ${self.less.len} ${self.ratio.len} ${self.exact.len} " +
+                s"${self.chosen.len} ${self.called.len} ${self.rows.len}x${self.rows[0].len}"
+        var a: Shapes[6, 2]
+        var b: Shapes[1, 3]
+        print(a.lens())
+        print(b.lens())
+        print(sizeof(Shapes[6, 2]), sizeof(Shapes[1, 3]))
+        """), "8 12 5 3 8 6 12 6x3\n4 3 0 0 3 2 2 1x4\n72 18\n")
+
+@test("an enum's payload takes a computed length too")
+fcl_enum_payload()
+    if fcl_skip() then return
+
+    assert_eq(fcl_ran(raw"""
+        enum Run[const N: usize]
+            Full(xs: [N + 1]int)
+            Empty
+        count[const N: usize](r: Run[N]) -> usize = r match
+            Full(xs) -> xs.len
+            Empty -> 0
+        val r: Run[2] = Full([1, 2, 3])
+        val none: Run[5] = Empty
+        print(count(r), count(none))
+        """), "3 0\n")
+
+@test("the element may be the type's own parameter, a counted reference or a generic over the same B")
+fcl_elements()
+    if fcl_skip() then return
+
+    assert_eq(fcl_ran(raw"""
+        struct Res
+            n: int
+        impl Drop for Res
+            drop(self) = print("drop", self.n)
+        struct Leaf[K, const B: usize]
+            keys: [B]K
+        struct Inner[K, const B: usize]
+            keys: [B]K
+            kids: [B + 1]&Leaf[K, B]
+            held: [B + 1]&Res
+            counts: [B + 1]usize
+        impl[K, const B: usize] Inner[K, B]
+            first(self) -> K = self.kids[0].keys[0]
+            last(self) -> K = self.kids[B].keys[B - 1]
+        run()
+            val n: Inner[int, 2] = Inner([1, 2], [Leaf([3, 4]), Leaf([5, 6]), Leaf([7, 8])],
+                                         [Res(1), Res(2), Res(3)], [0; 3])
+            print(n.first(), n.last(), n.kids.len, n.counts.len)
+            val s: Inner[string, 1] = Inner(["a"], [Leaf(["b"]), Leaf(["c"])], [Res(4), Res(5)], [0; 2])
+            print(s.first(), s.last())
+        run()
+        print("done")
+        """), "3 8 3 3\nb c\ndrop 4\ndrop 5\ndrop 1\ndrop 2\ndrop 3\ndone\n")
+
+@test("at the definition two spellings of one polynomial are one length")
+fcl_one_form()
+    if fcl_skip() then return
+
+    assert_eq(fcl_ran(raw"""
+        struct Arr[T, const N: usize]
+            a: [N]T
+        struct Left[const B: usize]
+            kids: [B + 1]int
+            twice: [2 * B]int
+        struct Right[const B: usize]
+            kids: [1 + B]int
+            twice: [B + B]int
+        struct Via[const B: usize]
+            kids: Arr[int, B + 1]
+        impl[const B: usize] Left[B]
+            right(self) -> Right[B] = Right(self.kids, self.twice)
+            via(self) -> Via[B] = Via(Arr(self.kids))
+            fresh() -> Left[B] = Left([1; B + 1], [2; B * 2])
+        val l = Left[3].fresh()
+        print(l.right().kids.len, l.right().twice.len, l.via().kids.a.len, l.kids[3], l.twice[5])
+        """), "4 6 4 1 2\n")
+
+@test("and two forms are two lengths, refused once at the definition with what separates them")
+fcl_two_forms()
+    if fcl_skip() then return
+
+    fcl_said(fcl_ran(raw"""
+        struct Node[const B: usize]
+            kids: [B + 1]int
+        struct Other[const B: usize]
+            kids: [B + 2]int
+        impl[const B: usize] Node[B]
+            wrong(self) -> Other[B] = Other(self.kids)
+        print(1)
+        """), "'kids' of 'Other[B]' is [B + 2]int, but [B + 1]int was given — the two differ by 1 for every B")
+    fcl_said(fcl_ran(raw"""
+        struct Node[const B: usize]
+            kids: [B + 1]int
+        impl[const B: usize] Node[B]
+            plain() -> Node[B] = Node([0; B])
+        print(1)
+        """), "'kids' of 'Node[B]' is [B + 1]int, but [B]int was given — the two differ by 1 for every B")
+    fcl_said(fcl_ran(raw"""
+        struct Node[const B: usize, const C: usize]
+            kids: [B * 2]int
+        impl[const B: usize, const C: usize] Node[B, C]
+            other() -> Node[B, C] = Node([0; C * 2])
+        print(1)
+        """), "'kids' of 'Node[B, C]' is [2 * B]int, but [2 * C]int was given")
+
+@test("an instance whose length comes out below zero is refused, and one at zero is an empty array")
+fcl_instance_folds()
+    if fcl_skip() then return
+
+    val source = "struct Less[const B: usize]\n    kids: [B - 1]int\n    n: int\n"
+
+    assert_eq(fcl_ran(source + "val one: Less[1] = Less([], 5)\nprint(one.kids.len, one.n, sizeof(Less[1]) == sizeof(int))\n"),
+              "0 5 true\n")
+    fcl_said(fcl_ran(source + "val none: Less[0] = Less([], 5)\nprint(none.kids.len)\n"),
+             "an array cannot have -1 elements")
+    // The definition alone, with nothing instantiating it, says nothing.
+    assert_eq(fcl_ran(source + "print(1)\n"), "1\n")
+    assert_eq(fcl_ran("struct Ratio[const N: usize, const M: usize]\n    xs: [N / M]int\nprint(1)\n"), "1\n")
+
+@test("a length past the cap is refused where the field is written")
+fcl_cap()
+    if fcl_skip() then return
+
+    fcl_said(fcl_ran("struct Deep[const N: usize]\n    xs: [N * N * N * N * N * N * N * N * N]u8\nprint(1)\n"),
+             "the type argument 'N * N * N * N * N * N * N * N * N' is too large to compare (of degree over 8)")
+    assert_eq(fcl_ran("struct Deep[const N: usize]\n    xs: [N * N * N * N * N * N * N * N]u8\n" +
+                      "var d: Deep[1]\nprint(d.xs.len)\n"), "1\n")
+
+@test("a defaulted parameter and a type declared in another file size a field the same way")
+fcl_default_and_module()
+    if fcl_skip() then return
+
+    assert_eq(fcl_ran(raw"""
+        import util.Node
+        struct Local[const B: usize = 4]
+            kids: [B + 1]int
+        var a: Local
+        var b: Node[int, 2]
+        print(a.kids.len, b.kids.len, b.room())
+        """, [("util/util.sysl", "module util\n\nstruct Node[T, const B: usize]\n    keys: [B]T\n" +
+                                 "    kids: [B + 1]T\n\n    room(self) -> usize = self.keys.len + self.kids.len\n")]),
+              "5 3 5\n")
+
+@test("a signature, a body's local and a match in a field keep their refusal")
+fcl_still_refused()
+    if fcl_skip() then return
+
+    fcl_said(fcl_ran("struct Node[const B: usize]\n    kids: [B + 1]int\n\n" +
+                     "take[const B: usize](n: Node[B]) -> [B + 1]int = n.kids\nprint(1)\n"),
+             "the length 'B + 1' computes with the value parameter 'B'")
+    fcl_said(fcl_ran("struct Node[const B: usize]\n    kids: [B + 1]int\n\n" +
+                     "    copy(self) -> usize\n        var c: [B + 1]int = self.kids\n        c.len\n" +
+                     "var n: Node[2]\nprint(n.copy())\n"),
+             "the length 'B + 1' computes with the value parameter 'B'")
+    fcl_said(fcl_ran("struct R[const M: usize]\n    xs: [M match\n        1 -> 2\n        _ -> 3]u8\nprint(1)\n"),
+             "a length computes with the value parameter 'M'")

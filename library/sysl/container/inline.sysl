@@ -1,0 +1,260 @@
+module sysl.container
+
+import sysl.{index_past, insert_past, panic_begin, panic_says, panic_stop, panic_uint}
+
+/** A sequence of **up to `N` values held inside its owner**: the `N` slots are an `[N]T` in the
+ * value itself, the first `len()` of them hold a value and the rest hold nothing. There is no heap
+ * behind it, so a struct that holds one is one piece of storage, wherever that struct lives.
+ *
+ * ```
+ * struct Leaf[K, const B: usize]
+ *     keys: Inline[K, B]
+ *     kids: Inline[usize, B + 1]
+ *
+ * val leaf: Leaf[string, 4] = Leaf(inline(), inline())
+ * ```
+ *
+ * **It is `Buf` with the storage moved inside and the growth taken away**, and its members have
+ * `Buf`'s names: `push`, `pop`, `insert`, `remove`, `swap_remove`, `truncate`, `clear`, `get`,
+ * `view`, `view_mut`, `b[i]`, and `for x in b`.
+ *
+ * **A slot past the length holds no value.** A value is moved into its slot and moved out again, so
+ * a removed element is let go of at the removal, an `Inline[&Handle, 8]` holding three handles keeps
+ * three alive, and when the buffer goes exactly the elements it still holds are let go of, in order.
+ *
+ * **A push onto a full buffer stops the program**, as an index past the length does, with a report
+ * naming the capacity; `try_push` and `try_insert` answer instead, handing the value back in `Err`.
+ * This is where it differs from `InlineRing`, whose `push_back` answers a `bool`: a ring is made to
+ * be full, and a full ring is a state its caller meets on every lap, while a buffer that is full
+ * when something pushes is a bound the program got wrong. Ask `is_full()` first, or use the `try_`
+ * form, where being full is expected.
+ *
+ * **A fresh one is `inline[T, N]()`.** A plain `var b: Inline[T, N]` is an empty buffer too wherever
+ * `T` has a zero value (an integer, a `string`, a struct of them). Where it has none -- a `&T`, an
+ * enum with no variant at zero -- that declaration is refused (*"has no zero value, so 'b' needs an
+ * initial value"*), and `inline()` is the initial value it needs.
+ *
+ * **A copy is its own buffer**, since the storage is part of the value: passing one, returning one
+ * and assigning one copy the `N` slots. `view()` and `view_mut()` are views of the buffer they were
+ * taken from, not copies, and may not outlive it.
+ */
+struct Inline[T, const N: usize]
+    private slots: [N]T
+    private live: usize
+
+    /** How many values it can hold, which is `N`. */
+    capacity(self) -> usize = N
+
+    /** How many values are in it. */
+    len(self) -> usize = self.live
+
+    is_empty(self) -> bool = self.live == 0
+
+    /** Whether the next `push` would stop the program. */
+    is_full(self) -> bool = self.live == N
+
+    /** The `i`th value, or nothing where there is no such value -- `i` at or past the length, or
+     * negative. The total form of `b[i]`, which traps; `i` may be any integer type.
+     */
+    get[I: Integer](self, i: I) -> Option[T]
+        if i < 0 || u128(i) >= u128(self.live) then return None
+
+        Some(self.slots[usize(i)])
+
+    first(self) -> Option[T] = if self.live == 0 then None else Some(self.slots[0])
+
+    last(self) -> Option[T] = if self.live == 0 then None else Some(self.slots[self.live - 1])
+
+    /** Adds at the end. **A full buffer stops the program**, naming its capacity. */
+    push(*self, v: T)
+        if self.live == N then full(N)
+
+        slot_put(&self.slots[self.live], v)
+        self.live += 1
+    end push
+
+    /** Adds at the end, or hands the value back in `Err` where the buffer is full, which is then
+     * left as it was.
+     */
+    try_push(*self, v: T) -> Result[unit, T]
+        if self.live == N then return Err(v)
+
+        slot_put(&self.slots[self.live], v)
+        self.live += 1
+        Ok(())
+    end try_push
+
+    /** The last value, moved out, its slot left holding nothing. */
+    pop(*self) -> Option[T]
+        if self.live == 0 then return None
+
+        self.live -= 1
+        Some(slot_take(&self.slots[self.live]))
+
+    /** Puts `v` at `i`, moving every value from `i` on up one; `i` may be the length, which is a
+     * push. An `i` past the length traps as an insertion past a `Buf`'s does, and **a full buffer
+     * stops the program**, naming its capacity.
+     */
+    @track_caller
+    insert(*self, i: usize, v: T)
+        if i > self.live then insert_past(i, self.live)
+        if self.live == N then full(N)
+
+        self.open(i)
+        slot_put(&self.slots[i], v)
+        self.live += 1
+    end insert
+
+    /** `insert`, except that a full buffer hands the value back in `Err` and is left as it was. An
+     * `i` past the length still traps: that is the caller's mistake, not the buffer's capacity.
+     */
+    @track_caller
+    try_insert(*self, i: usize, v: T) -> Result[unit, T]
+        if i > self.live then insert_past(i, self.live)
+        if self.live == N then return Err(v)
+
+        self.open(i)
+        slot_put(&self.slots[i], v)
+        self.live += 1
+        Ok(())
+    end try_insert
+
+    // Moves every value from `i` on up one slot, top first, leaving slot `i` holding nothing. There
+    // is room: the caller checked.
+    private open(*self, i: usize)
+        var j = self.live
+
+        while j > i
+            slot_put(&self.slots[j], slot_take(&self.slots[j - 1]))
+            j -= 1
+    end open
+
+    /** The value at `i`, moved out, every value after it moved down one. Order is kept; `i` at or
+     * past the length traps.
+     */
+    @track_caller
+    remove(*self, i: usize) -> T
+        if i >= self.live then index_past(i, self.live)
+
+        val gone = slot_take(&self.slots[i])
+
+        for j in i + 1..<self.live
+            slot_put(&self.slots[j - 1], slot_take(&self.slots[j]))
+
+        self.live -= 1
+        gone
+    end remove
+
+    /** The value at `i`, moved out in constant time by moving the last value into its place. Order
+     * is not kept. `i` at or past the length traps.
+     */
+    @track_caller
+    swap_remove(*self, i: usize) -> T
+        if i >= self.live then index_past(i, self.live)
+
+        val gone = slot_take(&self.slots[i])
+        val last = self.live - 1
+
+        if i != last then slot_put(&self.slots[i], slot_take(&self.slots[last]))
+
+        self.live = last
+        gone
+    end swap_remove
+
+    /** The values from `n` on, let go of now, lowest index first. A buffer already that short is
+     * left alone.
+     */
+    truncate(*self, n: usize)
+        if n >= self.live then return
+
+        val was = self.live
+
+        self.live = n
+
+        for i in n..<was
+            self.let_go(i)
+    end truncate
+
+    // One value moved out of its slot and let go of at the end of this body.
+    private let_go(*self, i: usize)
+        val gone = slot_take(&self.slots[i])
+
+    /** Every value let go of, there and then, lowest index first. */
+    clear(*self) = self.truncate(0)
+
+    /** The values as a read-only slice of the buffer's own storage: the filled part and no more. It
+     * is a view of the buffer it was taken from, not a copy.
+     */
+    @views(self)
+    view(*self) -> []const T = self.slots[..<self.live]
+
+    /** The same slice, writable: a write through it is a write to the buffer. */
+    @views(self)
+    view_mut(*self) -> []T = self.slots[..<self.live]
+end Inline
+
+/** `b[i]` is the `i`th value, and traps at or past the length as an array's index does -- a slot
+ * past the length holds nothing to read.
+ */
+impl[T, const N: usize] Index[usize, T] for Inline[T, N]
+    @track_caller
+    index(self, i: usize) -> T
+        if i >= self.live then index_past(i, self.live)
+
+        self.slots[i]
+
+/** `b[i] = v` replaces the `i`th value, letting go of the one it held; it does not grow the buffer,
+ * and traps at or past the length.
+ */
+impl[T, const N: usize] IndexSet[usize, T] for Inline[T, N]
+    @track_caller
+    index_set(*self, i: usize, v: T)
+        if i >= self.live then index_past(i, self.live)
+
+        self.slots[i] = v
+
+/** `for x in b` walks the values in order. The cursor holds a copy of the buffer as it was when the
+ * walk began, so changing the buffer inside the loop does not change what the loop reads.
+ */
+impl[T, const N: usize] Walk for Inline[T, N]
+    type Walker = InlineCursor[T, N]
+    walk(self) -> InlineCursor[T, N] = InlineCursor(self, 0)
+
+/** An empty buffer of capacity `N`: `inline[int, 8]()`, or `inline()` where the type is known. It
+ * is what makes one for a `T` with no zero value, which a plain declaration cannot.
+ */
+inline[T, const N: usize]() -> Inline[T, N]
+    var b: Inline[T, N] = slot_empty()
+
+    b.live = 0
+    b
+end inline
+
+/** A walk in order over a copy of the buffer it started from. */
+struct InlineCursor[T, const N: usize]
+    buffer: Inline[T, N]
+    at: usize
+
+impl[T, const N: usize] Iterate for InlineCursor[T, N]
+    type Item = T
+
+    next(*self) -> Option[T]
+        if self.at >= self.buffer.live then return None
+
+        val v = self.buffer.slots[self.at]
+
+        self.at += 1
+        Some(v)
+    end next
+
+// The report a push onto a full buffer makes, out of line so that what a `push` keeps at the check
+// is a compare and a branch. Streamed rather than built, since building a string makes heap storage.
+@noinline
+@cold
+private full(room: usize) -> never
+    panic_begin()
+    panic_says("push onto a full Inline, whose capacity is ")
+    panic_uint(ulong(room))
+    panic_says("\n")
+    panic_stop("push onto a full Inline", null)
+end full

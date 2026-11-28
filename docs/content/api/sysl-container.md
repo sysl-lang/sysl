@@ -4,21 +4,27 @@ layout: api-module
 headingShift: 0
 slugStyle: github
 module: sysl.container
-summary: "Five containers, each with a shape a slice and a `Buf` cannot give you."
+summary: "Six containers, each with a shape a slice and a `Buf` cannot give you."
 ---
 
 `Map` and `Set` over one flat probe table, `Deque` for a queue cheap at both ends, `Heap` for a
-priority queue, and `List` — an immutable singly linked list that shares its tail. Every one of
-them owns its elements and grows, so every one of them needs an allocator; the fixed-capacity
-complement is `sysl.container.ring`, which needs none.
+priority queue, `List` — an immutable singly linked list that shares its tail — and `Inline`, a
+sequence of a fixed capacity held inside its owner.
 
-**A module rather than five**, because what a program wants from here is a data structure and the
+**Five of them own their elements and grow, so those five need an allocator**: `Map`, `Set`,
+`Deque`, `Heap` and `List`. **`Inline` needs none.** Its slots are part of the value that holds it
+and no member of it allocates, so a module that has given the allocator up may import it from here
+and build for a machine with no heap; what a program does not call, it does not link. The module
+itself cannot say `@no_alloc`, that being a promise about all of it. The other fixed-capacity
+containers are `sysl.container.ring`'s, a module that does say it.
+
+**A module rather than six**, because what a program wants from here is a data structure and the
 choice between them is the interesting part. Each file's own header says what its structure costs
 and when to reach for it instead of its neighbour.
 
 ## Index
 
-[`deque`](#deque) [`deque_with_capacity`](#deque_with_capacity) [`difference`](#difference) [`heap`](#heap) [`heap_of`](#heap_of) [`heap_with_capacity`](#heap_with_capacity) [`intersection`](#intersection) [`is_subset`](#is_subset) [`list`](#list) [`list_of`](#list_of) [`map`](#map) [`map_with_capacity`](#map_with_capacity) [`set`](#set) [`set_of`](#set_of) [`set_with_capacity`](#set_with_capacity) [`union`](#union) [`Cursor`](#cursor) [`Deque`](#deque-1) [`DequeCursor`](#dequecursor) [`Heap`](#heap-1) [`List`](#list-1) [`ListCursor`](#listcursor) [`Map`](#map-1) [`Set`](#set-1) [`SetCursor`](#setcursor) [`Slot`](#slot) [Index for Deque[T]](#index-for-dequet) [IndexSet for Deque[T]](#indexset-for-dequet) [Iterate for Cursor[K, V]](#iterate-for-cursork-v) [Iterate for DequeCursor[T]](#iterate-for-dequecursort) [Iterate for ListCursor[T]](#iterate-for-listcursort) [Iterate for SetCursor[K]](#iterate-for-setcursork) [Walk for Deque[T]](#walk-for-dequet) [Walk for List[T]](#walk-for-listt) [Walk for Map[K, V]](#walk-for-mapk-v) [Walk for Set[K]](#walk-for-setk)
+[`deque`](#deque) [`deque_with_capacity`](#deque_with_capacity) [`difference`](#difference) [`heap`](#heap) [`heap_of`](#heap_of) [`heap_with_capacity`](#heap_with_capacity) [`inline`](#inline) [`intersection`](#intersection) [`is_subset`](#is_subset) [`list`](#list) [`list_of`](#list_of) [`map`](#map) [`map_with_capacity`](#map_with_capacity) [`set`](#set) [`set_of`](#set_of) [`set_with_capacity`](#set_with_capacity) [`union`](#union) [`Cursor`](#cursor) [`Deque`](#deque-1) [`DequeCursor`](#dequecursor) [`Heap`](#heap-1) [`Inline`](#inline-1) [`InlineCursor`](#inlinecursor) [`List`](#list-1) [`ListCursor`](#listcursor) [`Map`](#map-1) [`Set`](#set-1) [`SetCursor`](#setcursor) [`Slot`](#slot) [Index for Deque[T]](#index-for-dequet) [Index for Inline[T, N]](#index-for-inlinet-n) [IndexSet for Deque[T]](#indexset-for-dequet) [IndexSet for Inline[T, N]](#indexset-for-inlinet-n) [Iterate for Cursor[K, V]](#iterate-for-cursork-v) [Iterate for DequeCursor[T]](#iterate-for-dequecursort) [Iterate for InlineCursor[T, N]](#iterate-for-inlinecursort-n) [Iterate for ListCursor[T]](#iterate-for-listcursort) [Iterate for SetCursor[K]](#iterate-for-setcursork) [Walk for Deque[T]](#walk-for-dequet) [Walk for Inline[T, N]](#walk-for-inlinet-n) [Walk for List[T]](#walk-for-listt) [Walk for Map[K, V]](#walk-for-mapk-v) [Walk for Set[K]](#walk-for-setk)
 
 ## Functions
 
@@ -76,6 +82,15 @@ heap_with_capacity[T: Ord](n: usize, fill: T) -> Heap[T]
 
 A heap whose storage is already big enough for `n` elements. The fill is written for the reason
 `buf_with_capacity`'s is: a generic `T` has no zero, and none of these slots is read.
+
+### `inline`
+
+```sysl
+inline[T, const N: usize]() -> Inline[T, N]
+```
+
+An empty buffer of capacity `N`: `inline[int, 8]()`, or `inline()` where the type is known. It
+is what makes one for a `T` with no zero value, which a plain declaration cannot.
 
 ### `intersection`
 
@@ -306,6 +321,81 @@ is read in order, and it is the only way that answers truthfully.
 | `clear` | `clear(self)` |  |
 | `release` | `release(*self)` | The buffer underneath given back without allocating, as `Buf.release` does -- for a heap in storage the program zeroed itself, which answers as empty until it is assigned. |
 
+### `Inline`
+
+```sysl
+struct Inline[T, const N: usize]
+    private slots: [N]T
+    private live: usize
+```
+
+A sequence of **up to `N` values held inside its owner**: the `N` slots are an `[N]T` in the
+value itself, the first `len()` of them hold a value and the rest hold nothing. There is no heap
+behind it, so a struct that holds one is one piece of storage, wherever that struct lives.
+
+```
+struct Leaf[K, const B: usize]
+    keys: Inline[K, B]
+    kids: Inline[usize, B + 1]
+
+val leaf: Leaf[string, 4] = Leaf(inline(), inline())
+```
+
+**It is `Buf` with the storage moved inside and the growth taken away**, and its members have
+`Buf`'s names: `push`, `pop`, `insert`, `remove`, `swap_remove`, `truncate`, `clear`, `get`,
+`view`, `view_mut`, `b[i]`, and `for x in b`.
+
+**A slot past the length holds no value.** A value is moved into its slot and moved out again, so
+a removed element is let go of at the removal, an `Inline[&Handle, 8]` holding three handles keeps
+three alive, and when the buffer goes exactly the elements it still holds are let go of, in order.
+
+**A push onto a full buffer stops the program**, as an index past the length does, with a report
+naming the capacity; `try_push` and `try_insert` answer instead, handing the value back in `Err`.
+This is where it differs from `InlineRing`, whose `push_back` answers a `bool`: a ring is made to
+be full, and a full ring is a state its caller meets on every lap, while a buffer that is full
+when something pushes is a bound the program got wrong. Ask `is_full()` first, or use the `try_`
+form, where being full is expected.
+
+**A fresh one is `inline[T, N]()`.** A plain `var b: Inline[T, N]` is an empty buffer too wherever
+`T` has a zero value (an integer, a `string`, a struct of them). Where it has none -- a `&T`, an
+enum with no variant at zero -- that declaration is refused (*"has no zero value, so 'b' needs an
+initial value"*), and `inline()` is the initial value it needs.
+
+**A copy is its own buffer**, since the storage is part of the value: passing one, returning one
+and assigning one copy the `N` slots. `view()` and `view_mut()` are views of the buffer they were
+taken from, not copies, and may not outlive it.
+
+| Member | Signature | Description |
+|---|---|---|
+| `capacity` | `capacity(self) -> usize` | How many values it can hold, which is `N`. |
+| `len` | `len(self) -> usize` | How many values are in it. |
+| `is_empty` | `is_empty(self) -> bool` |  |
+| `is_full` | `is_full(self) -> bool` | Whether the next `push` would stop the program. |
+| `get` | `get[I: Integer](self, i: I) -> Option[T]` | The `i`th value, or nothing where there is no such value -- `i` at or past the length, or negative. |
+| `first` | `first(self) -> Option[T]` |  |
+| `last` | `last(self) -> Option[T]` |  |
+| `push` | `push(*self, v: T)` | Adds at the end. |
+| `try_push` | `try_push(*self, v: T) -> Result[unit, T]` | Adds at the end, or hands the value back in `Err` where the buffer is full, which is then left as it was. |
+| `pop` | `pop(*self) -> Option[T]` | The last value, moved out, its slot left holding nothing. |
+| `insert` | `insert(*self, i: usize, v: T)` | Puts `v` at `i`, moving every value from `i` on up one; `i` may be the length, which is a push. |
+| `try_insert` | `try_insert(*self, i: usize, v: T) -> Result[unit, T]` | `insert`, except that a full buffer hands the value back in `Err` and is left as it was. |
+| `remove` | `remove(*self, i: usize) -> T` | The value at `i`, moved out, every value after it moved down one. |
+| `swap_remove` | `swap_remove(*self, i: usize) -> T` | The value at `i`, moved out in constant time by moving the last value into its place. |
+| `truncate` | `truncate(*self, n: usize)` | The values from `n` on, let go of now, lowest index first. |
+| `clear` | `clear(*self)` | Every value let go of, there and then, lowest index first. |
+| `view` | `view(*self) -> []const T` | The values as a read-only slice of the buffer's own storage: the filled part and no more. |
+| `view_mut` | `view_mut(*self) -> []T` | The same slice, writable: a write through it is a write to the buffer. |
+
+### `InlineCursor`
+
+```sysl
+struct InlineCursor[T, const N: usize]
+    buffer: Inline[T, N]
+    at: usize
+```
+
+A walk in order over a copy of the buffer it started from.
+
 ### `List`
 
 ```sysl
@@ -473,11 +563,29 @@ impl[T] Index[usize, T] for Deque[T]
 Subscripting reaches the bounds-checked members rather than the storage, so `d[i]` counts from the
 **front** of the deque and cannot read a slot the ring is not currently using.
 
+### Index for Inline[T, N]
+
+```sysl
+impl[T, const N: usize] Index[usize, T] for Inline[T, N]
+```
+
+`b[i]` is the `i`th value, and traps at or past the length as an array's index does -- a slot
+past the length holds nothing to read.
+
 ### IndexSet for Deque[T]
 
 ```sysl
 impl[T] IndexSet[usize, T] for Deque[T]
 ```
+
+### IndexSet for Inline[T, N]
+
+```sysl
+impl[T, const N: usize] IndexSet[usize, T] for Inline[T, N]
+```
+
+`b[i] = v` replaces the `i`th value, letting go of the one it held; it does not grow the buffer,
+and traps at or past the length.
 
 ### Iterate for Cursor[K, V]
 
@@ -493,6 +601,12 @@ design exists to make impossible.
 
 ```sysl
 impl[T] Iterate for DequeCursor[T]
+```
+
+### Iterate for InlineCursor[T, N]
+
+```sysl
+impl[T, const N: usize] Iterate for InlineCursor[T, N]
 ```
 
 ### Iterate for ListCursor[T]
@@ -514,6 +628,15 @@ impl[T] Walk for Deque[T]
 ```
 
 `for x in d` walks a deque from the front to the back, through the cursor `walk` answers.
+
+### Walk for Inline[T, N]
+
+```sysl
+impl[T, const N: usize] Walk for Inline[T, N]
+```
+
+`for x in b` walks the values in order. The cursor holds a copy of the buffer as it was when the
+walk began, so changing the buffer inside the loop does not change what the loop reads.
 
 ### Walk for List[T]
 

@@ -1,12 +1,12 @@
 ---
 title: The container module
-summary: "`sysl.container` — `Map` and `Set` over one flat probe table, `Deque` for a queue at both ends, `Heap` for a priority queue, and an immutable `List` that shares its tail."
+summary: "`sysl.container` — `Map` and `Set` over one flat probe table, `Deque` for a queue at both ends, `Heap` for a priority queue, an immutable `List` that shares its tail, and `Inline`, a fixed-capacity sequence held inside its owner."
 weight: 32
 ---
 
 **Every declaration in `sysl.container`, with its signature:** [the generated API page](/api/sysl-container/#index). This page is the argument — what the module is for, and how its pieces fit; that one is the list.
 
-One module, `sysl.container`, holding five types. A program names the ones it wants and gets nothing
+One module, `sysl.container`, holding six types. A program names the ones it wants and gets nothing
 else — what a program does not import, it does not link.
 
 | type | is |
@@ -16,18 +16,20 @@ else — what a program does not import, it does not link.
 | [`Deque[T]`](#the-queue-at-both-ends) | a sequence cheap to take from at either end |
 | [`Heap[T: Ord]`](#the-priority-queue) | smallest out first |
 | [`List[T]`](#the-immutable-list) | never modified, shares its tail |
+| [`Inline[T, const N: usize]`](#the-sequence-held-inline) | up to `N` values inside its owner, no heap |
 
 None of them is a type the compiler knows. Each is ordinary sysl over a `[]T` or a
 [`Buf[T]`](/library/buf/), in files a program could have written — which is the same thing worth
 saying about `Buf` itself, and it stays true as the containers get more interesting.
 
-**There is a sixth thing in this namespace and it is a module rather than a type**:
+**There is one more thing in this namespace and it is a module rather than a type**:
 [`sysl.container.ring`](/library/ring/), holding `Ring[T]` — the queue of a **fixed** capacity, laid
 over storage the caller supplies. It sits below this module rather than inside it because it declares
 `@no_alloc` and [a capability is a property of the whole
-module](/reference/modules/#capabilities-are-a-module-property), which the five types here could not
-claim: every one of them grows. So a program that has given the allocator up imports that module and
-not this one.
+module](/reference/modules/#capabilities-are-a-module-property), which this module cannot claim: five
+of its six types grow. **`Inline` is the one that does not**, and a program that has given the
+allocator up may import it from here all the same — the heap is asked of what a module *calls*, not of
+what it imports, and no member of `Inline` allocates.
 
 ## One flat table, and why that is the whole design
 
@@ -431,3 +433,91 @@ element walks `i` cells, and those cells are wherever the allocator put them. `B
 wants; this is what a *shared history* wants — a scope chain, an undo stack, a search path that is its
 parent's path plus a step. All three share almost everything and would copy almost everything in a
 `Buf`.
+
+## The sequence held inline
+
+`Inline[T, const N: usize]` is up to `N` values **inside the value that holds it**: an `[N]T` and a
+length, of which the first `len()` slots hold a value and the rest hold nothing. There is no storage
+behind it to allocate, so a struct holding one is a single piece of memory — which is what a tree's
+node wants, and what a board with no heap can afford.
+
+```sysl
+import sysl.container.{Inline, inline}
+
+struct Leaf[K, const B: usize]
+    keys: Inline[K, B]
+    kids: Inline[usize, B + 1]
+
+var leaf: Leaf[string, 2] = Leaf(inline(), inline())
+
+leaf.keys.push("pear")
+leaf.keys.insert(0, "apple")
+leaf.kids.push(7)
+
+print(leaf.keys.len(), leaf.keys.is_full(), leaf.kids.capacity())
+print(leaf.keys.try_push("plum"))
+print(leaf.keys.remove(0), leaf.keys[0], leaf.keys.pop(), leaf.keys.pop())
+```
+
+```output
+2 true 3
+Err(plum)
+apple pear Some(pear) None
+```
+
+**Its members are `Buf`'s, by name**: `push`, `pop`, `insert`, `remove`, `swap_remove`, `truncate`,
+`clear`, `get`, `first`, `last`, `b[i]` and `b[i] = v`, `view()` and `view_mut()` over the filled part,
+`for x in b`, with `capacity()` and `is_full()` for the bound a `Buf` does not have. The capacity may be
+a literal, a value parameter of the holder, or [a computation over
+one](/reference/generics/#what-may-be-written-with-n), as `B + 1` is above.
+
+- **A slot past the length holds no value.** A value is moved into its slot and moved out of it, so a
+  removed element is let go of at the removal, and when the buffer goes it lets go of exactly the
+  elements it still holds, lowest index first. An `Inline[&Handle, 8]` holding three handles keeps
+  three alive, not eight.
+- **A push onto a full buffer stops the program**, with `panic: push onto a full Inline, whose capacity
+  is 2`, and so does an `insert` into one. A buffer that is full when something pushes is a bound the
+  program got wrong, exactly as an index past the length is. Where being full is expected, ask
+  `is_full()` first or use **`try_push` and `try_insert`**, which answer a `Result[unit, T]` and hand
+  the value back in `Err`, the buffer left as it was. (`InlineRing.push_back` answers a `bool`
+  instead, because [a full ring is a state, not a failure](/library/ring/#a-full-ring-is-a-state-not-a-failure).)
+  An index past the length still traps in the `try_` forms: that is not a question of capacity.
+- **A fresh one is `inline[T, N]()`**, or `inline()` where the type is known. A plain `var b: Inline[T,
+  N]` is an empty buffer too wherever `T` has a zero value. Where it has none — a `&T`, an enum with no
+  variant at zero — that declaration is refused with *"Inline[&Res, 3] has no zero value, so 'b' needs
+  an initial value"*, and `inline()` is the initial value it means.
+- **A copy is its own buffer.** The slots are part of the value, so assigning one, passing one and
+  returning one copy all `N` of them, and `for x in b` walks a copy made when the walk began. `view()`
+  and `view_mut()` do not copy: they are slices of the buffer they were taken from. A large capacity
+  belongs in a box or a `static var`, not on a small stack.
+- **It allocates nothing and builds for a bare machine**: a `@no_alloc` module may import it, and a
+  struct holding one compiles for `thumb-freestanding-softfp` with no heap.
+
+```sysl
+import sysl.container.{Inline, inline}
+
+struct Res
+    n: int
+
+impl Drop for Res
+    drop(self) = print("closed", self.n)
+
+run()
+    var open = inline[&Res, 4]()
+
+    open.push(Res(1))
+    open.push(Res(2))
+    open.push(Res(3))
+    print("removed", open.remove(1).n)
+    print("leaving with", open.len())
+
+run()
+```
+
+```output
+removed 2
+closed 2
+leaving with 2
+closed 1
+closed 3
+```

@@ -1,0 +1,340 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.{capture, Status, Var}
+import sysl.text.Search
+
+// **`sysl.container.Inline[T, N]` as whole programs**: what the library's own tests
+// (`library/sysl/container/inline_tests.sysl`) cannot see from inside one process -- a program
+// stopped by a push onto a full buffer or by an index past the length and what it said, a counted
+// heap that was never asked for a byte, the build for a bare Thumb machine from a module that gave the
+// allocator up, and the declaration the compiler refuses.
+//
+// The axes: the build (hosted at -O0 and the default level, the counted heap, a freestanding Thumb
+// archive), the element (plain, a `&T` with a `Drop`), the capacity (a literal, the holder's value
+// parameter, one computed from it), the holder (a local, a module `var`, a field, a type declared in
+// another module), and the failure (full by `push`, full by `insert`, an index, an insertion index,
+// a removal, a slot that was vacated).
+//
+// Cells skipped: a `.syslib` and codegen units (the type is library code like `InlineRing`, whose
+// instances are emitted where they are used; `tests_irg_` skips them for the same reason), and an
+// exported `sysl_bounds_fail` (the reports are `Buf`'s own, which `tests_ctr_` pins).
+
+private ilb_ready() -> bool = std_root().is_ok() && clang_available()
+
+private struct IlbRun
+    state: Status
+    out: string
+    err: string
+    bytes: long
+end IlbRun
+
+// The program built -- on the counted heap where `counted` -- and run to its end.
+private ilb_run(files: []const (string, string), level: string, counted: bool) -> IlbRun
+    val root = make_temp_dir("sysl-ilb").unwrap()
+
+    for i in 0..<files.len
+        val at = s"$root/${files[i].0}"
+
+        make_dir_all(parent_of(at).unwrap()).unwrap()
+        write_text(at, files[i].1).unwrap()
+
+    val exe = s"$root/built"
+
+    if counted then force_alloc_counting(true)
+
+    val made = build_native_program(root, None, None, level, Some(exe))
+
+    if counted then force_alloc_counting(false)
+
+    made match
+        Err(why) ->
+            remove_dir_all(root).unwrap_or(())
+            return IlbRun(Status.Exited(-1), "", failure_text(why), -1)
+        Ok(_) -> ()
+
+    val said = capture(exe, [], "", [Var(alloc_bytes_variable(), "1")], true)
+
+    remove_dir_all(root).unwrap_or(())
+
+    said match
+        Err(_) -> IlbRun(Status.Exited(-1), "", "the program that was built could not be run", -1)
+        Ok(o) ->
+            val err = o.err.unwrap_or("")
+
+            IlbRun(o.status, o.text, err, if counted then alloc_bytes_reported(err) else 0)
+end ilb_run
+
+private ilb_main(body: string, level: string = DefaultOptimization, counted: bool = false) -> IlbRun
+    var files: [2](string, string) = [("package.hocon", "package {\n  name = \"probe\"\n}\n"),
+                                      ("main.sysl", body)]
+
+    ilb_run(files[..], level, counted)
+end ilb_main
+
+private val IlbHead: string = "import sysl.container.{Inline, inline}\n\n"
+
+// A buffer of three slots holding 10 and 20.
+private val IlbTwo: string =
+    IlbHead + "var b = inline[int, 3]()\nb.push(10)\nb.push(20)\nval i: usize = 5\n"
+
+// The program printed `printed`, then stopped at both levels having said something that starts `said`.
+private ilb_stops(body: string, printed: string, said: string, how: Status)
+    if !ilb_ready() then return
+
+    for level in ["0", DefaultOptimization]
+        val ran = ilb_main(body, level)
+
+        assert(ran.err.starts_with(said), s"-O$level said '${ran.err}', not '$said'")
+        assert_eq(ran.out, printed)
+        assert(ran.state == how, s"-O$level stopped with ${ran.state}, having printed '${ran.out}'")
+end ilb_stops
+
+// -- a full buffer ------------------------------------------------------------------------------------
+
+@test("a push onto a full Inline stops the program with a panic naming the capacity")
+ilb_full_push()
+    ilb_stops(IlbTwo + "b.push(30)\nprint(b.len())\nb.push(40)\nprint(\"unreached\")\n", "3\n",
+              "panic: push onto a full Inline, whose capacity is 3\n", Status.Signalled(6))
+
+@test("so does an insertion into a full one, and into one sized by a computation over its holder's parameter")
+ilb_full_insert()
+    ilb_stops(IlbTwo + "b.insert(0, 5)\nprint(b[0])\nb.insert(1, 7)\n", "5\n",
+              "panic: push onto a full Inline, whose capacity is 3\n", Status.Signalled(6))
+    ilb_stops(IlbHead + raw"""
+        struct Node[const B: usize]
+            kids: Inline[int, B + 1]
+        fill[const B: usize](n: *Node[B])
+            for i in 0..B + 1
+                print(i)
+                n.kids.push(int(i))
+        var n: Node[1] = Node(inline())
+        fill(&n)
+        """, "0\n1\n2\n", "panic: push onto a full Inline, whose capacity is 2\n", Status.Signalled(6))
+
+@test("a buffer of no slots stops on its first push")
+ilb_full_at_zero()
+    ilb_stops(IlbHead + "var b = inline[int, 0]()\nprint(b.try_push(1).is_err())\nb.push(1)\n", "true\n",
+              "panic: push onto a full Inline, whose capacity is 0\n", Status.Signalled(6))
+
+// -- an index past the length -------------------------------------------------------------------------
+//
+// These are `Buf`'s reports through `sysl_bounds_fail`, and the stop is the trap instruction.
+
+@test("a subscript at the length traps with an array's report, though the slot exists")
+ilb_index_traps()
+    ilb_stops(IlbTwo + "print(b[1])\nprint(b[2])\n", "20\n", "index 2 out of bounds for length 2 (main.sysl:",
+              Status.Signalled(5))
+    ilb_stops(IlbTwo + "b[2] = 30\n", "", "index 2 out of bounds for length 2 (main.sysl:", Status.Signalled(5))
+
+@test("a slot that was vacated is past the length again")
+ilb_vacated_slot_traps()
+    ilb_stops(IlbTwo + "print(b.pop())\nprint(b.get(1))\nprint(b[1])\n", "Some(20)\nNone\n",
+              "index 1 out of bounds for length 1 (main.sysl:", Status.Signalled(5))
+
+@test("a removal at the length and an insertion past it trap, and a tried insertion past it traps too")
+ilb_remove_and_insert_trap()
+    ilb_stops(IlbTwo + "print(b.remove(1))\nprint(b.remove(1))\n", "20\n",
+              "index 1 out of bounds for length 1 (main.sysl:", Status.Signalled(5))
+    ilb_stops(IlbTwo + "b.swap_remove(2)\n", "", "index 2 out of bounds for length 2 (main.sysl:",
+              Status.Signalled(5))
+    ilb_stops(IlbTwo + "b.insert(2, 30)\nprint(b.len())\nb.remove(0)\nb.insert(i, 40)\n", "3\n",
+              "insertion index 5 is past length 2 (main.sysl:", Status.Signalled(5))
+    ilb_stops(IlbTwo + "print(b.try_insert(i, 40).is_err())\n", "",
+              "insertion index 5 is past length 2 (main.sysl:", Status.Signalled(5))
+
+// -- the heap -----------------------------------------------------------------------------------------
+
+@test("a buffer of plain values never asks the heap for a byte, as a local, a field, a module var or a result")
+ilb_no_heap()
+    if !ilb_ready() then return
+
+    val ran = ilb_main(IlbHead + raw"""
+        struct Node[K, const B: usize]
+            keys: Inline[K, B]
+            kids: Inline[usize, B + 1]
+        var held: Node[int, 4] = Node(inline(), inline())
+        made(n: int) -> Inline[int, 8]
+            var b = inline[int, 8]()
+            for i in 0..<n do b.push(i)
+            b
+        run() -> int
+            var b = made(8)
+            b.remove(3)
+            b.insert(0, 100)
+            b.swap_remove(1)
+            b.truncate(5)
+            var total = 0
+            for x in b do total += x
+            for x in b.view() do total += x
+            for i in 0..<4 do held.keys.push(i)
+            for i in 0..<5 do held.kids.push(usize(i))
+            total + held.keys.pop().unwrap_or(0) + int(held.kids.remove(0)) + int(held.kids.len())
+        print(run())
+        """, DefaultOptimization, true)
+
+    assert_eq(ran.out, "235\n")
+    assert_eq(alloc_count_reported(ran.err), 0)
+    assert(ran.bytes == 0, s"a plain Inline allocated ${ran.bytes} bytes:\n${ran.err}")
+
+@test("a buffer of references gives every one back: those removed at the removal, the rest in order at the end")
+ilb_references()
+    if !ilb_ready() then return
+
+    val text = IlbHead + raw"""
+        struct Res
+            n: int
+        impl Drop for Res
+            drop(self) = print("drop", self.n)
+        struct Node[const B: usize]
+            keys: Inline[int, B]
+            kids: Inline[&Res, B + 1]
+        run()
+            var n: Node[2] = Node(inline(), inline())
+            n.kids.push(Res(1))
+            n.kids.push(Res(3))
+            n.kids.insert(1, Res(2))
+            print(n.kids.try_push(Res(9)).is_err())
+            print("removed", n.kids.remove(0).n)
+            val boxed: &Node[3] = Node(inline(), inline())
+            boxed.kids.push(Res(40))
+            boxed.kids.push(Res(41))
+            var copy = boxed.kids
+            copy.push(Res(42))
+            print(copy.len(), boxed.kids.len())
+            print("leaving")
+        run()
+        print("done")
+        """
+    val want = "true\ndrop 9\nremoved 1\ndrop 1\n3 2\nleaving\ndrop 42\ndrop 40\ndrop 41\ndrop 2\ndrop 3\ndone\n"
+
+    for level in ["0", DefaultOptimization]
+        val ran = ilb_main(text, level, true)
+
+        assert_eq(ran.out, want)
+        assert_eq(alloc_count_reported(ran.err), 0)
+        assert(ran.bytes > 0, "the boxes of a counted element are the heap's")
+    end for
+end ilb_references
+
+// -- another module, and what is refused ------------------------------------------------------------
+
+@test("a type declared in another module holds one sized by a computation, and its members are reached from outside")
+ilb_other_module()
+    if !ilb_ready() then return
+
+    var files: [3](string, string) = [
+        ("package.hocon", "package {\n  name = \"probe\"\n}\n"),
+        ("tree/tree.sysl", "module tree\n\nimport sysl.container.{Inline, inline}\n\n" +
+                           "struct Inner[K, const B: usize]\n    keys: Inline[K, B]\n    kids: Inline[usize, B + 1]\n\n" +
+                           "inner[K, const B: usize]() -> Inner[K, B] = Inner(inline(), inline())\n"),
+        ("main.sysl", "import tree.{Inner, inner}\n\nvar n = inner[string, 2]()\n\nn.keys.push(\"a\" + \"b\")\n" +
+                      "n.kids.push(1)\nn.kids.push(2)\nn.kids.push(3)\n" +
+                      "print(n.keys[0], n.keys.capacity(), n.kids.is_full(), n.kids.view().len)\n")]
+
+    val ran = ilb_run(files[..], DefaultOptimization, false)
+
+    assert_eq(ran.err, "")
+    assert_eq(ran.out, "ab 2 true 3\n")
+end ilb_other_module
+
+@test("a plain declaration of one whose element has no zero value is refused, and inline() is what it needs")
+ilb_plain_declaration()
+    if !ilb_ready() then return
+
+    val head = IlbHead + "struct Res\n    n: int\n\nimpl Drop for Res\n    drop(self) = print(\"drop\", self.n)\n\n"
+    val refused = ilb_main(head + "var b: Inline[&Res, 3]\nprint(b.len())\n")
+
+    assert(refused.err.contains("Inline[&Res, 3] has no zero value, so 'b' needs an initial value"), refused.err)
+
+    val ring = ilb_main("import sysl.container.ring.{InlineRing, inline_ring}\n\nstruct Res\n    n: int\n\n" +
+                        "var r: InlineRing[&Res, 3]\nprint(r.len())\n")
+
+    assert(ring.err.contains("InlineRing[&Res, 3] has no zero value, so 'r' needs an initial value"), ring.err)
+
+    val made = ilb_main(head + "run()\n    var b: Inline[&Res, 3] = inline()\n    b.push(Res(1))\n    print(b.len())\n\nrun()\n")
+
+    assert_eq(made.out, "1\ndrop 1\n")
+end ilb_plain_declaration
+
+// -- a bare machine -----------------------------------------------------------------------------------
+
+// The archive `build-c` makes for `target`, and what `nm -u` lists as still wanted by it.
+private ilb_build_c(text: string, target: string) -> (int, string, string)
+    val root = make_temp_dir("sysl-ilb-c").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    write_text(s"$root/main.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [7]string = ["sysl", "build-c", "--target", target, "-o", s"$root/probe.a", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+
+    reset_search_paths()
+
+    val wanted = capture("nm", ["-u", s"$root/probe.a"], "", [], true) match
+        Err(_) -> "nm could not be run"
+        Ok(o) -> o.text
+
+    remove_dir_all(root).unwrap_or(())
+
+    var text_out = ""
+
+    for piece in said
+        text_out = text_out + piece
+
+    (code, text_out, wanted)
+end ilb_build_c
+
+@test("a module that gave the allocator up imports sysl.container's Inline and builds for a bare Thumb machine, wanting no heap")
+ilb_builds_on_thumb()
+    if !ilb_ready() then return
+
+    val (code, said, wanted) = ilb_build_c(raw"""
+        @no_alloc
+
+        import sysl.container.{Inline, inline}
+
+        struct Node[const B: usize]
+            keys: Inline[u32, B]
+            kids: Inline[u8, B + 1]
+
+        struct Dev
+            rx: Inline[u8, 16]
+            none: Inline[u8, 0]
+
+        var dev: Dev
+
+        @export("main")
+        probe() -> u32
+            var n: Node[2] = Node(inline(), inline())
+
+            n.keys.push(7)
+            n.keys.insert(0, 6)
+            n.kids.push(1)
+            n.kids.push(2)
+            dev.rx.push(3)
+
+            if n.kids.try_push(3).is_err() then return 1
+            if dev.none.try_insert(0, 1).is_ok() then return 2
+
+            var sum = u32(dev.rx[0])
+
+            for k in n.keys.view() do sum += k
+            for k in n.kids do sum += u32(k)
+
+            n.kids.truncate(1)
+            n.kids.view_mut()[0] = 9
+            sum + u32(n.kids.remove(0)) + u32(n.kids.len()) + n.keys.swap_remove(0) + n.keys.pop().unwrap_or(0)
+        """, "thumb-freestanding-softfp")
+
+    assert(!said.contains("error"), said)
+    assert_eq(code, 0)
+    assert(wanted.contains("memcpy") || wanted.contains("memset") || wanted.contains(".o"), wanted)
+
+    for name in ["malloc", "calloc", "realloc", " free", "_free", "sysl_alloc", "sysl_count", "sbrk"]
+        assert(!wanted.contains(name), s"the archive wants '$name':\n$wanted")
+end ilb_builds_on_thumb
