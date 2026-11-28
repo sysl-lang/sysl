@@ -530,6 +530,10 @@ private gather_node(e: *Emit, g: &Gather, x: TExpr) = *x.kind match
     TUpdate(place, _, _, _, _, _, _) -> bar_place(g, place)
     TIncDec(place, _, _, _, _) -> bar_place(g, place)
     TAddrOf(place, _) -> bar_place(g, place)
+
+    // A local asked whether it is the only reference holds a count of its own, so the answer counts
+    // it beside the storage it was read out of.
+    TIsUnique(place) -> bar_place(g, place)
     _ -> ()
 
 // The `is` bindings of a condition, each one's scope the terms after it and the body it guards (list
@@ -1084,6 +1088,21 @@ private event_node(e: *Emit, g: &Gather, sink: &EventSink, aliases: Set[string],
 
             note_slots(es, op, elem)
             sink.events.push(Event(es.w, "", false, "", s"'$op'", x.span))
+        TIsUnique(value) ->
+            val es = edge_sink()
+
+            es.count(texpr_type(value))
+            sink.events.push(Event(es.w, "", false, "", "'is_unique'", x.span))
+
+            // A value still in a root's own slot is backed along no edge, so no count read meets it:
+            // the question is a use of the root it asks about, and a local read out of that root
+            // holds a count of its own for the answer to see.
+            place_base(value) match
+                Some(name) ->
+                    if root_name(name, params, tops) then
+                        sink.events.push(Event(edge_writes_none(), name, false, "",
+                                               s"'${shown(name)}' is asked whether it is the only reference", x.span))
+                None -> ()
         TAtomic(op, _, _, _, at, _) ->
             if op != "load"
                 val es = edge_sink()

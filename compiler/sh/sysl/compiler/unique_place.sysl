@@ -1,0 +1,90 @@
+module sh.sysl.compiler
+
+// **Which places `r.is_unique()` may be asked of** (`memory.md § Asking whether a reference is the only
+// one`).
+//
+// The answer is read off the object's count, so it is right exactly where every holder of the object
+// has a count in it. **A parameter is the one name that does not**: an argument is lent, the callee
+// reading it through the count its caller holds (`memory.md § Passing a reference to a call usually
+// costs nothing`), so inside `push(self)` called as `val w = v.push(x)` the count is one while `v` is
+// still read afterwards. A true answer there would let the callee write an object its caller still
+// reads. So the question is asked of a **place that holds a count of its own**, never of a lent value:
+//
+// - a local -- a `var`, a `val`, a `ref`, a name a pattern or a `for` bound -- and anything reached
+//   from one through fields, elements and references;
+// - module storage, and anything reached from it;
+// - anything reached through a raw pointer or a view, at any depth: a field through `*self`, the
+//   place a `*&T` parameter points at, an element of a `Buf`. The pointer says where the place is,
+//   and the place holds its count whoever was handed the pointer.
+//
+// A parameter, and anything read through one by value or through a reference it holds, is refused,
+// and so is a value in no place at all (a call's answer). **Whether the function owns its parameter
+// does not change this**: that is read off the body by the lowering (`owned_params.sysl`), differs
+// between a call by name and one through a table, and is nothing a reader of the signature can see.
+// A parameter copied into a `var` is asked there, and the `var` takes the parameter's own count where
+// the function was handed one.
+//
+// The locals the count elisions would otherwise leave uncounted are counted where this is asked:
+// `plus0_locals.sysl` bars a local asked about and treats the question as a read of the count, the
+// pair cancellation and the frame's own counting both stop at the load `gen_is_unique` emits.
+check_unique_places(a: &Analysis, p: TProgram)
+    for i in 0..<p.funcs.len()
+        check_unique_in(a, p.funcs[i])
+end check_unique_places
+
+private check_unique_in(a: &Analysis, f: TFunc)
+    val scope = func_home(a, f.name)
+    val an = a
+    val fn = f
+
+    walk_block_stmts(f.body, expr_walk(true, x -> one_unique(an, fn, scope, x)))
+end check_unique_in
+
+private one_unique(a: &Analysis, f: TFunc, scope: Scope, x: TExpr) = *x.kind match
+    TIsUnique(place) -> asked_of(f, place) match
+        AskedLent(name) -> a.fault(scope, x.span, unique_of_lent(name))
+        AskedValue -> a.fault(scope, x.span, unique_of_value())
+        AskedPlace -> ()
+    _ -> ()
+
+// What `is_unique` was asked of: a place holding a count of its own, something lent through the
+// parameter `name`, or a value in no place.
+private enum Asked
+    AskedPlace
+    AskedLent(name: string)
+    AskedValue
+end Asked
+
+private asked_of(f: TFunc, x: TExpr) -> Asked = *x.kind match
+    TLoad(name, _) -> if is_parameter(f, name) then AskedLent(name) else AskedPlace
+    TGlobal(_, _, _) -> AskedPlace
+    TField(r, _, _) -> asked_through(f, r)
+    TIndex(r, _, _) -> asked_through(f, r)
+    TDeref(r, _) -> asked_through(f, r)
+    _ -> AskedValue
+
+// A step from `r` to a part of it or to what it points at. Storage reached through a raw pointer or
+// a view is a place of its own, whoever holds the pointer.
+private asked_through(f: TFunc, r: TExpr) -> Asked = repr(texpr_type(r)) match
+    Ptr(_, _, _) -> AskedPlace
+    Slice(_, _) -> AskedPlace
+    _ -> asked_of(f, r)
+
+private is_parameter(f: TFunc, name: string) -> bool
+    for item in f.params
+        if item.0 == name then return true
+
+    false
+end is_parameter
+
+// What asking a lent reference is told.
+unique_of_lent(name: string) -> string =
+    s"'is_unique' counts the references to an object, and '$name' is a parameter, which is lent — it " +
+    "takes no count, so the reference its caller holds would not be counted. Ask a place that holds " +
+    "a count of its own: a field reached through '*self' or through a pointer to the place, or a " +
+    "'var' the reference is copied into"
+
+// What asking a value in no place is told.
+unique_of_value() -> string =
+    "'is_unique' asks about the reference a place holds — a local, a field or an element — and this " +
+    "value is in no place. Bind it to a 'var' and ask that"
