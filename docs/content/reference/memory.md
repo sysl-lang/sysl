@@ -3738,7 +3738,7 @@ made by `&f`, with the same niche and the same refusals. At the C boundary `Opti
 nullable `T *`, matched rather than compared ([`ffi.md`](/reference/ffi/#a-pointer-c-never-makes-null)).
 An `extern` and the `@export` defining its symbol may differ in a pointer's `nonnull`, one way for a
 result and either way for a parameter
-([the table](/reference/ffi/#the-supplier-is-held-to-the-declarations-signature)).
+([the table](/reference/ffi/#the-supplier-is-held-to-the-declaration-s-signature)).
 
 ### Arithmetic: two directions, one spelling each
 
