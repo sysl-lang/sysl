@@ -249,6 +249,10 @@ private check_object_safe(a: &Analysis, scope: Scope, span: Span, key: string, a
 
         names.push("Self")
 
+        // A provided member of that shape is no slot's: the object reaches it as the default body
+        // read with `Self` the object, so it asks nothing of the table and refuses nothing here.
+        if off_table_default(m, closure_assocs(a, closure)) then continue
+
         if member_mentions(m, names, fixed_names)
             a.fault(scope, span, s"'${m.name}' of '$shown' mentions 'Self' away from its receiver, and " +
                     s"an erased value has forgotten which type that is — so there is no $obj to form")
@@ -424,6 +428,39 @@ private params_bound_to_self(a: &Analysis, b: Bound, left_out: Buf[string]) -> B
 
     out
 end params_bound_to_self
+
+// **Whether a member is one an object reaches as its default body rather than through a slot**: a
+// method the trait PROVIDES that declares type parameters of its own or names `Self` away from its
+// receiver. Neither can sit in a table -- the first is not a function until a call names its types,
+// the second speaks of a type the object has forgotten -- and neither needs to: the body is the
+// trait's, so it is read with `Self` standing for the object itself, and what it asks of `self` goes
+// through the table like any other call on one (`object_defaults.sysl`). A REQUIRED member of either
+// shape has no body to read that way, and is what the rules above are still about.
+//
+// `settled` are the associated types of the traits the object reaches, each of which an object has
+// fixed by the time it exists: `Self::Item` names nothing it has forgotten.
+off_table_default(m: MethodDecl, settled: Buf[string]) -> bool
+    if m.body.is_empty() || m.receiver.is_none() || m.is_property || m.variadic then return false
+
+    var selves: Buf[string] = buf()
+
+    selves.push("Self")
+    !m.tparams.is_empty() || member_mentions(m, selves, settled)
+end off_table_default
+
+// The associated types the traits of a requirement set declare, by name.
+closure_assocs(a: &Analysis, closure: Buf[Bound]) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for item in closure
+        val d = trait_decl_at(a, item.name)
+
+        if d.is_some()
+            for x in d.unwrap().assocs
+                out.push(x.name)
+
+    out
+end closure_assocs
 
 private member_mentions(m: MethodDecl, names: Buf[string], settled: Buf[string]) -> bool
     for param in m.params

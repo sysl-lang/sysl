@@ -1,0 +1,100 @@
+module sh.sysl.compiler
+
+import sh.sysl.parsing.*
+import sysl.buf.{Buf, buf}
+
+// **The provided members an object reaches as their default bodies**, lowered once per trait.
+//
+// A member a trait provides that declares type parameters of its own, or names `Self` away from its
+// receiver, has no slot in any table (`object_safety.sysl`'s `off_table_default`) -- and an object
+// has no `impl` whose copy of the default a call could find. What it has is the trait's body, which
+// assumes of `Self` exactly what the trait declares, and an object meets its own trait by
+// dispatching. So the body is lowered as a member generic over `Self`, bounded by the trait at the
+// trait's own parameters, and a call on an object makes it real with `Self` the object: `o.map(f)`
+// on a `&It[int]` is `map` read at `Self = &It[int]`, where `self.next()` is a call through the
+// table and `MapIt[Self, F, U]` is a `MapIt[&It[int], F, U]`.
+//
+// **It is the trait's default and never an implementation's**: an object has forgotten which type
+// it holds, so an `impl` that overrode the member is not what it reaches.
+//
+// The members are filed under a key no type's own can be, one per trait, with `Self` first among
+// the parameters and the trait's own after it -- the order a call supplies them in.
+
+// The key a trait's object defaults are filed under.
+object_home_key(trait_key: string) -> string = s"@object:$trait_key"
+
+// Whether a key is one of those.
+is_object_home(key: string) -> bool = key.starts_with("@object:")
+
+// Lowers every trait's object defaults, once every `impl` block is in.
+hoist_object_defaults(a: &Analysis)
+    for i in 0..<a.tables.types.len()
+        val key = a.tables.types.key_at(i)
+        val decl = a.tables.types.at(i)
+
+        decl.kind match
+            TraitOf(d) -> hoist_for_trait(a, key, decl.scope, d)
+            _ -> ()
+end hoist_object_defaults
+
+private hoist_for_trait(a: &Analysis, key: string, scope: Scope, d: TraitDecl)
+    var own: Buf[Type] = buf()
+
+    for tp in d.tparams
+        own.push(Abstract(tp, buf()))
+
+    val settled = closure_assocs(a, trait_closure(a, plain_bound(key, own),
+                                                  self_binding(Abstract("Self", buf()))))
+    var members: Buf[MethodDecl] = buf()
+
+    for m in d.methods
+        if off_table_default(m, settled) then members.push(m)
+
+    if members.is_empty() then return
+
+    val span = members[0].span
+    var tparams: Buf[string] = buf()
+    var args: Buf[TypeRef] = buf()
+
+    tparams.push("Self")
+
+    for tp in d.tparams
+        tparams.push(tp)
+        args.push(named_type(span, tp))
+
+    // `Self` is held to the trait at the trait's own parameters, which is all a default may assume
+    // of it; what the trait asked of those parameters is asked of them here too.
+    var of_self: Buf[BoundRef] = buf()
+    var bounds: Buf[NamedBounds] = buf()
+
+    of_self.push(BoundRef(span, d.name, args))
+    bounds.push(NamedBounds("Self", of_self))
+
+    for item in d.bounds
+        bounds.push(item)
+
+    val symbol = s"object.$key"
+    val home = MemberHome(object_home_key(key), qualified_name(key), symbol, None,
+                          named_type(span, "Self"), tparams, bounds, buf(), "field", buf(), buf(), "",
+                          Some(key), false, d.tvalues, buf(), scope, buf())
+
+    // Each is a copy of a default, read in the trait's file and checked there once, as the copy an
+    // `impl` inherits is.
+    for m in members
+        a.tables.members.default_origin.put(s"$symbol.${m.name}", s"$key.${m.name}")
+
+    hoist_member_list(a, home, members, true)
+end hoist_for_trait
+
+// What a call on an object hands such a member for its home's parameters: the object, then the
+// arguments the object's trait gives the trait that declared the member.
+object_default_args(obj: Type, from: Bound) -> Buf[Type]
+    var out: Buf[Type] = buf()
+
+    out.push(obj)
+
+    for item in from.args
+        out.push(item)
+
+    out
+end object_default_args

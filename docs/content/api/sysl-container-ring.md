@@ -60,7 +60,8 @@ was filled with, so a slot outside the live run is always an empty one.
 inline_ring[T, const N: usize]() -> InlineRing[T, N]
 ```
 
-An empty ring of capacity `N`: `inline_ring[int, 8]()`.
+An empty ring of capacity `N`: `inline_ring[int, 8]()`. Its slots start as empty slots rather
+than as values, so `T` needs no zero value.
 
 ### `ring`
 
@@ -109,8 +110,10 @@ u.rx.push_back(1)
 past the end as an array's index does, and `for x in r` walks front to back. Code can move between the two by changing the
 type and the line that makes it.
 
-**A fresh one is `inline_ring[T, N]()`, or a plain `var r: InlineRing[T, N]`**: a zeroed slot is an
-empty slot, so no slot needs a value to be made, and a type with no default value can still be held.
+**A fresh one is `inline_ring[T, N]()`**, which needs no value to make its slots from, so a type
+with no zero value -- a `&T`, an enum with no variant at zero -- can be held. A plain `var r:
+InlineRing[T, N]` is an empty ring too wherever `T` has a zero value, a zeroed slot being an empty
+slot; where `T` has none that declaration is refused, and `inline_ring()` is its initial value.
 `N` need not be a power of two; wrapping is a compare and a subtract, as in `Ring`.
 
 A value is moved in and out of its slot with `slot_put` and `slot_take`, exactly as `Ring` does it.

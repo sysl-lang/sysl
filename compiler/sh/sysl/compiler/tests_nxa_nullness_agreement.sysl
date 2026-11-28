@@ -1,0 +1,509 @@
+module sh.sysl.compiler
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, make_temp_dir, remove_dir_all, write_text}
+import sysl.process.capture
+
+// **An `extern` and the `@export` defining its symbol need not say alike whether a pointer may be
+// null** (`reference/ffi.md § The supplier is held to the declaration's signature`). The declaration
+// may be looser than the definition about what it passes and may promise less about what it gets
+// back, never more:
+//
+// | position  | extern `*T`, export `*nonnull T` | extern `*nonnull T`, export `*T` |
+// | parameter | accepted (the entry check)       | accepted                         |
+// | result    | accepted                         | refused                          |
+//
+// The axes: the four cells; where the two declarations sit (one file, two modules, the standard
+// library and the program); two externs of one symbol; `*const nonnull`; a function pointer; what is
+// still compared exactly (the pointee, a pointer behind the pointer, a struct's field, `const`, the
+// count, `Option[*nonnull T]` beside `*T`); variadic exports; `@unchecked`; what a null through the
+// looser declaration does, in a debug build and a release one; a bare target; the header.
+//
+// Skipped cells: a `.syslib` built apart from the program, where the seam is already bound and the
+// two signatures never meet in one compilation; codegen units, which the comparison runs ahead of;
+// generic exports, which do not exist.
+
+// The opening every refusal of this kind shares, for the export `name` and the extern `ext`.
+private nxa_lead(name: string, symbol: string, ext: string) -> string =
+    s"the exported '$name' defines '$symbol', which the 'extern' '$ext' declares — so every call " +
+    "through that declaration reaches this definition, and the linker joins the two by name alone. " +
+    "They have to agree: "
+
+// What a one-file program is told: its first complaint, or nothing.
+private nxa_said(text: string) -> string = tnn_build(text, host_target()).0
+
+// The refusal of a result the declaration promises never to be null and the definition does not.
+private nxa_promises_more(ext: string, mine: string, theirs: string) -> string =
+    s"this one returns $mine, which may be null, where '$ext' returns $theirs, which never is — the " +
+    "declaration promises its callers more than this definition gives. A declaration may promise " +
+    s"less than its definition, never more: return $theirs here, or declare '$ext' as returning $mine"
+
+// A project of these files built by the command line, in a release build where `release`, and run:
+// the build's status and report, then what the program said on both streams and its status.
+private nxa_ran(files: Buf[(string, string)], release: bool) -> (int, string, string, int)
+    val root = lbr_project(files)
+    val exe = s"$root/built"
+    var debug_args: [5]string = ["sysl", "build", "-o", exe, root]
+    var release_args: [6]string = ["sysl", "build", "--release", "-o", exe, root]
+    val built = if release then lbr_cli(release_args[..]) else lbr_cli(debug_args[..])
+
+    if built.0 != 0
+        lbr_drop([root])
+        return (built.0, built.1, "", -1)
+    end if
+
+    val said = capture(exe, [], "", [], true)
+
+    lbr_drop([root])
+
+    said match
+        Err(_) -> (0, built.1, "the program that was built could not be run", -1)
+        Ok(out) -> (0, built.1, out.text + out.err.unwrap_or(""), shell_status(out.status))
+end nxa_ran
+
+// The header of a library whose one module is `text`.
+private nxa_header(text: string) -> string
+    val root = make_temp_dir("sysl-nxa-h").unwrap()
+
+    write_text(s"$root/package.hocon", "package {\n  name = \"probe\"\n}\n").unwrap()
+    make_dir_all(s"$root/mylib").unwrap()
+    write_text(s"$root/mylib/mylib.sysl", text).unwrap()
+
+    var said: Buf[string] = buf()
+    val sink = &said
+    var args: [3]string = ["sysl", "emit-header", root]
+    val code = run_cli(args[..], piece -> sink.push(piece))
+    var out = ""
+
+    for item in said
+        out = out + item + "\n"
+
+    reset_search_paths()
+    remove_dir_all(root).unwrap_or(())
+    assert_eq(code, 0, out)
+    out
+end nxa_header
+
+// -- the four cells --------------------------------------------------------------------------------
+
+@test("a parameter: an extern saying *T agrees with an export saying *nonnull T")
+nxa_parameter_extern_looser()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_read" read_it(p: *i32) -> i32
+
+        @export("nxa_read")
+        answer(p: *nonnull i32) -> i32 = *p
+        """), "")
+
+@test("a parameter: an extern saying *nonnull T agrees with an export saying *T")
+nxa_parameter_extern_stricter()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_read" read_it(p: *nonnull i32) -> i32
+
+        @export("nxa_read")
+        answer(p: *i32) -> i32 = if p == null then 0 else *p
+        """), "")
+
+@test("a result: an extern saying *T agrees with an export saying *nonnull T")
+nxa_result_extern_promises_less()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_same" same(p: *nonnull i32) -> *i32
+
+        @export("nxa_same")
+        answer(p: *nonnull i32) -> *nonnull i32 = p
+        """), "")
+
+@test("a result: an extern saying *nonnull T where the export says *T is refused, naming both and which promises more")
+nxa_result_extern_promises_more()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_same" same(p: *i32) -> *nonnull i32
+
+        @export("nxa_same")
+        answer(p: *i32) -> *i32 = p
+        """), nxa_lead("answer", "nxa_same", "same") + nxa_promises_more("same", "*int", "*nonnull int"))
+
+@test("every cell at once: both parameters loosened each way and the result promised less")
+nxa_all_accepted_cells_together()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_mix" mix(a: *i32, b: *nonnull i32) -> *i32
+
+        @export("nxa_mix")
+        answer(a: *nonnull i32, b: *i32) -> *nonnull i32 = a
+        """), "")
+
+// -- `*const nonnull` and a function pointer -------------------------------------------------------
+
+@test("*const T beside *const nonnull T follows the same table")
+nxa_const_nonnull()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_peek" peek(p: *const i32, q: *const nonnull i32) -> *const i32
+
+        @export("nxa_peek")
+        answer(p: *const nonnull i32, q: *const i32) -> *const nonnull i32 = p
+        """), "")
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_peek" peek(p: *const i32) -> *const nonnull i32
+
+        @export("nxa_peek")
+        answer(p: *const i32) -> *const i32 = p
+        """), nxa_lead("answer", "nxa_peek", "peek") +
+        nxa_promises_more("peek", "*const int", "*const nonnull int"))
+end nxa_const_nonnull
+
+@test("a function pointer's nonnull follows the same table")
+nxa_function_pointer()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_call" call_it(f: *extern(i32) -> i32, n: i32) -> i32
+
+        @export("nxa_call")
+        answer(f: *nonnull extern(i32) -> i32, n: i32) -> i32 = f(n)
+        """), "")
+
+    val said = nxa_said(raw"""
+        extern "nxa_pass" pass(f: *extern(i32) -> i32) -> *nonnull extern(i32) -> i32
+
+        @export("nxa_pass")
+        answer(f: *extern(i32) -> i32) -> *extern(i32) -> i32 = f
+        """)
+
+    tnn_says(said, nxa_lead("answer", "nxa_pass", "pass") + "this one returns ")
+    tnn_says(said, "the declaration promises its callers more than this definition gives")
+end nxa_function_pointer
+
+// -- what is still compared exactly ----------------------------------------------------------------
+
+@test("a pointee that differs is refused as before, whatever the nullness says")
+nxa_pointee_differs()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_read" read_it(p: *u8) -> i32
+
+        @export("nxa_read")
+        answer(p: *nonnull i32) -> i32 = *p
+        """), nxa_lead("answer", "nxa_read", "read_it") +
+        "its parameter 1, 'p', is *nonnull int, where 'read_it' declares 'p: *byte'")
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_same" same(p: *i32) -> *u8
+
+        @export("nxa_same")
+        answer(p: *i32) -> *nonnull i32 = p.nonnull().unwrap()
+        """), nxa_lead("answer", "nxa_same", "same") + "this one returns *nonnull int, where 'same' returns *byte")
+end nxa_pointee_differs
+
+@test("const that differs is refused as before, with the nullness differing too or not")
+nxa_mutability_differs()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_read" read_it(p: *const i32) -> i32
+
+        @export("nxa_read")
+        answer(p: *nonnull i32) -> i32 = *p
+        """), nxa_lead("answer", "nxa_read", "read_it") +
+        "its parameter 1, 'p', is *nonnull int, where 'read_it' declares 'p: *const int'")
+
+@test("a parameter count that differs is refused as before beside a loosened pointer")
+nxa_count_differs()
+    if std_root().is_err() then return
+
+    tnn_says(nxa_said(raw"""
+        extern "nxa_read" read_it(p: *i32, n: usize) -> i32
+
+        @export("nxa_read")
+        answer(p: *nonnull i32) -> i32 = *p
+        """), "this one takes 1 parameter, but 'read_it' declares 2 — the declaration also has 'n: usize'")
+
+@test("only the pointer handed over is loosened: a pointer behind it is compared exactly")
+nxa_inner_pointer_exact()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_deep" deep(p: * *i32) -> i32
+
+        @export("nxa_deep")
+        answer(p: * *nonnull i32) -> i32 = **p
+        """), nxa_lead("answer", "nxa_deep", "deep") +
+        "its parameter 1, 'p', is **nonnull int, where 'deep' declares 'p: **int'")
+
+@test("a *nonnull field of a struct passed by pointer is unchanged: two structs are two pointees")
+nxa_struct_field_exact()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        struct Sure
+            held: *nonnull i32
+
+        struct Maybe
+            held: *i32
+
+        extern "nxa_field" field(s: *Maybe) -> i32
+
+        @export("nxa_field")
+        answer(s: *Sure) -> i32 = 0
+        """), nxa_lead("answer", "nxa_field", "field") +
+        "its parameter 1, 's', is *Sure, where 'field' declares 's: *Maybe'")
+
+    assert_eq(nxa_said(raw"""
+        struct Sure
+            held: *nonnull i32
+
+        extern "nxa_field" field(s: *Sure) -> i32
+
+        @export("nxa_field")
+        answer(s: *nonnull Sure) -> i32 = 0
+        """), "")
+end nxa_struct_field_exact
+
+@test("Option[*nonnull T] beside *T is two types still, and is refused as before")
+nxa_option_is_not_loosened()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_read" read_it(p: Option[*nonnull i32]) -> i32
+
+        @export("nxa_read")
+        answer(p: *i32) -> i32 = 0
+        """), nxa_lead("answer", "nxa_read", "read_it") +
+        "its parameter 1, 'p', is *int, where 'read_it' declares 'p: Option[*nonnull int]'")
+
+// -- two externs of one symbol ---------------------------------------------------------------------
+
+@test("two externs of one symbol differing in nullness and a definition: each is asked")
+nxa_two_externs()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_same" loose(p: *i32) -> *i32
+        extern "nxa_same" strict(p: *nonnull i32) -> *i32
+
+        @export("nxa_same")
+        answer(p: *nonnull i32) -> *nonnull i32 = p
+        """), "")
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_same" loose(p: *i32) -> *i32
+        extern "nxa_same" strict(p: *i32) -> *nonnull i32
+
+        @export("nxa_same")
+        answer(p: *i32) -> *i32 = p
+        """), nxa_lead("answer", "nxa_same", "strict") + nxa_promises_more("strict", "*int", "*nonnull int"))
+end nxa_two_externs
+
+@test("a second extern of the symbol is held to the definition as the first is")
+nxa_second_extern_is_compared()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_read" first(p: *i32) -> i32
+        extern "nxa_read" second(p: *u8) -> i32
+
+        @export("nxa_read")
+        answer(p: *i32) -> i32 = 0
+        """), nxa_lead("answer", "nxa_read", "second") +
+        "its parameter 1, 'p', is *int, where 'second' declares 'p: *byte'")
+
+// -- variadic exports ------------------------------------------------------------------------------
+
+@test("a variadic export beside a variadic extern follows the table, and one variadic side is refused still")
+nxa_variadic()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_fmt" fmt(to: *u8, ...) -> i32
+
+        @export("nxa_fmt")
+        answer(to: *nonnull u8, ...) -> i32 = 0
+        """), "")
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_fmt" fmt(to: *u8, ...) -> i32
+
+        @export("nxa_fmt")
+        answer(to: *nonnull u8) -> i32 = 0
+        """), nxa_lead("answer", "nxa_fmt", "fmt") + "'fmt' is variadic and this one is not")
+
+    assert_eq(nxa_said(raw"""
+        extern "nxa_fmt" fmt(to: *u8, ...) -> *nonnull u8
+
+        @export("nxa_fmt")
+        answer(to: *u8, ...) -> *u8 = to
+        """), nxa_lead("answer", "nxa_fmt", "fmt") + nxa_promises_more("fmt", "*byte", "*nonnull byte"))
+end nxa_variadic
+
+// -- where the two declarations sit ----------------------------------------------------------------
+
+@test("the standard library's extern of strlen agrees with a program's export taking *nonnull u8")
+nxa_std_extern_program_export()
+    if std_root().is_err() then return
+
+    assert_eq(nxa_said(raw"""
+        @export("strlen")
+        len(s: *nonnull u8) -> usize = 0
+        """), "")
+
+    tnn_says(nxa_said(raw"""
+        @export("strlen")
+        len(s: *nonnull i32) -> usize = 0
+        """), "They have to agree: its parameter 1, 's', is *nonnull int, where ")
+end nxa_std_extern_program_export
+
+private nxa_decl_module(result: string) -> string =
+    s"module decl\n\nextern \"nxa_len\" c_len(s: *u8) -> usize\n\nextern \"nxa_at\" c_at(s: *u8) -> $result\n"
+
+private nxa_main_module() -> string = raw"""
+    import decl.{c_at, c_len}
+
+    @export("nxa_len")
+    count(s: *nonnull u8) -> usize
+        var n: usize = 0
+
+        while s[n] != 0
+            n += 1
+
+        n
+    end count
+
+    @export("nxa_at")
+    same(s: *u8) -> *u8 = s
+
+    var absent: *u8 = null
+
+    print(count(c"hi"), c_len(c"hello"), c_at(absent) == absent)
+    print(c_len(absent))
+    """
+
+@test("in two modules: a null through the looser extern traps at the export's entry, debug and release")
+nxa_two_modules_null_traps()
+    if !lbr_ready() then return
+
+    for release in [false, true]
+        val out = nxa_ran(lbr_two("main.sysl", nxa_main_module(), "decl/decl.sysl", nxa_decl_module("*u8")),
+                          release)
+
+        assert_eq(out.0, 0, out.1)
+        assert_eq(out.3, 133, out.2)
+        tnn_says(out.2, "2 5 true\n")
+        tnn_says(out.2, "C handed null to a '*nonnull' parameter of 'nxa_len'")
+end nxa_two_modules_null_traps
+
+@test("in two modules: the extern promising more than the export is refused, naming the other module's extern")
+nxa_two_modules_refused()
+    if !lbr_ready() then return
+
+    val out = nxa_ran(lbr_two("main.sysl", nxa_main_module(), "decl/decl.sysl",
+                              nxa_decl_module("*nonnull u8")), false)
+
+    assert(out.0 != 0, "built with an extern promising more than its definition gives")
+    tnn_says(out.1, nxa_lead("same", "nxa_at", "decl.c_at") + nxa_promises_more("decl.c_at", "*byte", "*nonnull byte"))
+end nxa_two_modules_refused
+
+@test("in one file: a null through the looser extern traps at the export's entry")
+nxa_one_file_null_traps()
+    if !tnn_ready() then return
+
+    val out = tnn_outcome(raw"""
+        extern "nxa_read" read_it(p: *i32) -> i32
+
+        @export("nxa_read")
+        answer(p: *nonnull i32) -> i32 = *p
+
+        var seven = 7
+        var absent: *i32 = null
+
+        print(read_it(&seven))
+        print(read_it(absent))
+        """, "")
+
+    assert_eq(out.1, 133, out.0)
+    tnn_says(out.0, "7\n")
+    tnn_says(out.0, "C handed null to a '*nonnull' parameter of 'nxa_read'")
+end nxa_one_file_null_traps
+
+@test("an extern stricter than the export passes what the export accepts, and the looser answer is read")
+nxa_stricter_extern_runs()
+    tnn_prints(raw"""
+        extern "nxa_or" value_or(p: *nonnull i32, other: i32) -> *i32
+
+        @export("nxa_or")
+        answer(p: *i32, other: i32) -> *nonnull i32 = p.nonnull().unwrap()
+
+        var seven = 7
+
+        print(*value_or(&seven, 1))
+        """, "", "7\n")
+
+// -- `@unchecked` ----------------------------------------------------------------------------------
+
+@test("@unchecked above the export still agrees with a looser extern, and has no entry check to meet")
+nxa_unchecked_export()
+    if std_root().is_err() then return
+
+    val built = tnn_build("extern \"nxa_read\" read_it(p: *i32) -> i32\n\n@unchecked\n@export(\"nxa_read\")\n" +
+                          "answer(p: *nonnull i32) -> i32 = *p\n", host_target())
+
+    assert_eq(built.0, "")
+    tnn_lacks(built.1, "handed_null")
+
+    val checked = tnn_build("extern \"nxa_read\" read_it(p: *i32) -> i32\n\n@export(\"nxa_read\")\n" +
+                            "answer(p: *nonnull i32) -> i32 = *p\n", host_target())
+
+    assert_eq(checked.0, "")
+    tnn_says(checked.1, "handed_null")
+end nxa_unchecked_export
+
+// -- a bare target ---------------------------------------------------------------------------------
+
+@test("an archive for a bare machine holds the same table")
+nxa_freestanding()
+    if !lbr_ready() then return
+
+    for result in ["*i32", "*nonnull i32"]
+        val root = lbr_tree(lbr_two("main.sysl",
+            s"extern \"nxa_same\" same(p: *i32) -> $result\n\n@export(\"nxa_same\")\n" +
+            "answer(p: *nonnull i32) -> *i32 = p\n\n@export(\"nxa_use\")\nuse_it(p: *i32) -> *i32 = same(p)\n",
+            "package.hocon", "package { name = \"nxa\", version = \"0.0.1\" }\n"))
+        val archive = s"$root/nxa.a"
+        var args: [7]string = ["sysl", "build-c", "--target", "aarch64-freestanding", "-o", archive, root]
+        val said = lbr_cli(args[..])
+
+        lbr_drop([root])
+
+        if result == "*i32"
+            assert_eq(said.0, 0, said.1)
+        else
+            assert(said.0 != 0, "built with an extern promising more than its definition gives")
+            tnn_says(said.1, nxa_promises_more("same", "*int", "*nonnull int"))
+        end if
+end nxa_freestanding
+
+// -- the header ------------------------------------------------------------------------------------
+
+@test("the header an export publishes is the same with a looser extern beside it and without one")
+nxa_header_unchanged()
+    if std_root().is_err() then return
+
+    val export = "@export(\"nxa_same\")\nanswer(p: *nonnull i32, q: *i32) -> *nonnull i32 = p\n"
+    val alone = nxa_header("module mylib\n\n" + export)
+    val beside = nxa_header("module mylib\n\nextern \"nxa_same\" same(p: *i32, q: *nonnull i32) -> *i32\n\n" + export)
+
+    tnn_says(alone, "int32_t * nxa_same(int32_t * p, int32_t * q);")
+    assert_eq(beside, alone)
+end nxa_header_unchanged

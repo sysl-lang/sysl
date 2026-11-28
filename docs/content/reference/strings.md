@@ -234,10 +234,105 @@ ha hi
 fixed where it is made — which is exactly how a buffer grows in place.
 
 **The storage stays the compiler's business.** The string holds its share of the owner for as long as
-it lives, so the bytes outlive the slice and every other holder. A string outlives every frame, so a
-view of an array the frame owns moves that array to the heap, the same promotion a returned slice gets
-([`--explain-escapes`](/reference/memory/#promotion-is-silent-not-hidden) names it: *"is made into a string"*). A slice of a `*T`
-region has no owner to share, and is the programmer's problem exactly as every `*T` is.
+it lives, so the bytes outlive the slice and every other holder. A slice of a `*T` region has no owner
+to share, and is the programmer's problem exactly as every `*T` is.
+
+**A string over an array the frame owns is a view of that array, and is followed as one.** It may be
+read where it is made, held in a local, and handed to any function whose body only reads it — its
+`.len`, its bytes, a comparison, a search — or hands it on to one that does. The compiler reads the
+callee's body to tell, as it does for a `[]T`; so the bytes may equally arrive as a `[]u8` parameter
+and be made into a string one frame down. Nothing is allocated, which is what lets a function format
+into a buffer on its stack under [`@no_alloc`](/reference/attributes/#no-alloc-on-a-function-one-entry-point-that-makes-no-heap-storage):
+
+```sysl
+import sysl.text.str_view
+
+@no_alloc
+shout(s: string) -> usize
+    var n: usize = 0
+
+    for c in s.bytes
+        if c >= 65 && c <= 90 then n += 1
+
+    n
+end shout
+
+@no_alloc
+measure(b: []u8) -> usize = shout(str_view(b))
+
+@no_alloc
+frame() -> usize
+    var text: [8]u8 = [72, 105, 32, 77, 111, 109, 0, 0]
+    val s = str_view(text[0..<6])
+
+    shout(s) + measure(text[0..<2]) + s[3..<6].len
+end frame
+
+print(frame())
+```
+
+```output
+6
+```
+
+**Where the string would outlive the array, the array moves to the heap** — the same promotion a
+returned slice gets, named by [`--explain-escapes`](/reference/memory/#promotion-is-silent-not-hidden)
+at the place the string leaves: returned, stored in a field or in module storage, pushed into a
+buffer, captured by a closure that is returned, or handed to a function that does any of those,
+however many calls down. A cut of the string and its `.bytes` are the same view and leave the same
+way; a string built from it — an interpolation, a `+` — is a copy, and leaves on its own.
+
+```sysl
+import sysl.text.str_view
+
+var last = ""
+
+remember(s: string) = last = s
+
+made() -> string
+    var text: [2]u8 = [111, 107]
+    str_view(text[0..<2])
+end made
+
+noted()
+    var text: [2]u8 = [104, 105]
+    remember(str_view(text[0..<2]))
+end noted
+
+noted()
+print(made(), last)
+```
+
+```output
+ok hi
+```
+
+Under `@no_alloc` there is nothing to move the array into, and the escape is refused where it is
+made:
+
+```sysl
+import sysl.text.str_view
+
+var last = ""
+
+remember(s: string) = last = s
+
+@no_alloc
+noted()
+    var text: [2]u8 = [104, 105]
+    remember(str_view(text[0..<2]))
+end noted
+
+noted()
+```
+
+```error
+this view of 'text' is passed to 'remember', which holds on to it, so the array would move to the heap to outlive the frame
+```
+
+**Where no body can be read, the string is taken to be kept**: a call through a trait object, a
+`&Fn` or a function pointer moves the array, as does a function whose body is not part of the
+build.
 
 ## Immortal bytes
 
